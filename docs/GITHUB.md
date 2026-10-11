@@ -90,7 +90,16 @@ GitHub 单仓库建议 < 1 GB，硬上限 5 GB；超了无法回滚，只能重�
 - `exp:` 用于实验性改动（改超参、换数据），便于日后区分"代码变更"与"实验变更"
 - 一个提交只做一件事，不要把格式化与逻辑改动混在一起
 
-## 6. 给 AI 协作助手的约定
+## 6. 跨平台仓库的坑（都已处理，勿改回去）
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| `core.fileMode` | 在集群 `chmod +x` 后 `git status` 一堆 ` M`，看着像改了内容 | 本机与集群均已设 `core.fileMode=false`。仓库不上传 exec 位，脚本权限由部署时 `chmod` 决定 |
+| CRLF | Windows 编辑过的 `.sh` 到 Linux 报 `bad interpreter: /bin/bash^M` | `.gitattributes` 强制 `* text=auto eol=lf` |
+| 大小写 | `Docs/` 与 `docs/` 在 macOS/Windows 是同一个目录 | 目录名统一小写 |
+| 中文文件名 | 部分工具会显示成转义码 | 文件名一律英文，中文只出现在文件内容里 |
+
+## 7. 给 AI 协作助手的约定
 
 1. **动手前先读** `docs/CLUSTER_GUIDE.md`，里面列了集群硬约束
 2. 新增脚本必须提交到仓库，不要只留在集群上
