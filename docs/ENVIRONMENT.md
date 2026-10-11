@@ -1,6 +1,7 @@
 # 环境事实清单
 
 > 机器可读的集群事实。供 AI 助手在无交互探查时直接引用。
+> 覆盖 **二期** 与 **三期 ACD** 两个集群（两者完全独立）。
 > 采集时间：2026-10-11
 
 ## 身份
@@ -9,10 +10,11 @@
 user: xyu608
 uid: 204227
 gid: 201375
-group: tonggehuang_team
+group: tonggehuang_team          # 二期
+group_phase3: formal             # 三期
 groups: [tonggehuang_team, HKUST-GZ, domain_users, Redbird_MPhil_Programs, College_of_Future_Tech]
 login_shell: /bin/bash
-home: /hpc2hdd/home/xyu608
+home: /hpc2hdd/home/xyu608        # 二期；三期是 /data/user/xyu608
 ```
 
 ## 主机
@@ -25,7 +27,22 @@ portal: https://hpc2login.hpc.hkust-gz.edu.cn/
 ssh_server: OpenSSH_8.2p1 Ubuntu-4ubuntu0.8
 auth_methods: [publickey, password]
 vpn: 校内网络直连可用（出现 10.120.x.x / 10.121.x.x 内网 IP）
+internet: 可访问（github.com/pypi 正常）
 ```
+
+### 三期主机
+
+```yaml
+cluster: HKUST-GZ HPC 三期 ACD
+slurm_cluster_name: chess
+login_node: hpc3login.hpc.hkust-gz.edu.cn      # IP 10.120.81.30，实际登录到 ACD-Login-1
+portal: https://hpc3login.hpc.hkust-gz.edu.cn/hpc-user/#/login
+ssh_server: OpenSSH_10.5
+auth_methods: [publickey, password]
+internet: ❌ 完全隔离（github.com / pypi.org 均连不上）
+docs: https://docs.hpc.hkust-gz.edu.cn/docs/hpc3/
+```
+
 
 ## 路径
 
@@ -134,3 +151,104 @@ models--Qwen--Qwen3-30B-A3B-Instruct-2507
 | theory_final | 8.0M | ReVision |
 | huangzhe | 131M | DLLM-Searcher |
 | haiji | 1.0K | 无 |
+
+---
+
+# 三期 ACD 事实清单
+
+## 路径
+
+```yaml
+home: /data/user/xyu608                  # 挂在 /data（19P, 38% used, 余 12P）
+share: /share                           # 平台软件/cuda/dataset
+share_anaconda: /share/anaconda3
+share_cuda: [/share/cuda132, /share/cuda133, /share/bak_cuda128]
+share_dataset: /share/dataset
+workdir: /data/user/xyu608/ztwang
+tmp: /tmp                                # 节点本地，作业结束即丢
+```
+
+> 三期**没有** `~/jhspoolers` 等二期软链。训练产物写 `~/ztwang/runs/<jobid>/`。
+
+## Slurm
+
+```yaml
+version: 23.11.11
+cluster_name: chess
+bindir: /bin                             # 无需设 PATH（与二期不同）
+account: d_tonggehuang_team              # 显示为 d_tonggeh+
+default_partition: acd_u
+default_qos: normal
+private_data: jobs                       # ⚠️ squeue 看不到别人的作业
+select_type: select/cons_tres
+gres_types: [gpu]
+controllers: [ACD-Manage-3, ACD-Manage-2]
+```
+
+### 分区
+
+| 分区 | 节点 | 单节点 | GRES | 时限 | 优先级 |
+|---|---|---|---|---|---|
+| `acd_u` ⭐默认 | 40 | 96c / 2T | gpu:8 | 7d | 100 |
+| `acd_ue` | 40 | 96c / 2T | gpu:8 | 7d | 200 |
+| `emergency_acd` | 40 | 96c / 2T | gpu:8 | 7d | 300 |
+| `debug` | 1 (`ACD1-63`) | 96c / 2T | gpu:8 | **30m** | 1 |
+
+节点：`ACD1-{1-4,6-9,11-26,28,30-33,36,50-52,54-56,59,61,64,67}`（acd_* 三分区共用同一批 40 台）
+
+### 配额与限制
+
+```yaml
+allow_groups: [formal, admin]
+qos_normal:
+  MaxTRESPerUser: cpu=192, gres/gpu=16
+  MaxJobsPerUser: 20
+user_quota_doc:  CPU 128 核 / GPU 16 张 / 单作业 ≤7 天
+max_time: 7-00:00:00                     # 可申请延长一次，不得超 7 天
+```
+
+## 硬件
+
+```yaml
+gpu_model: NVIDIA H100 80GB HBM3         # nvidia-smi 实测
+gpu_total_visible: 328                   # 41 节点 × 8
+gpu_allocated: 299                       # 2026-10-11 实测
+gpu_free: 29                             # 分散在各节点，凑不出整机
+cpus_per_node: 96                        # 2 × 48
+mem_per_node: 2000000M                   # ≈2TB
+interconnect: 400Gb/s RoCE v2
+intra_node_gpu: 800GB/s 双向
+storage: 17PB 分布式
+nodes_visible: 41                        # acd_u 40 + debug 1
+fp16_peak: 1078 Pflops                   # 官方口径
+```
+
+## conda
+
+```yaml
+root: /share/anaconda3                   # 登录即激活
+envs: [ReVision, revision, pytorch, pytorch251, pytorch271, pytorch2.14.0,
+       vllm, vllm017, flash_attn3, jax_gpu, video_dit, open3d]
+```
+
+## 家目录现状（只读，勿改）
+
+| 目录 | 体积 | 内容 |
+|---|---|---|
+| `output` | **406G** | 3 组 `checkpoints-sft-bunny-*` 断点 |
+| `model` | 61G | 模型 |
+| `models` | 624M | 模型目录 |
+| `revision_sft` | 5.3G | ReVision SFT |
+| `res` | 1.1G | 权重分片 |
+| `ReVision` | 78M | 项目（**非 git 仓库**） |
+| `checkpoints-pretrain-bunny-2M` | 44M | 预训练断点 |
+| `aistudio` `pkgs` `output` | — | 平台/依赖 |
+
+## 三期特有约束
+
+1. **无外网** → 代码靠 `python hpc_tools/sync_ztwang.py --host hpc3` 推送；依赖需离线安装。
+2. **`PrivateData=jobs`** → 判断拥堵必须看 `sinfo` 节点状态或 `--test-only`，不能看 `squeue`。
+3. **单机固定 8 卡** → 常规用法是整机 `--gres=gpu:8`。
+4. **单用户 GPU 上限 16 张** → 同时最多 2 个 8 卡作业。
+5. **最长 7 天**（二期有 14 天队列，三期没有）。
+
