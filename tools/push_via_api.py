@@ -19,7 +19,13 @@ OWNER = "ZitongWang018"
 REPO = "handover-ustgz"
 BRANCH = "main"
 API = "https://api.github.com"
-LOCAL_REPO = pathlib.Path(__file__).resolve().parent.parent / "ztwang"
+_HERE = pathlib.Path(__file__).resolve()
+# 兼容两种存放位置：<root>/ztwang/tools/ 或 <root>/hpc_tools/
+_CANDS = [_HERE.parent.parent, _HERE.parent.parent / "ztwang", _HERE.parent]
+LOCAL_REPO = next(
+    (c for c in _CANDS if (c / "docs").is_dir() and (c / "README.md").is_file()),
+    _HERE.parent.parent / "ztwang",
+)
 SKIP_DIRS = {".git", "__pycache__", "logs"}
 EXEC_SUFFIX = (".sh", ".sbatch")
 
