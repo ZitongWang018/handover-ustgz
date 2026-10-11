@@ -1,0 +1,49 @@
+# 绝不入库：模型权重、数据集、checkpoint、大文件
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.whl
+
+# 数据与输出目录
+data/
+datasets/
+models/
+checkpoints/
+ckpt/
+outputs/
+logs/
+runs/
+wandb/
+results/
+
+# 缓存
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.cache/
+.pytest_cache/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# 环境
+.venv/
+venv/
+env/
+*.env
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp

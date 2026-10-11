@@ -1,0 +1,20 @@
+# 集群是 Linux，所有脚本必须保持 LF 换行，否则 bash 报 "bad interpreter"
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.sbatch    text eol=lf
+*.slurm     text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+*.cfg       text eol=lf
+
+# 二进制文件不做换行转换
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+*.safetensors binary
+*.bin       binary
