@@ -95,16 +95,26 @@
 结论：**通过** ✅ 关0/1/2b/3 全过：1 处 update_rel>0，单步最多更新 252 个张量
 ```
 
-判据已经从"三关"扩到"四关 + 多卡过关4"，`ez_check_smoke_ok.py` 里逐条实现：
+**2 卡真实多进程（DDP 接线验证）✅ 接线全对**（2026-10-12 job 12989603 @ `debug:gpu3-9`，2:42）
+
+两 rank 各自 `本地 games=1/2`、同一 `run_dir`、`world_size=2`、DDP 包装成功、
+探针 `hasattr(DDP,'set_adapter')=False`、池子为空时**两 rank 一致跳过 solver 相位**、
+双双 `[done]` 干净退出、`train_log.rank0/1.jsonl` 各 15 行 —— DDP 该验的全验了。
+
+但那一发 `accept=0/2`（`turns=12` 太短）⇒ 候选全同分 ⇒ 优势全 0 ⇒
+`真实 backward grad_norm=0.0000e+00` ⇒ `0/504 张量动了` 是**正确**的。
+旧判据只看位移、不看梯度，误报出两条 FATAL，把这一发判成 FAILED（见下）。
+
+判据已经从"三关"扩到"关0/1/2/2b/3 + 多卡关4"，`ez_check_smoke_ok.py` 里逐条实现：
 
 | 关 | 判据 | 落地 |
 |---|---|---|
 | 关0 | 两个 adapter 各自都能接到梯度（`grad_chain_selfcheck`，**不依赖环境/奖励**） | 启动自检，任一 adapter 为 0 直接 `SystemExit` |
 | 关1 | facts 通道存在 | 启动预检 `assert_facts_mode` |
 | 关2 | `update_rel` 对**本组奖励 spread** 判（专治"梯度断" vs "奖励同分"） | job 12989143 的教训 |
-| 关2b | `N/M 张量真的动了` 的 N>0 | job 12989450 的教训，见下 |
+| 关2b | 位移计数 + **真实 backward grad_norm**（`grad_norm>0` 却 0 位移才是断链） | job 12989450 / 12989603 的教训 |
 | 关3 | proposer `accept>=1`、solver 奖励不是全 0 | — |
-| 关4 | 8 卡：rank 日志齐 / `world_size==8` / 各 rank `update_rel` 同量级 | 见 `EZ_DDP_PLAN.md` §8 |
+| 关4 | 多卡：rank 日志齐 / `world_size==N` / 各 rank `update_rel` 同量级（**全 0 且 grad_norm 全 0 不算错**） | 见 `EZ_DDP_PLAN.md` §8 |
 
 **`update_rel=0.000e+00` 的假警报（2026-10-12 job 12989450 → 12989496 定位）**
 
@@ -130,7 +140,7 @@
 
 代码状态（2026-10-12）：7 个源文件 + 配置 + 5 个脚本，三 agent 交叉 review 抓出的
 2 个 P0（`old logps` 未脱图 / G_P 撞 env batch）+ 6 个 P1 已全部修复。
-61 项离线单测 + 12 项判读回归（`scripts/ez_check_smoke_selftest.py`）全绿。
+61 项离线单测 + 16 项判读回归（`scripts/ez_check_smoke_selftest.py` 用例 A–P）全绿。
 
 ```bash
 # 二期 · A40 48G · debug 分区（30min 上限，几分钟内起算，先跑这个）
@@ -176,13 +186,20 @@ GC 在 peft 包装下是否真的关掉——**GC 兜底实测正常，不是本
 | 日志无 "facts 通道 OK" | **FATAL** | textworld 版本不够，改 `request_infos`；否则奖励是废的 |
 | `update_rel = 0` **且** 奖励有区分度 | **FATAL** | 梯度链断了（no_grad / 断图 / lr=0），必修 |
 | `update_rel = 0` **且** 奖励全同分 | **WARN** | 不是 bug：GRPO 组内优势全 0 时梯度天然为 0。缩规模下常见，加大 turns 再看 |
-| `0/504 张量真的动了` 但 `grad_norm` 非零 | **FATAL** | 真断链（probe 已排除挑错张量） |
+| `0/M 张量真的动了` 但 `grad_norm` 非零 | **FATAL** | 真断链（probe 已排除挑错张量） |
+| `0/M 张量真的动了` 且 `grad_norm` **也为 0** | **WARN** | 不是 bug：奖励全同分 ⇒ 优势全 0 ⇒ 精确零梯度，不动是对的 |
 | `N/M 张量真的动了` 且 N≈M/2 | **正常** | LoRA 第 0 步：B 初始全 0 ⇒ 所有 A 无梯度，只有 B 动 |
-| proposer `accept=0/N` | **FATAL** | 提案器一条有效任务都没产出，查 prompt/解析/有效性过滤 |
-| 8 卡：某 rank 的 `train_log.rank*.jsonl` 缺失/为空 | **FATAL** | 那个 rank 提早挂了，看它的 `.err` |
-| 8 卡：各 rank `update_rel` 差 ≥100× | **FATAL** | 该 rank 没参与梯度同步（policy 可能拿了 `raw.module`） |
-| 8 卡：`world_size=1` | **WARN** | torchrun 没生效，8 个进程各跑各的（速度不涨、日志多 8 倍） |
+| 日志里根本没有 `真实 backward grad_norm` 行 | **WARN/FATAL** | 跑的是旧代码，无法区分"断链"与"无信号"，先升级 |
+| proposer `accept=0/N` | **FATAL** | 提案器一条有效任务都没产出。`fmt_bad>0` 是解析/格式问题；`fmt_bad=0` 通常是 **turns 不够**（prompt 要求探索 10-20 动作才 finish，用 `EZ_SMOKE_TURNS=16`）|
+| 多卡：某 rank 的 `train_log.rank*.jsonl` 缺失/为空 | **FATAL** | 那个 rank 提早挂了，看它的 `.err` |
+| 多卡：各 rank `update_rel` 差 ≥100× **且该 rank grad_norm 非零** | **FATAL** | 该 rank 没参与梯度同步（policy 可能拿了 `raw.module`） |
+| 多卡：各 rank `update_rel` 全 0 **且 grad_norm 也全 0** | **OK** | 一致无信号（开局奖励同分），不是没同步 |
+| 多卡：`world_size=1` | **WARN** | torchrun 没生效，N 个进程各跑各的（速度不涨、日志多 N 倍） |
 | 全部通过 | **PASS** | 允许开 8 卡正式作业 |
+
+⚠️ 判"参数没动"的最终依据是**真实 backward grad_norm**，不是 `update_rel`。
+`update_rel` 只能告诉你"动没动"，无法区分"有梯度却不动（错）"和"没梯度所以不动（对）"。
+`ez_check_smoke_selftest.py` 里有 16 个回归用例把这条钉住（含 O/P 两个 2 卡场景）。
 
 ### Phase 4 — 完整交替训练（主实验，8 卡）
 - [ ] 交替循环：4 outer × (25 proposer + 25 solver steps)，LoRA r32，实现 Algorithm 1（含 G_P=8 的 solve-rate 估计和 proposer 奖励）。

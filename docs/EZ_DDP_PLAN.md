@@ -17,7 +17,14 @@
 | P0 代码落地 | ✅ | `ez_train.py` / `train_grpo.py` / `ez_smoke_8gpu.sbatch` / `ez_check_smoke_ok.py` 关4 |
 | 单卡冒烟硬通过 | ✅ | job `12989496`：`结论：**通过** ✅ 关0/1/2b/3 全过`，`update_rel=5.00e-01，252/504 张量真的动了` |
 | P0 后单卡回归（确认没改坏 world==1） | ✅ | job `12989528`（`scripts/ez_smoke_1gpu.sbatch`）|
-| 8 卡冒烟 | ⏳ 排队 | job `12989532` @ `i64m1tga800u8ka`（8 卡作业被策略限定只能投 800u8ka / a40u8ka）|
+| 修掉 2 卡那一发触发的判据假警报 | ✅ | 见 §0.5.2；回归用例 16/16 全绿（`ez_check_smoke_selftest.py`，新增 N/O/P） |
+| **2 卡真实多进程（DDP 接线）** | ✅ | job `12989603` @ `debug:gpu3-9`，2:42。两 rank 各 `本地 games=1/2`、同一 `run_dir`、`world_size=2`、空池时**一致跳过**、双双 `[done]`、`rank0/1.jsonl` 各 15 行 |
+| **2 卡 `turns=16` 硬通过** | ✅ **P0 验收完成** | job `12989645` @ `debug:gpu3-9`，6:43，ExitCode 0:0。自检全 OK 零 WARN：`update_rel(P0)=5.00e-01`、`252/504`、`accept=1/2`、`solver reward mean=1.000`、**两 rank `max(update_rel)` 同量级（比值 1.0）** |
+| 8 卡冒烟（P0 的最后一关） | ⏳ 排队 | job `12989532` @ `i64m1tga800u8ka`（8 卡作业被策略限定只能投 800u8ka / a40u8ka）|
+
+> **2 卡那一发已经把 DDP 该验的全验了**（分片不重不漏、run_dir 广播、梯度同步、
+> 空池一致跳过、干净退出）。8 卡排队 ~26h，只多验"8 个进程"这一种规模，
+> 逻辑上没有新的失败模式——所以它是**保险**，不是前置条件。
 
 ### 0.5.1 路上清掉的一个"假故障"（值得记住）
 
@@ -55,6 +62,47 @@ y = W x + B(A x) · s      ⇒   ∂L/∂A = Bᵀ(∂L/∂y) xᵀ ≡ 0        �
 **教训**：GRPO 里 "update_rel == 0" 有三种成因（梯度链断 / 组内奖励同分 / probe 挑错张量），
 `ez_check_smoke_ok.py` 现在用三条独立判据把它们分开：关2 对**组奖励 spread** 判、
 关2b 对**张量计数**判、关0 用不依赖奖励的梯度链自检。
+
+### 0.5.2 第二个假故障：`0/504` 被当成断链（2 卡那一发暴露的）
+
+2 卡作业 `12989603` 的日志是**完全正确**的，却被旧判据打出两条 FATAL：
+
+```
+[OK   ] 关4 2 个 rank 日志都存在且非空
+[OK   ] 关4 日志里的 world_size=[2]
+[FATAL] 关2b 优化器实际更新张量数：outer 0 P0=0/504（全 0 —— 优化器真的一步没动）
+[WARN ] 关2 这些 P 相位组内奖励全同分（无信号，属正常）：['0P0(spread=0.000)']
+[FATAL] 关3 proposer 全部被拒（[(0, 2)]）
+[FATAL] 关4 各 rank 的 max(update_rel)=r0=0.00e+00, r1=0.00e+00（最大/最小 = inf）
+```
+
+真因：那一发 `accept=0/2`（`turns=12` 太短，proposer 走不到 `finish`）⇒ 候选奖励全同分 ⇒
+GRPO 组内优势全 0 ⇒ **梯度精确为 0**。日志里的诊断行写得明明白白：
+
+```
+[outer 0][P0] 诊断 ... | 真实 backward grad_norm=0.0000e+00 (504 个张量有 grad；A=... B=...)
+```
+
+所以 `0/504` 是**正确行为**，不是 bug。旧判据只看"动了几个张量"，不看"有没有梯度"，
+就把"无信号"和"真断链"混成同一类；关4 里 `lo == 0 ⇒ ratio = inf` 同理。
+
+修法：判"参数没动"的**最终依据改成真实 backward grad_norm**（`ez_check_smoke_ok.py::GN_RE`）：
+
+| 现象 | 旧判据 | 新判据 |
+|---|---|---|
+| `grad_norm > 0` 且一步没动 | FATAL | FATAL（**真断链**，这才该报） |
+| `grad_norm == 0` 且一步没动 | FATAL ❌ | WARN（奖励同分 ⇒ 不动是正确的）|
+| 各 rank `update_rel` 全 0，比值 inf | FATAL ❌ | OK（各 rank grad_norm 也全 0 ⇒ **一致无信号**）|
+| 各 rank `update_rel` 全 0，但某 rank `grad_norm > 0` | FATAL | FATAL（那个 rank 真有问题）|
+| 日志里没有 `grad_norm` 行（旧代码）| 不判 | FATAL（无法区分，必须升级代码）|
+
+⚠️ 正则有个坑：`update_probe` 的行是 `[outer 2 P0] update_rel=...`（一个括号、空格分隔），
+而 P/S 相位的诊断行是 `[outer 2][P0] 诊断 ...`（**两个独立方括号**）。两条正则不能混用。
+
+**代价**：这个假警报是实打实的——`ez_smoke_8gpu.sbatch` 有 `set -euo pipefail`，
+自检 exit 1 ⇒ 整发作业被 Slurm 记成 **FAILED**（`12989603` 就是），
+看起来像 DDP 炸了，其实 DDP 全对。
+
 
 ---
 
@@ -288,10 +336,21 @@ DDP 平均 8 份 → (1/G) Σ_all a_i ℓ_i ，与单卡完全等价
 
 #### P0 里两个容易写错、但**必须**写对的地方（本次踩点）
 
-1. **`policy` 必须持有 DDP 包装后的对象**。`HFPolicy` 内部直接 `model(...)`；
-   如果传 `raw` 或 `raw.module`，就绕过了 DDP 的 forward hook，梯度**永远不会 all-reduce**
-   —— 8 个 rank 各自静默跑自己的，速度不涨、指标还对不上，且不报任何错。
-   旧代码那句 `model.module if hasattr(model, "module") else model` 正是这个雷。
+1. **`DistributedDataParallel` 不转发 unknown 属性**（torch 2.x 实测，job `12989565`）。
+   `model.set_adapter("proposer")` 会直接抛
+   `AttributeError: 'DistributedDataParallel' object has no attribute 'set_adapter'`，
+   `generate` / `save_pretrained` 同理。所以分工必须清楚：
+
+   | 调用 | 用在哪个对象上 | 为什么 |
+   |---|---|---|
+   | `set_adapter` / `generate` / `save_pretrained` / `print_trainable_parameters` | **内层 `raw`** | DDP 根本没有这些属性 |
+   | **要算梯度的那次 forward**（`per_token_logps` / `grpo_loss`） | **包装后的 `model`** | 否则绕过 DDP 的 forward hook，梯度**永远不会 all-reduce**，且不报任何错 |
+   | `train()` / `eval()` / `zero_grad()` | **包装后的 `model`** | 这些是 `nn.Module` 自己的方法；DDP 要靠 `train()` 重置 `require_backward_grad_sync` |
+
+   推论：`HFPolicy` 内部走 `generate`，所以它必须持有 **`raw`**；
+   loss 那一路由 `ez_train` 显式把 `model` 传进 `per_token_logps/grpo_loss`。
+   （一开始我把 `policy` 写成持有包装后的对象，属于**反了的**修法，被 job 12989565 打回。）
+   启动自检里留了探针日志 `hasattr(DDP,'set_adapter')`，升级 torch 时一眼能看出行为有没有变。
 
 2. **DDP 必须在双 adapter 都可训练之后才 wrap**（红线 C）。DDP 在构造那一刻按
    "哪些参数 requires_grad" 固定 bucket 成员；先 wrap 再切 `requires_grad`，
@@ -341,17 +400,40 @@ PyTorch 社区里出现过 `Expected to mark a variable ready only once` 这类�
 # P0 完成后，把冒烟脚本换成 8 进程版本跑（见 P0 验收）
 EZ_SMOKE_G=2 EZ_SMOKE_G_P=2 EZ_SMOKE_TPS=8 EZ_SMOKE_TURNS=16 \
   torchrun --nproc_per_node=8 src/ez_train.py --config configs/ez_qwen3_4b.yaml --dry-run
+
+# 或者直接提交 sbatch（推荐，内含单测 + facts 预检 + 自检五段）：
+sbatch -p i64m1tga800u8ka -t 02:00:00 --gres=gpu:8 \
+    ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
+# 最小成本的 DDP 接线验证（debug 区，立刻起算，实测 2:42 跑完）：
+sbatch -p debug -t 00:28:00 --gres=gpu:2 --cpus-per-task=16 --mem=240G \
+    --export=ALL,NPROC=2,EZ_SMOKE_TPS=2,EZ_SMOKE_TURNS=16 \
+    ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
 ```
 
-判据（`scripts/ez_check_smoke_ok.py` 已实现三关，8 卡额外加两条）：
-1. 三关全过（facts / `update_rel` / 奖励区分度）——单卡判据不变
-2. **`update_rel` 的数值在 8 个 rank 之间同量级**（差 100× 以上说明某个 rank 没参与梯度同步）
-3. **每个 rank 的 `train_log.rank*.jsonl` 都存在且非空**（缺文件 = 那个 rank 提早挂了）
-4. **rank0 的 `len(groups)` == TPS/world**（对不上说明分片写错了）
-5. **`dist` 初始化日志里 world_size == 8**（防止 torchrun 参数没生效，退化成 8 个独立单卡进程）
+判据（`scripts/ez_check_smoke_ok.py` 已实现，单卡关0/1/2/2b/3；多卡额外加关4）：
 
-> 第 5 条最容易出事：torchrun 没生效时**不会报错**，只是 8 个进程各自在单卡上跑，
-> 速度没变快、日志却多了 8 倍。启动自检里必须显式打印 world_size。
+1. **关0** 两个 adapter 各自都能接到梯度（`grad_chain_selfcheck`，不依赖环境/奖励）
+2. **关1** facts 通道存在
+3. **关2** `update_rel` 必须对着**本组奖励 spread** 判：`spread>0` 却不动 = 断链（FATAL）
+4. **关2b** `grad_norm > 0` 却 `0/M 张量动了` = 真断链（FATAL）；
+   `grad_norm == 0` 却不动 = 奖励同分，**正确**（WARN）。← ★ 这条必须看 grad_norm，不能只看位移
+5. **关3** proposer `accept >= 1`，solver 奖励不是全 0
+6. **关4** 每个 rank 的 `train_log.rank*.jsonl` 都存在且非空（缺文件 = 那个 rank 提早挂了）
+7. **关4** 各 rank 的 `max(update_rel)` 同量级。⚠️ **但"全 0"要分两种**：
+   - 各 rank 的真实 `grad_norm` **也全 0** ⇒ 一致无信号（开局奖励同分），**不是**没同步
+   - 某 rank `grad_norm > 0` 而它位移为 0 ⇒ 那个 rank 真有问题（FATAL）
+8. **关4** `dist` 初始化日志里 `world_size == 本发进程数`
+   （防止 torchrun 参数没生效，退化成 N 个独立单卡进程）
+
+> 第 8 条最容易出事：torchrun 没生效时**不会报错**，只是 N 个进程各自在单卡上跑，
+> 速度没变快、日志却多了 N 倍。启动自检里必须显式打印 world_size。
+
+> ★ 判据本身要先用回归用例证明**不会误报**，再拿它当准入门：
+> `python scripts/ez_check_smoke_selftest.py`（16 个用例 A–P，全部来自真实踩过的坑，
+> 包括 O = 2 卡一致无梯度、P = 某 rank 有梯度却不动）。
+> `ez_smoke_8gpu.sbatch` / `ez_smoke_1gpu.sbatch` 的 `[0/3b]` 段会自动跑它。
+> 这一条不是洁癖：2026-10-12 就是因为判据误报，让一发完全正确的 2 卡 DDP 作业
+> 被 Slurm 记成 FAILED（见 §0.5.2）。
 
 ---
 

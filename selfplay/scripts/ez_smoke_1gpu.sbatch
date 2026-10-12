@@ -24,16 +24,18 @@
 #   并用 ZTWANG_ENV=vllm017 覆盖 conda 环境（三期无 thinktool 环境）。
 #
 # ---------------------------------------------------------------------------
-# 冒烟通过标准（四关 + 单卡跳过关4，全过才允许开 8 卡正式作业）：
+# 冒烟通过标准（关0/1/2/2b/3 + 单卡自动跳过关4，全过才允许开 8 卡正式作业）：
 #   [关0] 梯度链        两个 adapter 各自都能接到梯度（启动自检，不依赖环境/奖励）
-#   [关1] facts 通道    脚本第一段打印 "[ok] reset 后 facts 有内容（N 条）"，N>0
-#   [关2] update_rel    dry-run 结尾 P0/S0 都打印 update_rel 且 **> 1e-10**
+#   [关1] facts 通道    "facts 通道 OK（N 条事实）"，N>0
+#   [关2] update_rel    dry-run 结尾 P0/S0 都打印 update_rel
 #                       ⚠️ 判据必须对着**本组奖励的 spread** 看：
 #                          rel=0 且 spread>0 -> 梯度链断（FATAL）
 #                          rel=0 且 spread=0 -> GRPO 组内优势全 0，正常（WARN）
-#   [关2b] 张量计数     "N/M 张量真的动了" 的 N>0。比 rel 更直接：
-#                       LoRA 第 0 步 B 初始全 0 ⇒ 所有 lora_A 梯度恒 0，
-#                       N≈M/2 是**正常**的；N=0 才是真断链。
+#   [关2b] 张量计数     "N/M 张量真的动了" 的 N>0，并用**真实 backward grad_norm** 兜底：
+#                          grad_norm=0（奖励全同分）-> 不动是正确的，不是失败
+#                          grad_norm>0 却 N=0        -> 真断链，FATAL
+#                       比 rel 更直接：LoRA 第 0 步 B 初始全 0 ⇒ 所有 lora_A 梯度恒 0，
+#                       N≈M/2 是**正常**的。（2026-10-12 job 12989450 的假警报就出在这）
 #   [关3] 奖励非退化    proposer 行 accept>=1，solver 行 reward 不是全 0
 #   任一条不过 → 直接 exit 1，别往下开 8 卡。
 #
@@ -43,6 +45,8 @@
 #   ⚠️ turns 别压得太低：prompt 要求探索 10-20 个动作后才 finish，给 3 轮的话
 #      proposer 永远走不到 finish -> accept=0 -> 任务池空 -> solver 相位整段跳过，
 #      冒烟会"看着跑完但其实一条真链路都没走"（实测 job 12989069 就是这么假通过的）。
+#      ★ turns=12 仍然偏紧：2026-10-12 job 12989603（2 卡）在 turns=12 下
+#        accept=0/2，DDP 全对却卡在关3。想拿到"参数真的动了"的硬证据请用 16。
 # ============================================================================
 #SBATCH --job-name=ez-smoke
 #SBATCH --account=root
@@ -96,9 +100,11 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 python -V
 df -h "$HOME" | tail -1
 
-# ---------- [0/3] 离线单测（纯 CPU，秒级；先证明核心逻辑没被改坏）----------
-echo "--- [0/3] EZ 离线单测 ---"
+# ---------- [0/3] 离线单测 + 判读逻辑自测（纯 CPU，秒级；先证明核心逻辑没被改坏）----------
+echo "--- [0/3a] EZ 离线单测 ---"
 python scripts/ez_unit_test.py
+echo "--- [0/3b] 冒烟判读逻辑自测（不需要 GPU）---"
+python scripts/ez_check_smoke_selftest.py
 
 # ---------- [1/3] facts 通道预检（EZ 的命根子，没有就直接停）----------
 echo "--- [1/3] facts 通道预检 ---"
@@ -126,4 +132,4 @@ if ! python scripts/ez_check_smoke_ok.py --config "$CFG"; then
   exit 1
 fi
 
-echo "=== done: $(date)  → 单卡冒烟四关全过，可以开 8 卡（先跑 ez_smoke_8gpu.sbatch）==="
+echo "=== done: $(date)  → 单卡冒烟关0/1/2/2b/3 全过，可以开 8 卡（先跑 ez_smoke_8gpu.sbatch）==="

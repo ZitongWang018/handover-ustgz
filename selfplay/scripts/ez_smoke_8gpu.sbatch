@@ -17,6 +17,16 @@
 #   sbatch -p debug -t 00:28:00 --gres=gpu:8 \
 #       ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
 #
+#   # ①b 二期 · debug 分区 **2 卡**变体（验 DDP 接线的最小成本；实测 2:42 跑完）
+#   #     ⚠️ debug 分区每 GPU 最多 8 核 ⇒ 2 卡最多 16 核、内存也要一起降
+#   #     ⚠️ turns 必须 ≥16：prompt 要求"探索 10-20 个动作后才 finish"，
+#   #        turns=12 时 proposer 永远走不到 finish ⇒ accept=0 ⇒ 关3 FATAL
+#   #        （2026-10-12 job 12989603 实测：2 卡 DDP 全部正确，唯一失败项就是它）
+#   sbatch -p debug -t 00:28:00 --gres=gpu:2 \
+#       --cpus-per-task=16 --mem=240G \
+#       --export=ALL,NPROC=2,EZ_SMOKE_TPS=2,EZ_SMOKE_TURNS=16 \
+#       ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
+#
 #   # ② 二期 · 正式 8 卡分区（排队久，但时限长；A800 版换 800u8ka）
 #   sbatch -p i64m1tga40u8ka -t 02:00:00 --gres=gpu:8 \
 #       ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
@@ -33,14 +43,19 @@
 #    提交前先本地确认 `python scripts/ez_check_smoke_selftest.py` 全绿。
 #
 # ---------------------------------------------------------------------------
-# 通过标准（在单卡三关之上多两关，见 ez_check_smoke_ok.py 关4）：
+# 通过标准（在单卡之上多一关；判据细节见 ez_check_smoke_ok.py）：
 #   [关0] 两个 adapter 各自都能接到梯度（grad_chain_selfcheck）
 #   [关1] facts 通道存在
 #   [关2/2b] update_rel > 1e-10 且「N/M 张量真的动了」的 N > 0
 #   [关3] proposer accept>=1，solver 奖励不是全 0
-#   [关4] 8 个 rank 的 train_log.rank*.jsonl 都存在且非空
-#   [关4] 各 rank 的 max(update_rel) 同量级（差 ≥100× 或某 rank 为 0 = 梯度没同步）
-#   [关4] 日志里的 world_size == 8（=1 说明 torchrun 没生效，8 进程各跑各的）
+#   [关4] 每个 rank 的 train_log.rank*.jsonl 都存在且非空
+#   [关4] 各 rank 的 max(update_rel) 同量级、日志里的 world_size == 本发进程数
+#   ★ 判"参数没动"的最终依据是**真实 backward grad_norm**（GN_RE），不是 update_rel：
+#        grad_norm=0（奖励全同分 ⇒ 优势全 0）  -> 不动是正确的，不算失败
+#        grad_norm>0 却一步没动                -> 真断链，FATAL
+#        各 rank update_rel 全 0 但 grad_norm 也全 0 -> 一致无信号，不是没同步
+#     （2026-10-12 job 12989603：旧判据在这两点上误报出两条 FATAL，把一发
+#      完全正确的 2 卡 DDP 判成 FAILED —— 现已修，见 ez_check_smoke_selftest.py N/O/P）
 #
 # 规模：EZ_SMOKE_TPS=8 让每 rank 恰好分到 1 个 game（TPS/world=1）。
 #   ⚠️ TPS 必须是 world 的倍数，否则各 rank 的 backward 次数不同 -> NCCL 死锁。
@@ -90,7 +105,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # NCCL 的"各 rank 耗时不均"容忍度：ALFWorld 单步推理可能几分钟，
 # torch 侧 setup_dist 已把 timeout 放宽到 30min，这里只是把 NCCL 的 watchdog 也放宽。
 export NCCL_DEBUG=WARN
-export NCCL_ASYNC_ERROR_HANDLING=1
+# ⚠️ `NCCL_ASYNC_ERROR_HANDLING` 在 NCCL ≥2.13（torch 2.x 捆绑的版本）里**已弃用**，
+#    要写 `TORCH_NCCL_ASYNC_ERROR_HANDLING` 才生效；老名字只会被静默忽略。
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_ASYNC_ERROR_HANDLING=1   # 兼容老版本 NCCL，留着无害
 
 CFG=${CFG:-configs/ez_qwen3_4b.yaml}
 NPROC=${NPROC:-8}

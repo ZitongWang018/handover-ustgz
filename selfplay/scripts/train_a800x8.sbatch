@@ -57,6 +57,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # ⚠️ NCCL 默认只在下一個集合通信时才报异步错误，结果是一个 rank 早就挂了、
 #    其它 rank 干等到作业超时。打开它才能**当场**失败当场暴露。
 export NCCL_ASYNC_ERROR_HANDLING=1
+# ⚠️ NCCL ≥2.13 已弃用上面那个名字，实际生效的是下面这个；两个都写以防版本差异
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 CFG=${CFG:-configs/train_qwen3_4b.yaml}
 SMOKE=${SMOKE:-1}

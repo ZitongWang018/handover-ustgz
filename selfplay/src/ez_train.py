@@ -436,15 +436,31 @@ def main() -> int:
         from torch.nn.parallel import DistributedDataParallel as _DDP
         model = _DDP(raw, device_ids=[local], output_device=local,
                      find_unused_parameters=True)
-        log(f"[dist] DDP 已包装：world_size={world} find_unused_parameters=True "
-            f"（adapter 参数量 {sum(p.numel() for p in _lora_all)/1e6:.1f}M × 2 → "
-            f"每步 all-reduce ≈{2*sum(p.numel() for p in _lora_all)*4/1e9:.2f} GB）")
+        log(f"[dist] DDP 已包装：world_size={world} find_unused_parameters=True；"
+            f"两个 adapter 合计 {sum(p.numel() for p in _lora_all)/1e6:.1f}M 参数，"
+            f"每步 all-reduce 的是 **fp32 梯度** ≈{sum(p.numel() for p in _lora_all)*4/1e9:.2f} GB"
+            f"（LoRA 让 DDP 在这里非常划算，不需要 ZeRO/FSDP）")
+        # ★ 探针：DDP 到底转不转发 peft/HF 的方法？不同 torch 版本行为不同，
+        #   实测（torch 2.x, job 12989565）是**不转发** —— 直接调就 AttributeError。
+        #   把它写进日志，以后升级 torch 时一眼能看出行为有没有变。
+        log(f"[dist] 属性转发探针：hasattr(DDP,'set_adapter')={hasattr(model, 'set_adapter')} "
+            f"hasattr(DDP,'generate')={hasattr(model, 'generate')} "
+            f"（False 表示必须用内层 raw 调这些方法；loss 的 forward 仍要用包装后的 model）")
     else:
         model = raw
-    # ★ policy 必须持有 **DDP 包装后的**对象：HFPolicy 内部直接 `model(...)`，
-    #   若传 raw（或 raw.module）就绕过了 DDP 的 forward hook —— 梯度永远不会
-    #   all-reduce，8 个 rank 各自静默跑自己的，速度不涨、指标还对不上。
-    policy = HFPolicy(model, tokenizer)
+    # ★★ DDP 的分工（实测踩过一次，见 job 12989565）：
+    #   `DistributedDataParallel` **不转发** unknown 属性 —— `model.set_adapter(...)`
+    #   会直接抛 `AttributeError: 'DistributedDataParallel' object has no attribute
+    #   'set_adapter'`；`generate` 同理。所以：
+    #     · **peft / HF 自己的方法**（set_adapter / generate / save_pretrained /
+    #       print_trainable_parameters）→ 一律用内层 `raw`
+    #     · **只有"要算梯度的那次 forward"** → 必须用包装后的 `model`，
+    #       否则绕过 DDP 的 forward hook，梯度永远不会 all-reduce（且不报错）
+    #     · `train()/eval()/zero_grad()` 是 nn.Module 自己的方法，用 `model`（包装后）
+    #       才对 —— DDP 要靠 train() 重置 require_backward_grad_sync
+    #   由于 HFPolicy 内部走 `generate`，它必须持有 `raw`；而 loss 的 forward
+    #   由 ez_train 显式把 `model` 传进 `per_token_logps/grpo_loss`，两条路各走各的。
+    policy = HFPolicy(raw, tokenizer)
 
     # ⚠️ 双 adapter 隔离由 peft 的 set_adapter 负责；optimizer 必须覆盖**两个**
     #    adapter 的全部参数（按名字里的 "lora_" 选），否则切到 solver 相位时新参数不在优化器里。
@@ -483,7 +499,7 @@ def main() -> int:
         model.eval()
         for step in range(M_P if not args.dry_run else 1):
             st0 = time.time()
-            model.set_adapter("proposer")
+            raw.set_adapter("proposer")
             # ---- ★ 分片采样（红线 B）：全局 TPS 个 game 由 rank0 抽一次后广播 ----
             #   各 rank 抽各自的会"不重不漏"变成"重且漏"；而 rank0 抽完再切
             #   `games[rank::world]` 才是严格不重不漏。组语义不变 ——
@@ -530,10 +546,10 @@ def main() -> int:
                 #   撞了之后 solver 相位的 `task_id == uid` 分组会把不同任务混成一组。
                 t.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
-                model.set_adapter("solver")
+                raw.set_adapter("solver")
                 rollouts = run_ez_solver_rollouts(env_sr, policy, [t] * G_P, s_cfg,
                                                   tokenize=False, log_fn=log)
-                model.set_adapter("proposer")
+                raw.set_adapter("proposer")
                 p_hat = sum(r.verify.final_match for r in rollouts) / G_P
                 r_total, parts = proposer_reward(t, p_hat, w_sub=w_sub, w_div=w_div)
                 c.reward = r_total
@@ -612,7 +628,7 @@ def main() -> int:
 
         # ================= solver 相位 =================
         model.eval()
-        model.set_adapter("solver")
+        raw.set_adapter("solver")
         # 任务来源对齐论文 Appendix C：solver 只练**本 outer proposer 相位产出的任务**
         # （论文是每迭代用冻结 proposer 重新采样；跨 outer 抽旧题会让任务分布与
         #   当前 proposer 脱节 —— review #2）。池子仍全量持久化供分析。
@@ -676,6 +692,16 @@ def main() -> int:
                 _n_bwd += 1
             if _n_bwd != len(batch):
                 raise SystemExit(f"[solver][红线B] backward 次数 {_n_bwd} != len(batch) {len(batch)}")
+            # ★ S 相位也打一行同款诊断：判读脚本要靠「真实 backward grad_norm」把
+            #   「有梯度却没位移」（真断链，FATAL）和「本来就没梯度」（奖励全同分，
+            #   正确不动）分开。只有 P 相位有诊断行时，S 相位的 0/504 无法判定。
+            _nofS = {id(p): n for n, p in raw.named_parameters()}
+            _actS = [p for p in opt_params if p.grad is not None and p.requires_grad]
+            _gnS = float(sum(p.grad.detach().float().norm() for p in _actS)) if _actS else 0.0
+            _gnSA = float(sum(p.grad.detach().float().norm() for p in _actS
+                              if ".lora_A." in _nofS.get(id(p), "")))
+            _gnSB = float(sum(p.grad.detach().float().norm() for p in _actS
+                              if ".lora_B." in _nofS.get(id(p), "")))
             torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
             update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}")
             rw = [r.traj.reward for r in all_roll]
@@ -683,6 +709,9 @@ def main() -> int:
                 f"| reward mean={np.mean(rw):.3f} "
                 f"| final_match={sum(r.verify.final_match for r in all_roll)}/{len(all_roll)} "
                 f"| pool={len(outer_pool)} | {time.time()-st0:.0f}s")
+            log(f"[outer {outer}][S{step}] 诊断 真实 backward grad_norm={_gnS:.4e} "
+                f"({len(_actS)} 个张量有 grad；A={_gnSA:.4e} B={_gnSB:.4e})"
+                f"{'  ← 奖励全同分 ⇒ 优势全 0 ⇒ 梯度精确为 0，参数不动是正确的' if _gnS == 0.0 else ''}")
             if args.dry_run:
                 break
 
