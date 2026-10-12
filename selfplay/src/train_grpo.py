@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -63,7 +65,11 @@ def setup_dist() -> Tuple[int, int, int]:
     rank, world, local = dist_info()
     if world > 1:
         torch.cuda.set_device(local)
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world)
+        # NCCL 默认 timeout 只有 10 分钟：某个 rank 卡在 rollout / 评测（其它 rank 在
+        # barrier 干等）超过 10 分钟就会被 watchdog 判死直接 abort 整队。
+        # ALFWorld 单步推理最长实测要好几分钟，统一放宽到 30 分钟。
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world,
+                                timeout=timedelta(minutes=30))
     return rank, world, local
 
 
@@ -385,8 +391,11 @@ def evaluate(env_eval, policy: HFPolicy, tasks: Sequence[Dict[str, Any]], cfg: d
         return {}
     # 评测 batch 必须整除 env batch_size —— 评测环境按需临时建，batch_size = n（单条轨迹）
     eval_cfg = RolloutConfig(**{**rollout_cfg.__dict__, "group_size": 1, "temperature": 0.0})
+    # ⚠️ tokenize=False：评测只用 stats（won/invalid/steps），不需要训练词元序列。
+    #    默认 True 会给每条评测轨迹白跑 build_token_sequence（16 条 × W~6k 的渲染+tokenize），
+    #    纯浪费 CPU/时间，还会在评测这个"本来就只发生在 rank0"的环节里拖长其它 rank 的 barrier 等待。
     with generation_mode(policy.model):
-        res = run_rollouts(env_eval, policy, list(tasks[:n]), eval_cfg, reward_cfg)
+        res = run_rollouts(env_eval, policy, list(tasks[:n]), eval_cfg, reward_cfg, tokenize=False)
     won = sum(1 for t in res if t.stats.won)
     invalid = sum(t.stats.n_invalid for t in res)
     steps = sum(t.stats.n_steps for t in res)
@@ -498,7 +507,9 @@ def main() -> int:
                                       weight_decay=cfg["train"].get("weight_decay", 0.0))
     else:
         raise SystemExit(f"未知 optimizer={_opt_name!r}（可选 adamw / adafactor）")
-    total_iters = args.max_iters or cfg["train"]["total_iters"]
+    # 用 `is not None` 而不是 `or`：显式传 --max-iters 0（只跑构建/冒烟自检）时
+    # `or` 会把 0 当 falsy 吃掉，退回 yaml 里的 total_iters，直接跑满全程。
+    total_iters = args.max_iters if args.max_iters is not None else cfg["train"]["total_iters"]
     warmup = cfg["train"].get("warmup_iters", 20)
 
     def lr_at(it: int) -> float:
@@ -572,8 +583,12 @@ def main() -> int:
         group_ids = [i // g for i in range(len(trajs))]
         advs = group_advantages([t.reward for t in trajs], group_ids,
                                 use_std=cfg["train"].get("adv_use_std", True))
+        # 课程权重 task_type_weights 作用在**组内归一化之后**的 advantage 上：
+        # 同组所有轨迹归一化前 reward 乘同一个 w 是严格无效的（被 std 归一化约掉），
+        # 只有乘在归一化后的 advantage 上才真的改变梯度权重。
+        _ttw = getattr(reward_cfg, "task_type_weights", None) or {}
         for t, a in zip(trajs, advs):
-            t.advantage = a
+            t.advantage = a * _ttw.get(t.task_type, 1.0)
         gstats = summarize_grouping([t.reward for t in trajs], group_ids)
 
         # ⚠️ 奖励符号自检：非法动作数与奖励的相关系数**必须为负**。
@@ -618,15 +633,19 @@ def main() -> int:
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
                     batches.append((bt, old))
             total_active = sum(bt.n_active for bt, _ in batches) or 1
+            # 除最后一个 micro-batch 外都用 no_sync() 挂起 all-reduce：每个 micro 的
+            # backward 都会触发一次 DDP 通信，micro 数一多通信量翻倍。no_sync 上下文
+            # 会在退出时自动恢复 require_backward_grad_sync，所以不需要手动再设回 True。
             for k, (bt, old) in enumerate(batches):
-                loss, st = grpo_loss(model, bt, old, clip_eps)
-                weight = bt.n_active / total_active
-                (loss * weight).backward()
+                _sync_ctx = (model.no_sync() if (world > 1 and k < len(batches) - 1)
+                             else contextlib.nullcontext())
+                with _sync_ctx:
+                    loss, st = grpo_loss(model, bt, old, clip_eps)
+                    weight = bt.n_active / total_active
+                    (loss * weight).backward()
                 loss_val += float(loss.item()) * weight
                 for kk, vv in st.items():
                     stats_acc[kk] = stats_acc.get(kk, 0.0) + vv * weight
-            if world > 1:
-                model.require_backward_grad_sync = True
             torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
             # ⚠️ 实测"参数真的动了吗"。
             #    纯 bf16 参数 + AdamW 小 lr 时，更新量远小于 bf16 的 ulp，会被舍入抹掉：
@@ -680,9 +699,10 @@ def main() -> int:
             dist.barrier()
 
         # ---- 保存 ----
-        if is_main(rank) and cfg["train"].get("save_every", 0) and (
-            (it + 1) % cfg["train"]["save_every"] == 0 or it == total_iters - 1
-        ):
+        # save_every=0 表示"训练中不周期存"，但**最终模型必须落盘**（否则跑完 24h
+        # 什么都没留下）。所以最后一轮无条件保存。
+        _se = cfg["train"].get("save_every", 0)
+        if is_main(rank) and ((_se and (it + 1) % _se == 0) or it == total_iters - 1):
             save_checkpoint(model, tokenizer, run_dir, f"iter{it+1}", cfg, {"iter": it + 1})
             log0(rank, f"[ckpt] saved {run_dir / 'ckpt'} (iter {it + 1})")
 
@@ -698,6 +718,8 @@ def main() -> int:
             json.dump(history, fh, indent=2)
         log0(rank, f"[done] {total_iters} iters in {(time.time() - t_start) / 60:.1f} min -> {run_dir}")
     env.close()
+    if env_eval is not None:
+        env_eval.close()
     if world > 1:
         dist.destroy_process_group()
     return 0

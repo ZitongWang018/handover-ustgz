@@ -122,7 +122,10 @@ def compute_reward(stats: TrajectoryStats, cfg: RewardConfig, max_steps: int) ->
     if stats.won:
         r += c.efficiency_bonus * max(0.0, 1.0 - stats.n_steps / denom)
     r -= c.step_penalty * (stats.n_steps / denom)
-    r *= c.task_type_weights.get(stats.task_type, 1.0)
+    # ⚠️ 课程权重 task_type_weights **不要在这里乘**：同一组所有轨迹乘同一个 w，
+    #    组内归一化 (R-mean)/(std+eps) 后 advantage 严格不变（mean/std 同比例缩放），
+    #    乘了也白乘、纯属"配置骗人"。真正的课程作用点在 train_grpo 里、归一化**之后**的
+    #    advantage 上乘（那里不同 task 的 advantage 是独立的，乘 w 才有效）。
     return float(np.clip(r, c.clip_min, c.clip_max))
 
 
