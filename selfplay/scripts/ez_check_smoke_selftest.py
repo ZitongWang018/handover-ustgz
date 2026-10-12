@@ -75,10 +75,15 @@ def run_case(name, msgs, expect_rc, must_contain=(), rank_msgs=None):
         return tag == "PASS"
 
 
-def _rank_msgs(rel_by_rank, world=8, gradchain=GRADCHAIN, facts=FACTS):
-    """造一套 8 个 rank 的完整日志；rel_by_rank={rank: "1.0e+00", ...}。"""
+def _rank_msgs(rel_by_rank, world=8, n_files=None, gradchain=GRADCHAIN, facts=FACTS):
+    """造一套 rank 日志；rel_by_rank={rank: "1.0e+00", ...}。
+
+    `world` 是**日志里写的** world_size，`n_files` 是**实际落盘的 rank 文件数** ——
+    两者故意分开：torchrun 没生效时正好是"8 个进程、每个都以为 world=1"。
+    """
+    n_files = n_files if n_files is not None else world
     out = {}
-    for r in range(world):
+    for r in range(n_files):
         out[r] = [_dist_line(r, world), facts, gradchain,
                   _p_line(rank=r), _upd_new(rel=rel_by_rank.get(r, "1.000e+00"))]
     return out
@@ -157,9 +162,17 @@ def main() -> int:
         "K 8 卡某 rank 梯度没同步",
         _rm[0], 1, ["关4 各 rank 的 max(update_rel)", "1000.0"], rank_msgs=_rm))
 
-    # L 8 卡但 world_size 记成 1 -> WARN（torchrun 没生效），不致命
-    _rm = _rank_msgs({r: "1.0e+00" for r in range(8)}, world=1)
+    # L 8 个进程都以为自己是 world=1（torchrun 没生效）-> WARN，不致命
+    _rm = _rank_msgs({r: "1.0e+00" for r in range(8)}, world=1, n_files=8)
     res.append(run_case("L world_size=1 警告", _rm[0], 0, ["torchrun 没生效"], rank_msgs=_rm))
+
+    # M 单卡运行：只有 rank0 文件，world_size=1 是**正常的**，不该报 WARN
+    #   （job 12989528 实测踩到：单卡也会写 train_log.rank0.jsonl）
+    res.append(run_case(
+        "M 单卡不误报关4",
+        [_dist_line(0, 1), GRADCHAIN, FACTS, _p_line(), _upd_new(), SREWARD],
+        0, ["关4 单卡运行", "结论：**通过**"],
+        rank_msgs={0: [_dist_line(0, 1), GRADCHAIN, FACTS, _p_line(), _upd_new()]}))
 
     print(f"\n{sum(res)}/{len(res)} PASS")
     return 0 if all(res) else 1

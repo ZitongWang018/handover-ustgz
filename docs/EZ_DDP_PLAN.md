@@ -297,6 +297,28 @@ DDP 平均 8 份 → (1/G) Σ_all a_i ℓ_i ，与单卡完全等价
    "哪些参数 requires_grad" 固定 bucket 成员；先 wrap 再切 `requires_grad`，
    非活跃 adapter 的参数**从未进过 bucket 列表**，切到它的相位时梯度不会被同步。
 
+#### 已知风险：`find_unused_parameters=True` × activation checkpointing
+
+第二个适配器在非活跃相位里"没参与前向"，靠 `find_unused_parameters=True` 让它被跳过。
+而 `find_unused_parameters=True` 的实现方式是**每次 backward 都遍历 autograd graph**
+去判定 unused 集合 —— 这和 activation checkpointing 的"反向时重算前向"是有张力的，
+PyTorch 社区里出现过 `Expected to mark a variable ready only once` 这类报错。
+本项目**两层都开了 checkpoint**：基座 `gradient_checkpointing_enable(use_reentrant=False)`
++ `per_token_logps` 里 `checkpoint(_chunk_logp, use_reentrant=False)`。
+`use_reentrant=False` 是官方支持 DDP 的那一支，预期能work，但**没在 8 卡上实测过**。
+
+**若 8 卡冒烟报 "mark a variable ready only once" / "finished reduction in the prior iteration"，**
+按下面的顺序改（前两条不改算法语义）：
+
+1. `static_graph=True`：不行 —— 本项目的"被使用集合"会在 proposer/solver 相位之间变化，
+   静态图会把它缓存错。
+2. **把"未使用的参数"变成"被使用的参数"**（推荐）：在 loss 上加一项系数为 0 的
+   `0.0 * Σ p.sum()`，覆盖**本相位不活跃的那个 adapter**。前向因此触及全部 adapter 参数，
+   `find_unused_parameters=False` 就能用，代价只是每步多 all-reduce 一份未活跃 adapter
+   （≈0.26 GB，LoRA 下可忽略），换来的是"最成熟的那条组合（DDP + checkpoint，无 unused 判定）"。
+3. 关掉 `per_token_logps` 里的分块 checkpoint（`_LOGSOFTMAX_CHUNK` 调到 ≥ 序列长度的量级）
+   —— 只在显存撑得住时用，属于拿显存换稳定。
+
 ### P1 — 效率（1 天）
 - [ ] `env_sr` 懒建（省 1/5 slot）；`OMP_NUM_THREADS=1`（8 卡脚本里已设）
 - [ ] `no_sync()` 包掉除最后一个 micro-batch 之外的所有 backward（主线同款）

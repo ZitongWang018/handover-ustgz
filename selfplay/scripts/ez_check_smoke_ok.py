@@ -259,24 +259,36 @@ def main() -> int:
             if n_lines == 0:
                 empty.append(rf.name)
             per_rank[rk] = vals
-        if empty:
-            findings.append((FATAL, f"关4 这些 rank 日志是空的（该 rank 提早挂了）：{empty}"))
+        # ⚠️ 只有**真的跑过多进程**才判关4：单卡运行时也会写 train_log.rank0.jsonl
+        #    （每 rank 一份日志是通用设计），此时 world_size=1 是**正常的**，
+        #    拿"8 进程"的标准去判单卡会打出假 WARN（job 12989528 实测踩到）。
+        multi = len(rank_files) >= 2 or max(worlds or {1}) > 1
+        if not multi:
+            findings.append((OK, f"关4 单卡运行（world_size={sorted(worlds)}, "
+                                 f"{len(rank_files)} 个 rank 日志），跳过 8 卡判据"))
         else:
-            findings.append((OK, f"关4 {len(rank_files)} 个 rank 日志都存在且非空"))
-        if worlds:
-            w_max = max(worlds)
-            findings.append((OK if w_max > 1 else WARN,
-                             f"关4 日志里的 world_size={sorted(worlds)}"
-                             + ("" if w_max > 1 else "（=1！torchrun 没生效，8 个进程各跑各的）")))
-        peaks = {r: max(v) for r, v in per_rank.items() if v}
-        if len(peaks) >= 2:
-            lo, hi = min(peaks.values()), max(peaks.values())
-            ratio = (hi / lo) if lo > 0 else float("inf")
-            findings.append((OK if (lo > 0 and ratio < 100) else FATAL,
-                             f"关4 各 rank 的 max(update_rel)="
-                             + ", ".join(f"r{r}={v:.2e}" for r, v in sorted(peaks.items()))
-                             + f"（最大/最小 = {ratio:.1f}；≥100× 或某 rank 为 0 "
-                               f"说明它没参与梯度同步）"))
+            if empty:
+                findings.append((FATAL, f"关4 这些 rank 日志是空的（该 rank 提早挂了）：{empty}"))
+            else:
+                findings.append((OK, f"关4 {len(rank_files)} 个 rank 日志都存在且非空"))
+            if worlds:
+                w_max = max(worlds)
+                findings.append((OK if w_max > 1 else WARN,
+                                 f"关4 日志里的 world_size={sorted(worlds)}"
+                                 + ("" if w_max > 1 else
+                                    "（=1！torchrun 没生效，8 个进程各跑各的）")))
+            if len(rank_files) < 2 and args.strict:
+                findings.append((WARN, f"关4 只找到 {len(rank_files)} 个 rank 日志 —— "
+                                       f"以为在跑 8 卡？检查 torchrun --nproc_per_node"))
+            peaks = {r: max(v) for r, v in per_rank.items() if v}
+            if len(peaks) >= 2:
+                lo, hi = min(peaks.values()), max(peaks.values())
+                ratio = (hi / lo) if lo > 0 else float("inf")
+                findings.append((OK if (lo > 0 and ratio < 100) else FATAL,
+                                 f"关4 各 rank 的 max(update_rel)="
+                                 + ", ".join(f"r{r}={v:.2e}" for r, v in sorted(peaks.items()))
+                                 + f"（最大/最小 = {ratio:.1f}；≥100× 或某 rank 为 0 "
+                                   f"说明它没参与梯度同步）"))
 
     # ---- 综合判定 ----
     print("\n===== EZ 冒烟自检 =====")
