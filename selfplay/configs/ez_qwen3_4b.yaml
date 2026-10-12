@@ -12,7 +12,12 @@ run:
 
 model:
   path: $ZTWANG_MODEL_PATH            # 注意：论文用 Qwen3-4B **base**（非 instruct）
-  dtype: float32                      # 同主线：bf16 参数 + AdamW 小 lr 会被舍入抹掉
+  # ★ bf16 基座（与主线 fp32 不同，这是有意的）：
+  #   主线的 fp32 铁律来自"AdamW 直接更新 bf16 基座权重、更新量被舍入抹掉"。
+  #   EZ 里基座**冻结**，只更新 LoRA adapter（peft 默认 fp32 创建），
+  #   adapter 更新量 ~1e-4 远大于 fp32 ulp ~1e-7 —— 舍入问题不存在。
+  #   收益：基座 16G -> 8G，省下的显存给 rollout batch（见 docs/GPU_UTILIZATION_PLAN.md）。
+  dtype: bfloat16
   attn_implementation: flash_attention_2
   gradient_checkpointing: true
   lora: true                          # Table 3: LoRA r32 α32

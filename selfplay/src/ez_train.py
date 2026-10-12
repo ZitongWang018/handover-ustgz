@@ -84,6 +84,15 @@ def build_dual_lora(model, cfg: dict):
     model = get_peft_model(model, lc, adapter_name="proposer")
     model.add_adapter("solver", lc)
     model.set_adapter("proposer")
+    # ★ adapter 参数必须 fp32：基座可以是 bf16（冻结，不参与更新，无舍入问题），
+    #   但被更新的 adapter 要是 bf16，lr=1e-4 的更新同样会被 bf16 ulp 抹掉。
+    n_cast = 0
+    for name, p in model.named_parameters():
+        if "lora_" in name and p.dtype != torch.float32:
+            p.data = p.data.float()
+            n_cast += 1
+    if n_cast:
+        print(f"[ez] cast {n_cast} 个 LoRA 张量到 fp32")
     model.print_trainable_parameters()
     return model
 
@@ -175,6 +184,21 @@ def main() -> int:
     w_sub = tcfg.get("w_sub", 0.3)
     w_div = tcfg.get("w_div", 0.3)
 
+    # ★ --dry-run 只把"步数"降到 1 是**不够**的：G=16 × 30 turns 在 A40 debug 分区
+    #   （30 min 上限）根本跑不完，会卡到超时。这里把 group / turns / tasks 一并压到
+    #   最小，冒烟只验证三件事：链路能通、facts 通道存在、参数真的动了。
+    if args.dry_run:
+        G = int(os.environ.get("EZ_SMOKE_G", "2"))
+        G_P = int(os.environ.get("EZ_SMOKE_G_P", "2"))
+        TPS = int(os.environ.get("EZ_SMOKE_TPS", "1"))
+        M_P = M_S = 1
+        _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "3"))
+        p_max_turns = s_max_turns = _smoke_turns
+        log(f"[dry-run] 缩规模：G={G} G_P={G_P} TPS={TPS} turns={_smoke_turns}")
+    else:
+        p_max_turns = cfg["proposer"].get("max_turns", 30)
+        s_max_turns = cfg["solver"].get("max_turns", 30)
+
     # ---- 环境（facts 通道是 EZ 的命根子，必须开）----
     alf_cfg = load_alfworld_config(
         cfg["env"]["config_path"] if os.path.isabs(cfg["env"]["config_path"])
@@ -183,22 +207,23 @@ def main() -> int:
     log(f"[data] {len(game_files)} train games")
 
     p_cfg = ProposerConfig(
-        group_size=G, max_turns=cfg["proposer"].get("max_turns", 30),
+        group_size=G, max_turns=p_max_turns,
         max_new_tokens=cfg["proposer"].get("max_new_tokens", 160),
         temperature=cfg["proposer"].get("temperature", 1.0),
         give_admissible=cfg["proposer"].get("give_admissible", False))
     s_cfg = RolloutConfig(
-        group_size=1, max_steps=cfg["solver"].get("max_turns", 30),
+        group_size=1, max_steps=s_max_turns,
         max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
         temperature=cfg["solver"].get("temperature", 1.0),
         max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
-        keep_recent_turns=cfg["solver"].get("keep_recent_turns", 12))
+        keep_recent_turns=cfg["solver"].get("keep_recent_turns", 12),
+        stop_mode="tool_call")
     # proposer 训练序列裁剪专用 cfg：必须与生成端 p_cfg 一致，否则训练上下文≠采样上下文
     p_tok_cfg = RolloutConfig(
         group_size=1, max_steps=p_cfg.max_turns,
         max_new_tokens=p_cfg.max_new_tokens, temperature=p_cfg.temperature,
         max_context_tokens=p_cfg.max_context_tokens,
-        keep_recent_turns=p_cfg.keep_recent_turns)
+        keep_recent_turns=p_cfg.keep_recent_turns, stop_mode="tool_call")
 
     env_p = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
                              batch_size=G, max_episode_steps=p_cfg.max_turns,
@@ -220,6 +245,21 @@ def main() -> int:
     model, tokenizer = build_model_and_tokenizer(cfg, local, world)
     model = build_dual_lora(model, cfg)
     policy = HFPolicy(model.module if hasattr(model, "module") else model, tokenizer)
+
+    # ---- 启动自检：dtype / adapter / GC / facts（跑几小时前先炸掉所有致命项）----
+    _p0 = next(model.parameters())
+    _adapters = [n for n, _ in model.named_parameters() if "lora_" in n][:1]
+    log(f"[selfcheck] base dtype={_p0.dtype} | lora参数样例={_adapters} | "
+        f"gc={getattr(model, 'is_gradient_checkpointing', '?')} | "
+        f"stop_mode=tool_call | 基座冻结={not any(p.requires_grad for n, p in model.named_parameters() if 'lora_' not in n)}")
+    # facts 预检：EZ 没有 facts 就是废的，早炸比跑一半炸好
+    from ez_state import assert_facts_mode as _afm
+    from ez_proposer import _slot_snapshot as _snp
+    _pre_games = [game_files[0]] * G_P
+    _obs, _views, _adm, _used, _ = env_sr.reset(_pre_games)
+    _pre = _snp(getattr(env_sr, "last_reset_facts", [None] * G_P)[0], _obs[0])
+    _afm(_pre, "startup preflight")
+    log(f"[selfcheck] facts 通道 OK（{len(_pre.facts)} 条事实）")
 
     device = next(model.parameters()).device
     # ⚠️ 双 adapter 下 peft 靠切换 requires_grad 隔离梯度：optimizer 必须覆盖**两个**

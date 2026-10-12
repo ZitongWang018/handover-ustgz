@@ -18,6 +18,7 @@ from ez_state import (StateDelta, StateSnapshot, delta_covers,  # noqa: E402
 from ez_verify import (ProposedTask, SubtaskRef, action_type,  # noqa: E402
                        proposer_reward, redundant_pair, validity_filter,
                        verify_solver_rollout)
+from rollout import _ToolCallStopCriteria                   # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -156,6 +157,46 @@ p = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_typ
 check("未知动作 -> malformed", p.kind == "malformed")
 p = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"take","object_name":"apple 1"}}</tool_call>')
 check("缺参数 -> malformed", p.kind == "malformed")
+
+print("== tool_call 停止条件（EZ 专用）==")
+
+
+class _FakeTok:
+    """把 token id 直接当字符解码：id n -> 词表第 n 个字符。"""
+    CHARS = ' abcdefghijklmnopqrstuvwxyz<>/{}_-'
+
+    def __init__(self):
+        self.chars = self.CHARS
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.chars[i] if 0 <= i < len(self.chars) else "?" for i in ids)
+
+
+class _FakeTensor:
+    """只实现 stopping criteria 用到的 shape / 二维切片。"""
+    def __init__(self, rows):
+        self.rows = rows
+        self.shape = (len(rows), len(rows[0]) if rows else 0)
+
+    def __getitem__(self, key):
+        i, sl = key
+        return self.rows[i][sl]
+
+
+def _encode(tok: _FakeTok, text: str):
+    return [tok.chars.index(c) for c in text]
+
+
+tok = _FakeTok()
+crit = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
+partial = _encode(tok, "<tool_call>{a}")
+done = _encode(tok, "<tool_call>{a}</tool_call>")
+check("未闭合不停", crit(_FakeTensor([partial]), None) is False)
+check("闭合后停", crit(_FakeTensor([done]), None) is True)
+check("stop_len 记录", crit.stop_len(0, 999) == len(done))
+crit2 = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
+check("从没出现标签 -> 永不触发", crit2(_FakeTensor([partial]), None) is False
+      and crit2.stop_len(0, 999) == 999)
 
 print("== text fallback 降级模式 ==")
 fa = snapshot_from_obs_text("You are in the kitchen.")

@@ -43,6 +43,10 @@ class RolloutConfig:
     keep_recent_turns: int = 12
     invalid_action_mode: str = "raw"       # "raw" | "best_match"
     fuzzy_threshold: float = 0.6
+    # 停止条件模式：
+    #   "action_line"（默认，主线）—— 等到 Action: 那行写完
+    #   "tool_call"（EZ）—— 一看到 </tool_call> 就停，避免白生成到 max_new_tokens
+    stop_mode: str = "action_line"
     seed: Optional[int] = None
     log_every: int = 0
 
@@ -161,8 +165,14 @@ class HFPolicy:
         #    token -> **训练目标被静默污染**。batch=1 时无 padding，不会触发，
         #    所以这个问题只在多卡/多槽训练时才暴露。
         gen_start = int(enc["input_ids"].shape[1])
-        criteria = _ActionStopCriteria(
-            self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
+        if cfg.stop_mode == "tool_call":
+            # EZ：<tool_call>{...}</tool_call> 写完即停。主线判据（Action: 行）对这种
+            # 输出永远不触发 -> 每轮白生成到 max_new_tokens（review P2-14）。
+            criteria = _ToolCallStopCriteria(
+                self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
+        else:
+            criteria = _ActionStopCriteria(
+                self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
 
         gen_kwargs = dict(
             max_new_tokens=cfg.max_new_tokens,
@@ -295,8 +305,47 @@ class _ActionStopCriteria:
         return self._stop.get(row, fallback)
 
 
-# --------------------------------------------------------------------------- gradient checkpointing 开关
+class _ToolCallStopCriteria:
+    """EZ 用：某行写出完整的 `</tool_call>` 即停。
 
+    与 `_ActionStopCriteria` 的差别：判据是闭合标签而非 `Action:` 行；`check_every=1`
+    （标签短，检查间隔大容易多生成十几个 token）。停止长度按"含闭合标签"记录，
+    尾部可能多带 1-2 个空白 token —— 对 EZ 无影响（整条 assistant 消息本来就进 loss）。
+    """
+
+    CLOSE = "</tool_call>"
+
+    def __init__(self, tokenizer, prompt_lens: Sequence[int], max_new_tokens: int,
+                 start_after: int = 4, check_every: int = 1):
+        self.tokenizer = tokenizer
+        self.prompt_lens = list(prompt_lens)
+        self.max_new_tokens = max_new_tokens
+        self.start_after = start_after
+        self.check_every = check_every
+        self._stop: Dict[int, int] = {}
+        self._step = 0
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        self._step += 1
+        rows = input_ids.shape[0]
+        if self._step % self.check_every != 0:
+            return len(self._stop) >= rows if rows else True
+        for i in range(rows):
+            if i in self._stop:
+                continue
+            generated_len = input_ids.shape[1] - self.prompt_lens[i]
+            if generated_len < self.start_after:
+                continue
+            text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:], skip_special_tokens=True)
+            if self.CLOSE in text:
+                self._stop[i] = generated_len
+        return len(self._stop) >= rows if rows else True
+
+    def stop_len(self, row: int, fallback: int) -> int:
+        return self._stop.get(row, fallback)
+
+
+# --------------------------------------------------------------------------- gradient checkpointing 开关
 
 def gc_set(model, on: bool) -> bool:
     """**幂等地**开/关 gradient_checkpointing，返回是否真的动了。

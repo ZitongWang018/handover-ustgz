@@ -60,30 +60,60 @@
 
 ## 3. 复现计划
 
-### Phase 0 — 设计冻结（半天，纯本地）
-- [ ] 定稿状态匹配规格（U1）：state dump 格式、delta 提取、"task-relevant" 谓词筛选规则、匹配算法；写单测（用 3 个手工场景：加热匹配、实例替换匹配、多余动作容忍）。
-- [ ] 按附录 G 骨架写 proposer/solver prompt 全稿（补全省略细节处做显式决策并记录）。
-- [ ] 决定：LoRA r32（贴近论文）vs 全参（贴我们现有 fp32 管线）；决定 KL β=0.001 是否保留。
-- [ ] 产出：`docs/EZ_STATE_MATCH.md`（规格）+ 两份 prompt 文件。
+### Phase 0 — 设计冻结（半天，纯本地）✅ 代码已落地
+- [x] 定稿状态匹配规格（U1）：`src/ez_state.py`（归一化 / delta / delta_covers / match_reference）+ 单测。
+- [x] 按附录 G 骨架写 proposer/solver prompt 全稿：`src/ez_prompts.py`。
+- [x] 决定：**LoRA r32 α32**（贴论文，且 4B 全参 fp32 显存放不下）；KL β=0.001 **暂缓**（我们的 GRPO 内核是 β=0 无参考模型版，LoRA 低 lr 下影响小，列为 TODO）。
+- 产出：`src/ez_state.py` / `src/ez_verify.py` / `src/ez_prompts.py`（规格直接落在代码 + 42 项单测里）。
 
-**验收**：单测全绿；规格文档过一遍人工 review。
+### Phase 1 — 环境快照机制（1-2 天）✅ 代码已落地
+- [x] `alfworld_env.py` 加 `with_facts` + `last_reset_facts` + `BatchStep.facts`（textworld `facts=True` 通道）。
+- [x] `ez_state.py`（快照/delta/匹配）+ `ez_verify.py`（Eq.5/6/7 奖励 + 有效性三规则 + Eq.1-4 proposer 奖励）。
+- [x] 接进 `scripts/ez_unit_test.py`（42 项）。
+- **验收**：离线全绿 ✅；集群侧真 facts 待 `scripts/ez_check_env_facts.py` 确认。
 
-### Phase 1 — 环境快照机制（1-2 天）
-- [ ] `alfworld_env.py` 加 `dump_state()`（textworld facts 序列化）+ `state_delta(s0, s1)`。
-- [ ] 新文件 `ez_verify.py`：参考状态管理、`s ≃ s_ref` 匹配器、Eq.5/6/7 奖励实现、有效性三规则过滤。
-- [ ] 接进 `unit_test.py`。
-- **验收**：对 20 个手工构造的 (s_ref, s_solver) 对，匹配结果与人判一致。
-
-### Phase 2 — proposer 冒烟（2-3 天）
-- [ ] `ez_proposer.py`：探索 loop + `sub_finish`/`finish` 工具解析 + 快照落盘（jsonl）。
-- [ ] proposer prompt 接入；parse 失败率统计。
-- [ ] 用**冻结的 base Qwen3-4B**（不训练）跑 50 条探索轨迹，人工抽查生成任务质量 + filter 接受率。
-- **验收**：接受率 ≥60%（论文没给绝对值，E.3 有趋势可对）；抽查任务物理可达、描述清晰。
+### Phase 2 — proposer 冒烟（2-3 天）✅ 代码已落地
+- [x] `ez_proposer.py`：探索 loop + `sub_finish`/`finish` 工具解析 + 快照落盘（`task_pool.jsonl`）。
+- [x] proposer prompt 接入；`tool_call` 停止条件（`_ToolCallStopCriteria`，按 `</tool_call>` 停）。
+- [ ] **待集群**：用冻结 base Qwen3-4B 跑 50 条探索轨迹，人工抽查任务质量 + filter 接受率 ≥60%。
 
 ### Phase 3 — solver 冒烟（2-3 天）
 - [ ] 生成任务池（Phase 2 产物）→ solver GRPO 小规模训练（单卡 A800/H100，3-5 steps × G=16）。
 - [ ] 验证 Eq.7 奖励分布：失败轨迹的子任务完成率是否有区分度（对照 Prop 1：collapse 率应显著低于二值奖励）。
 - **验收**：collapse 率从 ~100%（二值）降到 <50%；`update_rel > 1e-10`（我们的准入门）。
+
+### Phase 3.5 — EZ 端到端冒烟（**代码已就绪，等开服务器**）
+
+代码状态（2026-10-12）：7 个源文件 + 配置 + 2 个脚本已写完，三 agent 交叉 review 抓出的
+2 个 P0（`old logps` 未脱图 / G_P 撞 env batch）+ 6 个 P1 已全部修复，42 项离线单测全绿。
+**下面这条命令就是 Phase 2+3 的合并验收，一条命令跑完。**
+
+```bash
+# 二期 · A40 48G · debug 分区（30min 上限，几分钟内起算，先跑这个）
+sbatch -p debug -t 00:30:00 --gres=gpu:1 ~/ztwang/selfplay/scripts/ez_smoke_1gpu.sbatch
+
+# 二期 · A800 80G · 单卡（想量真实显存峰值）
+sbatch -p emergency_gpu -t 02:00:00 --gres=gpu:1 ~/ztwang/selfplay/scripts/ez_smoke_1gpu.sbatch
+
+# 三期 · H100（改 account/partition，见脚本头部【三期变体】注释）
+sbatch -p acd_u -A d_tonggehuang_team --qos=normal -t 01:00:00 --gres=gpu:1 .../ez_smoke_1gpu.sbatch
+```
+
+脚本内部按顺序跑四段：离线单测 → `ez_check_env_facts.py`（**facts 通道，EZ 的命根子**）
+→ `ez_train.py --dry-run` → `ez_check_smoke_ok.py`（产物自检）。
+
+冒烟规模会自动缩小（`G=2 G_P=2 TPS=1 turns=3`，因为论文默认 G=16×30turns 在 A40 的
+30min 里跑不完）；想加大用 `--export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=5`。
+
+**三关判定（`ez_check_smoke_ok.py` 的判据，别把这三种情况混为一谈）**
+
+| 现象 | 判定 | 该怎么办 |
+|---|---|---|
+| 日志无 "facts 通道 OK" | **FATAL** | textworld 版本不够，改 `request_infos`；否则奖励是废的 |
+| `update_rel = 0` **且** 奖励有区分度 | **FATAL** | 梯度链断了（no_grad / 断图 / lr=0），必修 |
+| `update_rel = 0` **且** 奖励全同分 | **WARN** | 不是 bug：GRPO 组内优势全 0 时梯度天然为 0。缩规模下常见，加大 turns 再看 |
+| proposer `accept=0/N` | **FATAL** | 提案器一条有效任务都没产出，查 prompt/解析/有效性过滤 |
+| 三关全过 | **PASS** | 允许开 8 卡正式作业 |
 
 ### Phase 4 — 完整交替训练（主实验，8 卡）
 - [ ] 交替循环：4 outer × (25 proposer + 25 solver steps)，LoRA r32，实现 Algorithm 1（含 G_P=8 的 solve-rate 估计和 proposer 奖励）。

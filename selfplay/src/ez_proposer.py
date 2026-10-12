@@ -175,7 +175,8 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                   temperature=cfg.temperature, top_p=cfg.top_p,
                   repetition_penalty=cfg.repetition_penalty,
                   max_context_tokens=cfg.max_context_tokens,
-                  keep_recent_turns=cfg.keep_recent_turns)
+                  keep_recent_turns=cfg.keep_recent_turns,
+                  stop_mode="tool_call")   # 写完 </tool_call> 即停，别白烧 token
 
     obs_list, views, admissible, used, _ = env.reset([game_file] * g)
     s0_facts = list(getattr(env, "last_reset_facts", [None] * g))
