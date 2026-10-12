@@ -17,14 +17,32 @@
 | P0 代码落地 | ✅ | `ez_train.py` / `train_grpo.py` / `ez_smoke_8gpu.sbatch` / `ez_check_smoke_ok.py` 关4 |
 | 单卡冒烟硬通过 | ✅ | job `12989496`：`结论：**通过** ✅ 关0/1/2b/3 全过`，`update_rel=5.00e-01，252/504 张量真的动了` |
 | P0 后单卡回归（确认没改坏 world==1） | ✅ | job `12989528`（`scripts/ez_smoke_1gpu.sbatch`）|
-| 修掉 2 卡那一发触发的判据假警报 | ✅ | 见 §0.5.2；回归用例 16/16 全绿（`ez_check_smoke_selftest.py`，新增 N/O/P） |
+| 修掉 2 卡那一发触发的判据假警报 | ✅ | 见 §0.5.2；回归用例 18/18 全绿（`ez_check_smoke_selftest.py`，新增 N/O/P/Q/R） |
 | **2 卡真实多进程（DDP 接线）** | ✅ | job `12989603` @ `debug:gpu3-9`，2:42。两 rank 各 `本地 games=1/2`、同一 `run_dir`、`world_size=2`、空池时**一致跳过**、双双 `[done]`、`rank0/1.jsonl` 各 15 行 |
 | **2 卡 `turns=16` 硬通过** | ✅ **P0 验收完成** | job `12989645` @ `debug:gpu3-9`，6:43，ExitCode 0:0。自检全 OK 零 WARN：`update_rel(P0)=5.00e-01`、`252/504`、`accept=1/2`、`solver reward mean=1.000`、**两 rank `max(update_rel)` 同量级（比值 1.0）** |
-| 8 卡冒烟（P0 的最后一关） | ⏳ 排队 | job `12989532` @ `i64m1tga800u8ka`（8 卡作业被策略限定只能投 800u8ka / a40u8ka）|
+| **8 卡冒烟（P0 最后一关）** | ✅ **P0 全部完成** | job `12989532` @ `i64m1tga800u8ka`，2.7min。关4 三条全绿：**8 个 rank 日志齐全**、`world_size=[8]`、**8 个 rank 的 `max(update_rel)` 全为 `5.00e-01`（比值 1.0）** |
 
-> **2 卡那一发已经把 DDP 该验的全验了**（分片不重不漏、run_dir 广播、梯度同步、
-> 空池一致跳过、干净退出）。8 卡排队 ~26h，只多验"8 个进程"这一种规模，
-> 逻辑上没有新的失败模式——所以它是**保险**，不是前置条件。
+**8 卡那发的实测输出（job 12989532）**
+
+```
+  [OK   ] 关0 梯度链通：proposer grad_norm=5.661e+02, solver grad_norm=5.639e+02
+  [OK   ] 关1 facts 通道存在（109 条事实）
+  [OK   ] 关2 update_rel 共 2 处：outer 0 P0=5.00e-01, outer 0 S0=0.00e+00
+  [OK   ] 关2b 优化器实际更新张量数：outer 0 P0=252/504, outer 0 S0=0/504
+  [OK   ] 关3 proposer 有有效提案：r0=0/2, r1=1/2, r2=0/2, r3=0/2,
+                                  r4=0/2, r5=0/2, r6=1/2, r7=0/2（全局 2/16）
+  [WARN ] 关3 solver reward mean=['0.000', '0.000']（缩规模下任务太难，正常）
+  [OK   ] 关4 8 个 rank 日志都存在且非空
+  [OK   ] 关4 日志里的 world_size=[8]
+  [OK   ] 关4 各 rank 的 max(update_rel)=r0..r7 全为 5.00e-01（最大/最小=1.0）
+                                            ⇒ 各 rank 都参与了梯度同步
+```
+
+> **8 卡那一发最有意思的一条证据**：rank0 自己的两个候选奖励都是 0
+> （`accept=0/2`，组内 spread=0 ⇒ 优势全 0 ⇒ 它自己算不出梯度），
+> 可它的 `update_rel` 却是**非零的 5.00e-01**。这个梯度只能是 DDP 的
+> all-reduce 从别的 rank（r1、r6 各接受了 1 条）传过来的 —— 而且 8 个 rank
+> 的值**完全一致**。这就是 DDP 真正接上的铁证。
 
 ### 0.5.1 路上清掉的一个"假故障"（值得记住）
 
@@ -331,8 +349,9 @@ DDP 平均 8 份 → (1/G) Σ_all a_i ℓ_i ，与单卡完全等价
 - [x] 分片采样（rank0 抽 + broadcast + `games[rank::world]`）；`uid` 带 rank 防跨 rank 撞号
 - [x] 死锁的显式守卫：空 GRPO 组 → 全局 MIN all_reduce 后**全员同时退出**；
       solver 空池 → 全局一致的跳过决定；空组 backward → 零 loss 占位（绝不 `continue`）
-- [ ] **验收**：8 卡跑完 1 个 outer，8 个 rank 的 `update_rel` 都不为 0
-      → job `12989532` 排队中，判据见 §8 关4（已实现）
+- [x] **验收**：8 卡跑完 1 个 outer，8 个 rank 的 `update_rel` 都不为 0
+      → job `12989532` @ `i64m1tga800u8ka`，2.7min，**关0/1/2/2b/3/4 全绿**
+      （8 个 rank 的 `max(update_rel)` 全为 `5.00e-01`，最大/最小=1.0）
 
 #### P0 里两个容易写错、但**必须**写对的地方（本次踩点）
 

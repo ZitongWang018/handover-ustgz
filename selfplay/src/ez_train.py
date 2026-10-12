@@ -380,13 +380,38 @@ def main() -> int:
                              with_facts=True)
     # ★ 估 solve rate 用独立 env（batch=G_P）：run_ez_solver_rollouts 要求 batch==len(tasks)，
     #   G_P(8) ≠ G(16) 时复用 env_s 会在第一个被接受提案处 ValueError（review P0-2）
-    env_sr = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                              batch_size=G_P, max_episode_steps=s_cfg.max_steps,
-                              with_facts=True)
+    # ★ env_sr 懒建：只在 proposer 相位里 accepted 非空、真正要估 solve rate 时才创建，
+    #   且只建一次（缓存到 env_sr）。省 1/5 slot，避免 8 卡全局 slot 静默超订。
+    #   懒建只影响 env 对象是否存在，不影响任何 rank 的 backward 次数
+    #   （backward 次数由 len(batch) 决定，与 env 无关），因此不违反红线 B。
+    env_sr = None
+    _envs_closed = False
+
+    def _ensure_env_sr():
+        # 懒建 env_sr：只建一次，创建成功后才注册 atexit.close
+        nonlocal env_sr
+        if _envs_closed:
+            raise RuntimeError("[EZ] 环境已关闭，不能再懒建 env_sr")
+        if env_sr is None:
+            env_sr = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
+                                      batch_size=G_P, max_episode_steps=s_cfg.max_steps,
+                                      with_facts=True)
+            atexit.register(env_sr.close)
+        return env_sr
+
+    def close_all():
+        # 统一收尾：判空再 close，并把 env_sr 清空标记已关闭，
+        # 避免收尾之后又被懒建出一个没人管的 env（子进程泄漏）
+        nonlocal env_sr, _envs_closed
+        for _e in (env_p, env_s, env_sr):
+            if _e is not None:
+                _e.close()
+        env_sr = None
+        _envs_closed = True
+
     # 异常退出也释放子进程/句柄（review P1-4）
     atexit.register(env_p.close)
     atexit.register(env_s.close)
-    atexit.register(env_sr.close)
 
     # ---- 模型（共享基座 + 双 LoRA adapter：proposer / solver）----
     # ★ wrap_ddp=False：DDP 必须等**双 adapter 都 trainable 之后**才包（红线 C）。
@@ -406,10 +431,34 @@ def main() -> int:
     from ez_state import assert_facts_mode as _afm
     from ez_proposer import _slot_snapshot as _snp
     _pre_games = [game_files[0]] * G_P
-    _obs, _views, _adm, _used, _ = env_sr.reset(_pre_games)
-    _pre = _snp(getattr(env_sr, "last_reset_facts", [None] * G_P)[0], _obs[0])
-    _afm(_pre, "startup preflight")
-    log(f"[selfcheck] facts 通道 OK（{len(_pre.facts)} 条事实）")
+    # 预检临时建一个 env，验完即关；真正训练时再由懒建路径重建
+    _pre_env = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
+                                batch_size=G_P, max_episode_steps=s_cfg.max_steps,
+                                with_facts=True)
+    try:
+        _obs, _views, _adm, _used, _ = _pre_env.reset(_pre_games)
+        _pre = _snp(getattr(_pre_env, "last_reset_facts", [None] * G_P)[0], _obs[0])
+        _afm(_pre, "startup preflight")
+        log(f"[selfcheck] facts 通道 OK（{len(_pre.facts)} 条事实）")
+    finally:
+        _pre_env.close()
+    # env slot 数进启动自检日志（防 8 卡全局静默超订）：
+    #   · env_p / env_s 已建，按真实 batch_size 计
+    #   · env_sr 此刻必然还没建（懒建），但**预警必须按"将来会建"算**，
+    #     否则这一行在启动时永远显示偏小的占用，预警形同虚设
+    _slot_p = int(getattr(env_p, "batch_size", 0) or 0)
+    _slot_s = int(getattr(env_s, "batch_size", 0) or 0)
+    _slot_sr_built = env_sr is not None
+    _slot_sr_show = _slot_sr_built and int(getattr(env_sr, "batch_size", 0) or 0) or G_P
+    _slot_local = _slot_p + _slot_s + (0 if not _slot_sr_built else int(
+        getattr(env_sr, "batch_size", 0) or 0))
+    _slot_worst = _slot_p + _slot_s + G_P          # 懒建触发后的本 rank 占用
+    _slot_global = world * _slot_worst
+    _slot_warn = "" if _slot_global <= 256 else "  ⚠️ 全局 slot 占用偏高"
+    log(f"[selfcheck] env slots: env_p={_slot_p} env_s={_slot_s} "
+        f"env_sr={_slot_sr_show}{'' if _slot_sr_built else '(lazy)'} "
+        f"→ 本 rank 当前 {_slot_local}，懒建后 {_slot_worst}；"
+        f"{world} rank 全局 {_slot_global}{_slot_warn}")
 
     # ---- 梯度链自检：两个 adapter 是否各自都能接到梯度（不依赖环境/奖励）----
     #   在 wrap **之前**跑：DDP 包装后会插 forward hook，自检的裸 forward/backward
@@ -547,7 +596,7 @@ def main() -> int:
                 t.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
                 raw.set_adapter("solver")
-                rollouts = run_ez_solver_rollouts(env_sr, policy, [t] * G_P, s_cfg,
+                rollouts = run_ez_solver_rollouts(_ensure_env_sr(), policy, [t] * G_P, s_cfg,
                                                   tokenize=False, log_fn=log)
                 raw.set_adapter("proposer")
                 p_hat = sum(r.verify.final_match for r in rollouts) / G_P
@@ -721,9 +770,7 @@ def main() -> int:
         if is_main(rank):
             ez_save(raw, tokenizer, run_dir, f"outer{outer+1}", cfg, {"outer": outer + 1})
 
-    env_p.close()
-    env_s.close()
-    env_sr.close()
+    close_all()
     persist_pool()
     # ★ dry-run 只跑 outer 0，但 N 仍是配置里的 4 —— 直接打 N 会让人以为跑了 4 轮
     _n_done = 1 if (args.dry_run and N > 0) else N

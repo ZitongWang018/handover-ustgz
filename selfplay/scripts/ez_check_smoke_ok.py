@@ -149,6 +149,51 @@ def main() -> int:
 
     findings: list[tuple[str, str]] = []
 
+    # ---- ★ 提前读取各 rank 日志并聚合（**只读一次**，关3 与关4 共用）----
+    #   原来这段在文件末尾的关4 里，导致关3 的 proposer 判据只能扫到 rank0 的日志。
+    #   多卡时每个 rank 只处理 TPS/world 个 game，rank0 自己 accept=0/2 是**正常的**
+    #   （别的 rank 接受了任务；日志里 `pool=2 (+2)` 就是 all_gather 后的全局证据）。
+    #   per_rank     : rank -> 该 rank 所有 P 相位 update_rel 值
+    #   per_rank_gn  : rank -> 该 rank 所有相位的「真实 backward grad_norm」值
+    #   per_rank_acc : rank -> 该 rank 所有 proposer 相位的 (accepted, total)
+    #   worlds       : 各 rank 日志里写的 world_size
+    #   empty        : 内容为空的 rank 日志文件名
+    rank_files = sorted(run_dir.glob("train_log.rank*.jsonl"))
+    per_rank: dict[int, list[float]] = {}
+    per_rank_gn: dict[int, list[float]] = {}
+    per_rank_acc: dict[int, list[tuple[int, int]]] = {}
+    worlds: set[int] = set()
+    empty: list[str] = []
+    for rf in rank_files:
+        rk = int(re.search(r"rank(\d+)", rf.name).group(1))
+        vals: list[float] = []
+        gns: list[float] = []
+        accs_r: list[tuple[int, int]] = []
+        n_lines = 0
+        with open(rf) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                n_lines += 1
+                try:
+                    m_ = json.loads(line)["msg"]
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if (mw := re.search(r"\[dist\] rank=\d+/(\d+)", m_)):
+                    worlds.add(int(mw.group(1)))
+                if (mv := UPD_RE.search(m_)) and mv.group("phase") == "P":
+                    vals.append(_fnum(mv.group("val")))
+                if (mg := GN_RE.search(m_)):
+                    gns.append(_fnum(mg.group("gn")))
+                if (mp := PPLINE_RE.search(m_)):
+                    accs_r.append((int(mp.group("acc")), int(mp.group("tot"))))
+        if n_lines == 0:
+            empty.append(rf.name)
+        per_rank[rk] = vals
+        per_rank_gn[rk] = gns
+        per_rank_acc[rk] = accs_r
+
     # ---- 关0：梯度链自检（最权威的一条）----
     gc = None
     for m in msgs:
@@ -247,17 +292,32 @@ def main() -> int:
         if no_sig:
             findings.append((WARN, f"关2 这些 P 相位组内奖励全同分（无信号，属正常）：{no_sig}"))
 
-    if not p_lines:
+    #   ★ proposer 判据必须**跨 rank 聚合**：多卡时 TPS 个 game 被切成 world 份，
+    #     每个 rank 只有 TPS/world 个，单独看任意一个 rank 的 accept=0 都是正常的。
+    #     只有**所有 rank 合计**为 0 才是"提案器一条有效任务都没产出"。
+    if per_rank_acc:
+        # {rank: (accepted 合计, total 合计)}
+        _sum_by_rank = {rk: (sum(a for a, _ in v), sum(t for _, t in v))
+                        for rk, v in per_rank_acc.items() if v}
+    else:
+        # 退化：没有 rank 文件（旧产物）时用主日志 = rank0
+        _sum_by_rank = {0: (sum(a for a, _, _ in p_lines.values()),
+                            sum(t for _, t, _ in p_lines.values()))}
+
+    if not _sum_by_rank:
         findings.append((WARN, "关3 没有 proposer 相位记录（可能本 outer 没走到）"))
     else:
-        accs = [(a, t) for a, t, _ in p_lines.values()]
-        if max(a for a, _ in accs) == 0:
-            findings.append((FATAL, f"关3 proposer 全部被拒（{accs}）—— 提案器一条有效任务都没产出。"
+        g_acc = sum(a for a, _ in _sum_by_rank.values())
+        g_tot = sum(t for _, t in _sum_by_rank.values())
+        detail = ", ".join(f"r{rk}={a}/{t}" for rk, (a, t) in _sum_by_rank.items())
+        if g_acc == 0:
+            findings.append((FATAL, f"关3 proposer 全部被拒（{detail}，全局 {g_acc}/{g_tot}）"
+                                    f"—— 提案器一条有效任务都没产出。"
                                     f"\n          先看 fmt_bad：>0 是解析/格式问题；=0 但仍 accept=0，"
                                     f"通常是**探索轮数不够**（prompt 要求探索 10-20 个动作后才 "
                                     f"finish，EZ_SMOKE_TURNS 太小就永远走不到 finish）"))
         else:
-            findings.append((OK, f"关3 proposer 有有效提案：{accs}"))
+            findings.append((OK, f"关3 proposer 有有效提案：{detail}（全局 {g_acc}/{g_tot}）"))
 
     # ---- 关3（solver 相位）----
     rw = [(float(m.group("mean")), int(m.group("fm")), int(m.group("n")))
@@ -280,37 +340,9 @@ def main() -> int:
     #   ★ ② 有个陷阱（job 12989603 实测）：本发 accept=0/2 ⇒ 全组奖励同分 ⇒ 各 rank
     #     的 update_rel **一致地**为 0，比值 = inf，被当成"没参与同步"。但各 rank 的
     #     真实 grad_norm 也都是 0，是"一致无信号"而非"不同步"。必须用 GN_RE 分开。
-    rank_files = sorted(run_dir.glob("train_log.rank*.jsonl"))
+    #   （rank_files / per_rank / per_rank_gn / per_rank_acc / worlds / empty
+    #     已在关2 之前提前聚合好，这里直接复用，不再重复读文件）
     if rank_files:
-        per_rank: dict[int, list[float]] = {}
-        per_rank_gn: dict[int, list[float]] = {}
-        worlds: set[int] = set()
-        empty: list[str] = []
-        for rf in rank_files:
-            rk = int(re.search(r"rank(\d+)", rf.name).group(1))
-            vals: list[float] = []
-            gns: list[float] = []
-            n_lines = 0
-            with open(rf) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    n_lines += 1
-                    try:
-                        m_ = json.loads(line)["msg"]
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-                    if (mw := re.search(r"\[dist\] rank=\d+/(\d+)", m_)):
-                        worlds.add(int(mw.group(1)))
-                    if (mv := UPD_RE.search(m_)) and mv.group("phase") == "P":
-                        vals.append(_fnum(mv.group("val")))
-                    if (mg := GN_RE.search(m_)):
-                        gns.append(_fnum(mg.group("gn")))
-            if n_lines == 0:
-                empty.append(rf.name)
-            per_rank[rk] = vals
-            per_rank_gn[rk] = gns
         # ⚠️ 只有**真的跑过多进程**才判关4：单卡运行时也会写 train_log.rank0.jsonl
         #    （每 rank 一份日志是通用设计），此时 world_size=1 是**正常的**，
         #    拿"8 进程"的标准去判单卡会打出假 WARN（job 12989528 实测踩到）。

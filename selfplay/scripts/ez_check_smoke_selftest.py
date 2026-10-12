@@ -89,20 +89,25 @@ def run_case(name, msgs, expect_rc, must_contain=(), rank_msgs=None):
 
 
 def _rank_msgs(rel_by_rank, world=8, n_files=None, gradchain=GRADCHAIN, facts=FACTS,
-               gn_by_rank=None, moved=None, accept=None, spread=None):
+               gn_by_rank=None, moved=None, accept=None, spread=None,
+               accept_by_rank=None):
     """造一套 rank 日志；rel_by_rank={rank: "1.0e+00", ...}。
 
     `world` 是**日志里写的** world_size，`n_files` 是**实际落盘的 rank 文件数** ——
     两者故意分开：torchrun 没生效时正好是"8 个进程、每个都以为 world=1"。
     `gn_by_rank` 用来单独控制某 rank 的真实 grad_norm（默认 4.3530e+00）。
+    `accept_by_rank` 可逐 rank 覆盖 accept（用例 Q 用：只有 rank3 有产出）。
+      ⚠️ 别写成 `accept or 1` —— accept=0 会被吞成 1，就造不出"全被拒"的用例了。
     """
     n_files = n_files if n_files is not None else world
     gn_by_rank = gn_by_rank or {}
     out = {}
     for r in range(n_files):
         _gn = gn_by_rank.get(r, "4.3530e+00")
+        _acc = accept if accept_by_rank is None else accept_by_rank.get(r, accept)
+        _acc = 1 if _acc is None else _acc
         out[r] = [_dist_line(r, world), facts, gradchain,
-                  _p_line(rank=r, acc=accept or 1, tot=2,
+                  _p_line(rank=r, acc=_acc, tot=2,
                           rews=("[0.3, 0.0]" if (spread is None or spread > 0) else "[0.3, 0.3]"),
                           spread=("0.300" if spread is None else f"{spread:.3f}")),
                   _upd_new(rel=rel_by_rank.get(r, "1.000e+00"),
@@ -220,6 +225,21 @@ def main() -> int:
     res.append(run_case(
         "P 2 卡某 rank 真断链(有梯度却不动)",
         _rm[0], 1, ["关2b **真断链**", "关4 各 rank 的 max(update_rel)"], rank_msgs=_rm))
+
+    # Q ★ 8 卡：rank0 自己 accept=0/2，但 rank3 有 2/2 -> 全局有产出，不该 FATAL
+    #     （job 12989532 实测：8 卡各 rank 只有 1 个 game，rank0 被拒是常态。
+    #       旧判据只看 rank0，把一发完全正确的 8 卡作业判成 FAILED。）
+    _rm = _rank_msgs({r: "5.0e-01" for r in range(8)},
+                     accept=0, accept_by_rank={3: 2})
+    res.append(run_case(
+        "Q 8 卡 rank0 被拒但 rank3 有产出(不误报)",
+        _rm[0], 0, ["关3 proposer 有有效提案", "r3=2/2", "全局 2/16"], rank_msgs=_rm))
+
+    # R ★ 8 卡：所有 rank 都是 accept=0/2 -> 真的全拒，仍然 FATAL
+    _rm = _rank_msgs({r: "0.0e+00" for r in range(8)}, accept=0, spread=0.0)
+    res.append(run_case(
+        "R 8 卡全部被拒(仍 FATAL)",
+        _rm[0], 1, ["全部被拒", "全局 0/16"], rank_msgs=_rm))
 
     print(f"\n{sum(res)}/{len(res)} PASS")
     return 0 if all(res) else 1
