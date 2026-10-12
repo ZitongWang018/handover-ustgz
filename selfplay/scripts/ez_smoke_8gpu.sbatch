@@ -117,6 +117,23 @@ export EZ_SMOKE_G_P=${EZ_SMOKE_G_P:-2}
 export EZ_SMOKE_TURNS=${EZ_SMOKE_TURNS:-12}
 export EZ_SMOKE_TPS=${EZ_SMOKE_TPS:-$NPROC}
 
+# ---------- SwanLab 指标上报（2026-10-13）----------
+# API key 不写在脚本里：登录过一次后 swanlab 会把凭据留在 `~/.swanlab/.netrc`（0600），
+# 这样密钥既不进 Git 也不用每次 export。（首次：`python -c "import swanlab; swanlab.login(api_key='...')"`）
+#
+# ⚠️ 三期 ACD **完全无外网**（github/pypi 都不可达），所以在那边必须走 `local`：
+#    训练照常把指标写进 `runs/<name>/swanlog/`，事后在有网的地方
+#    `swanlab sync <run_dir>/swanlog` 一次性补传。
+#    不显式降级的话，auto 模式会先尝试连云端，在没网的计算节点上要等超时才退回本地。
+if [ "$CLUSTER" = "hpc3" ]; then
+  export EZ_SWANLAB_MODE=${EZ_SWANLAB_MODE:-local}
+else
+  export EZ_SWANLAB_MODE=${EZ_SWANLAB_MODE:-auto}
+fi
+# EZ_SWANLAB_MODE=off 可完全关闭上报（排查问题或不想污染线上项目时用）
+export EZ_SWANLAB_PROJECT=${EZ_SWANLAB_PROJECT:-self-play}
+export EZ_SWANLAB_WORKSPACE=${EZ_SWANLAB_WORKSPACE:-ZitongWang}
+
 echo "=== job=$SLURM_JOB_ID cluster=$CLUSTER node=$(hostname) date=$(date) ==="
 echo "PROJ=$PROJ CFG=$CFG conda=$CONDA_ENV NPROC=$NPROC"
 echo "model=$ZTWANG_MODEL_PATH"

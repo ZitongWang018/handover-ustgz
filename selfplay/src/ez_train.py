@@ -26,6 +26,7 @@ import os
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +46,7 @@ import yaml  # noqa: E402
 from alfworld_env import ALFWorldBatchEnv, collect_game_files, load_alfworld_config  # noqa: E402
 from ez_proposer import ProposerConfig, ProposerRollout, run_proposer_exploration  # noqa: E402
 from ez_solver import EzSolverTrajectory, run_ez_solver_rollouts  # noqa: E402
+from ez_swanlab import EzSwanLab  # noqa: E402
 from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
 from rollout import HFPolicy, RolloutConfig, build_token_sequence  # noqa: E402
@@ -55,7 +57,8 @@ from train_grpo import (build_model_and_tokenizer, grpo_loss, group_advantages, 
 
 _LOG_FH = None    # 本 rank 的日志：train_log.rank{rank}.jsonl
 _LOG_FH0 = None   # 仅 rank0：额外的 train_log.jsonl（让现成的判读脚本不用改）
-_RANK = 0
+RANK = 0
+_REPORTER: Any = None   # SwanLab 上报器（未启用时是 no-op 对象，见 ez_swanlab）
 
 
 def log(msg: str) -> None:
@@ -290,6 +293,11 @@ def main() -> int:
         run_dir = Path(_rd[0])
     run_dir.mkdir(parents=True, exist_ok=True)
     task_pool_path = run_dir / "task_pool.jsonl"
+    # ★ SwanLab 上报在这里起：放后面是因为 `run_dir` 必须已经由 rank0 广播出去了，
+    #   否则 8 个 rank 会各自开出 8 个不同名的 run。
+    #   ⚠️ 上报失败不影响训练（ez_swanlab 全吞异常），所以直接挂着不管也行。
+    global _REPORTER
+    _REPORTER = EzSwanLab(cfg, run_dir=run_dir, rank=rank)
     global _LOG_FH, _LOG_FH0
     _LOG_FH = open(run_dir / f"train_log.rank{rank}.jsonl", "w")
     _LOG_FH0 = open(run_dir / "train_log.jsonl", "w") if is_main(rank) else None
@@ -643,6 +651,7 @@ def main() -> int:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             _diag = []
+            _p_loss_sum = 0.0          # 供 SwanLab 上报的本步平均 loss
             for groll in groups:
                 for c in groll:
                     tokenize_proposer_rollout(c, policy, p_tok_cfg)
@@ -667,6 +676,8 @@ def main() -> int:
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
                 loss, _st = grpo_loss(model, bt, old, clip_eps, loss_norm=loss_norm)
                 (loss / len(groups)).backward()
+                # 上报用：这里 detached 取标量，不影响计算图
+                _p_loss_sum += float(loss.detach().item())
             _nof = {id(p): n for n, p in raw.named_parameters()}
             _act = [p for p in opt_params if p.grad is not None and p.requires_grad]
             _gn = float(sum(p.grad.detach().float().norm() for p in _act)) if _act else 0.0
@@ -685,16 +696,38 @@ def main() -> int:
             #   实测教训（job 12989143 outer 2）：accept=1/2 却 update_rel=0，
             #   当时日志里连组奖励都没有，完全无法判断 —— 这就是补它的原因。
             _rw = [round(float(c.reward), 3) for c in cand]
+            # ★ 拒绝原因分布必须汇总进日志（`EZ_EXPERIMENT_PLAN.md` E0）：
+            #   光有 `accept=1/4` 只能知道"合格率低"，看不出**是哪条规则在杀题**。
+            #   `ez_proposer` 已把 reason 存在每条 rollout 的 `reject_reason` 上，
+            #   这里只差汇总。看分布才能决定该放宽过滤规则（U1/U3）
+            #   还是该做 base 模型的格式冷启动（U7）。
+            _rej = Counter(getattr(c, "reject_reason", "unknown") or "accepted"
+                           for c in cand)
             log(f"[outer {outer}][P{step}] rank={rank} 本地 games={len(local_games)}/{TPS} "
                 f"| pool={len(task_pool)} (+{len(new_tasks)}) "
                 f"| accept={len(accepted)}/{len(cand)} | rew={_rw} "
-                f"| rew_spread={max(_rw) - min(_rw) if _rw else 0:.3f} | {time.time()-st0:.0f}s")
+                f"| rew_spread={max(_rw) - min(_rw) if _rw else 0:.3f} "
+                f"| rej={dict(_rej)} | {time.time()-st0:.0f}s")
             # 断层定位：grad_norm>0 而 update_rel=0 -> 优化器/精度问题；
             # grad_norm=0 而 adv_spread>0 -> loss 没把梯度传出来（mask/图断）
             log(f"[outer {outer}][P{step}] 诊断 adv_spread/n_active/len_ids/mask_sum="
                 f"{_diag} | 真实 backward grad_norm={_gn:.4e} "
                 f"({len(_act)} 个张量有 grad；A={_gnA:.4e} B={_gnB:.4e})"
                 f"{'  ← A=0 是正常的（B 初始全 0）' if _gnA == 0.0 and _gnB > 0 else ''}")
+            # ---- SwanLab 上报：proposer 相位 ----
+            # step 必须是**全局单调递增**的，否则 P/S 两条曲线会叠在同一 x 上。
+            # 只有 rank0 真的会发（其它 rank 的 _REPORTER 是 no-op 对象）。
+            _REPORTER.log({
+                "train/loss": _p_loss_sum / max(len(groups), 1),
+                "train/grad_norm": _gn,
+                "train/grad_norm_lora_A": _gnA,
+                "train/grad_norm_lora_B": _gnB,
+                "proposer/reward_mean": float(np.mean(_rw)) if _rw else 0.0,
+                "proposer/reward_spread": max(_rw) - min(_rw) if _rw else 0.0,
+                "proposer/accept_rate": len(accepted) / max(len(cand), 1),
+                "proposer/pool_size": len(task_pool),
+                "proposer/sec_per_step": time.time() - st0,
+            }, step=outer * (M_P + M_S) + step)
             if args.dry_run:
                 break
 
@@ -761,6 +794,7 @@ def main() -> int:
             #   `if not grp: continue` 会让某个 rank 少一次 backward，其它 rank
             #   就永久卡在 NCCL barrier 上。空组用"零 loss 但带计算图"的 backward 占位。
             _n_bwd = 0
+            _s_loss_sum = 0.0          # 供 SwanLab 上报的本步平均 loss
             for t in batch:
                 grp = [r for r in all_roll if r.traj.task_id == t.meta["uid"]]
                 if not grp:
@@ -784,6 +818,7 @@ def main() -> int:
                 #   ★ 分母是**本 rank 的 batch 条数**（=TPS/world）：DDP 取平均后
                 #     全局正好是 1/TPS。不要手动乘 world。
                 (loss / len(batch)).backward()
+                _s_loss_sum += float(loss.detach().item())
                 _n_bwd += 1
             if _n_bwd != len(batch):
                 raise SystemExit(f"[solver][红线B] backward 次数 {_n_bwd} != len(batch) {len(batch)}")
@@ -807,6 +842,26 @@ def main() -> int:
             log(f"[outer {outer}][S{step}] 诊断 真实 backward grad_norm={_gnS:.4e} "
                 f"({len(_actS)} 个张量有 grad；A={_gnSA:.4e} B={_gnSB:.4e})"
                 f"{'  ← 奖励全同分 ⇒ 优势全 0 ⇒ 梯度精确为 0，参数不动是正确的' if _gnS == 0.0 else ''}")
+            # ---- SwanLab 上报：solver 相位 ----
+            # step 要排在同 outer 的 P 相位**之后**（+M_P），否则两条曲线会撞车。
+            _sanity = {
+                "train/loss": _s_loss_sum / max(len(batch), 1),
+                "train/grad_norm": _gnS,
+                "train/grad_norm_lora_A": _gnSA,
+                "train/grad_norm_lora_B": _gnSB,
+                "solver/reward_mean": float(np.mean(rw)) if rw else 0.0,
+                "solver/final_match_rate": (sum(r.verify.final_match for r in all_roll)
+                                            / max(len(all_roll), 1)),
+                "solver/n_rollouts": len(all_roll),
+                "solver/sec_per_step": time.time() - st0,
+            }
+            _REPORTER.log(_sanity, step=outer * (M_P + M_S) + M_P + step)
+            # solver 一步都没解出来 —— 这条要能在手机端看到，而不是等回来看日志
+            if rw and max(rw) == 0.0:
+                _REPORTER.alert(
+                    title="solver 奖励全 0",
+                    text=f"outer {outer} S{step}：{len(all_roll)} 条 rollout 奖励全为 0，"
+                         f"本轮可能发生了 reward collapse，去看 train_log.rank0.jsonl")
             if args.dry_run:
                 break
 
@@ -821,6 +876,11 @@ def main() -> int:
     # ★ dry-run 只跑 outer 0，但 N 仍是配置里的 4 —— 直接打 N 会让人以为跑了 4 轮
     _n_done = 1 if (args.dry_run and N > 0) else N
     log(f"[done] rank={rank} {_n_done} outer loops in {(time.time()-t_start)/60:.1f} min -> {run_dir}")
+    # ⚠️ finish 必须在**关日志文件之后、destroy_process_group 之前**：
+    #    SwanLab 收尾会把缓存的指标 flush 到云端/本地，放在 barrier 后面
+    #    可能因为进程组已销毁而卡住（别的 rank 还在等它参与集合通信）。
+    if _REPORTER is not None:
+        _REPORTER.finish()
     for _fh in (_LOG_FH, _LOG_FH0):
         if _fh is not None:
             _fh.close()
