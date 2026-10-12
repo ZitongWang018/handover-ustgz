@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ez_prompts import append_tool_result, build_proposer_messages
+from ez_prompts import FINISH_NUDGE, NUDGE_WHEN_LEFT, append_tool_result, build_proposer_messages
 from ez_state import (StateDelta, StateSnapshot, assert_facts_mode, snapshot_from_infos,
                       state_delta)
 from ez_verify import (ProposedTask, SubtaskRef, action_type, validity_filter)
@@ -92,41 +92,56 @@ class ParsedToolCall:
     action: str = ""                             # kind=action 时的环境命令
     task_description: str = ""                   # kind=sub_finish/finish 时的描述
     raw: str = ""
+    end_idx: int = -1                            # 工具调用在原文中的结束下标（开区间）；-1 = 未知
 
 
 def parse_tool_call(text: str) -> ParsedToolCall:
-    """从模型输出解析 <tool_call> JSON。
+    """从模型输出解析工具调用。
 
-    兼容两类形态：附录 G 的 `{"name":"alfworld_tool","arguments":{...}}`
-    与裸 `{"action_type": ...}`。
+    ★ 两种形态都要认（2026-10-12 冒烟实测，见 ez_prompts.PROPOSER_SYSTEM 的说明）：
+    1. 附录 G 的 `{"name":"alfworld_tool","arguments":{...}}` 包在 `<tool_call>` 标签里；
+    2. **裸 JSON**（不包标签）—— Qwen3-4B-Instruct-2507 实际就吐这种，而且一轮连写多个。
+       只认形态 1 的话解析 100% 失败（smoke: fmt_bad=6/6 -> accept=0/2）。
+
+    `end_idx` 一并返回，调用方可以据此把 assistant 消息裁到"这一个动作"为止，
+    避免消息历史里留着没被环境执行的动作。
     """
     m = _TOOL_CALL_RE.search(text)
-    if not m:
-        return ParsedToolCall(kind="malformed", raw=text[-200:])
+    if m:
+        obj_text, end_idx = m.group(1), m.end()
+    else:
+        # 延迟 import 避免 rollout <-> ez_proposer 的模块级循环依赖
+        from rollout import scan_bare_json_call
+        span = scan_bare_json_call(text)
+        if span is None:
+            return ParsedToolCall(kind="malformed", raw=text[-200:])
+        end_idx = span[1]
+        obj_text = text[span[0]:span[1]]
     try:
-        obj = json.loads(m.group(1))
+        obj = json.loads(obj_text)
     except json.JSONDecodeError:
-        return ParsedToolCall(kind="malformed", raw=m.group(1)[:200])
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     args = obj.get("arguments", obj)
     if not isinstance(args, dict):
-        return ParsedToolCall(kind="malformed", raw=m.group(1)[:200])
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     at = str(args.get("action_type", "")).strip().lower()
     desc = str(args.get("task_description", "")).strip()
     if at == "sub_finish":
-        return ParsedToolCall(kind="sub_finish", task_description=desc, raw=m.group(1))
+        return ParsedToolCall(kind="sub_finish", task_description=desc, raw=obj_text,
+                              end_idx=end_idx)
     if at == "finish":
-        return ParsedToolCall(kind="finish", task_description=desc, raw=m.group(1))
+        return ParsedToolCall(kind="finish", task_description=desc, raw=obj_text, end_idx=end_idx)
     tpl = _ACTION_TYPE_COMMANDS.get(at)
     if tpl is None:
-        return ParsedToolCall(kind="malformed", raw=m.group(1)[:200])
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     try:
         action = tpl.format(**{k: str(v) for k, v in args.items() if k != "action_type"})
     except KeyError:
-        return ParsedToolCall(kind="malformed", raw=m.group(1)[:200])
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     action = " ".join(action.split())
     if "{" in action or "}" in action:
-        return ParsedToolCall(kind="malformed", raw=m.group(1)[:200])
-    return ParsedToolCall(kind="action", action=action, raw=m.group(1))
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
+    return ParsedToolCall(kind="action", action=action, raw=obj_text, end_idx=end_idx)
 
 
 def sanitize_explore_action(action: str, admissible: Sequence[str],
@@ -204,6 +219,15 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
         if not any(active):
             break
         idxs = [s for s in range(g) if active[s]]
+        # ★ 临近回合上限时注入一次收尾提醒。没有它，模型会把回合跑满也不 finish
+        #   （实测 mean_turns == max_turns、accept=0，整轮 proposer 白跑）。
+        _left = cfg.max_turns - turn
+        if _left <= NUDGE_WHEN_LEFT:
+            for s in idxs:
+                if not stats[s].get("nudged"):
+                    messages[s].append({"role": "user", "content": FINISH_NUDGE.format(
+                        remaining=_left, total=cfg.max_turns)})
+                    stats[s]["nudged"] = 1
         texts, gen_ids, _ = policy.generate([messages[s] for s in idxs], gen_cfg)
 
         # ---- 解析 + 分类 ----
@@ -214,6 +238,13 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
             messages[s].append({"role": "assistant", "content": texts[k].strip()})
             gen_ids_log[s].append(list(gen_ids[k]))
             stats[s]["turns"] += 1
+            # ★ 工具调用之后还有多余内容？说明"一轮一动作"没被停止条件拦住。
+            #   这里**只统计不裁剪**：build_token_sequence 要求 assistant 段用模型真实
+            #   生成的 token id（见其 docstring：重新 tokenize 会引入 1 token 偏差、
+            #   污染训练目标），事后裁文本会让 gen_ids 与消息长度失配。
+            #   真正的拦截点放在 rollout._ToolCallStopCriteria（停在第一个完整动作对象）。
+            if parsed.end_idx > 0 and parsed.end_idx < len(texts[k].rstrip()):
+                stats[s]["extra"] = stats[s].get("extra", 0) + 1
 
             if parsed.kind == "malformed":
                 stats[s]["fmt"] += 1
@@ -316,8 +347,10 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
     if log_fn:
         acc = sum(1 for r in rollouts if r.accepted)
         dropped = sum(stats[s].get("dropped_sub", 0) for s in range(g))
+        extra = sum(stats[s].get("extra", 0) for s in range(g))
         log_fn(f"[proposer] {acc}/{g} accepted | mean_turns="
                f"{np.mean([r.n_turns for r in rollouts]):.1f} | "
                f"fmt_bad={sum(r.n_format_violation for r in rollouts)} | "
-               f"dropped_sub={dropped} | {time.time()-t0:.1f}s")
+               f"dropped_sub={dropped} | extra_after_call={extra} | "
+               f"{time.time()-t0:.1f}s")
     return rollouts

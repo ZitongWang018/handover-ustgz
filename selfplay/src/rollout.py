@@ -306,11 +306,17 @@ class _ActionStopCriteria:
 
 
 class _ToolCallStopCriteria:
-    """EZ 用：某行写出完整的 `</tool_call>` 即停。
+    """EZ 用：写完一个工具调用即停。
 
-    与 `_ActionStopCriteria` 的差别：判据是闭合标签而非 `Action:` 行；`check_every=1`
-    （标签短，检查间隔大容易多生成十几个 token）。停止长度按"含闭合标签"记录，
-    尾部可能多带 1-2 个空白 token —— 对 EZ 无影响（整条 assistant 消息本来就进 loss）。
+    ★ 为什么要认**裸 JSON**（2026-10-12 冒烟实测）：
+    只按 `</tool_call>` 闭合标签停的话，Qwen3-4B-Instruct-2507 根本不吐标签——
+    它直接把 `{"name":"alfworld_tool","arguments":{...}}` 甩出来，并且**一轮里
+    连写 8 个动作**一路顶到 max_new_tokens。后果：
+      * 解析侧 `<tool_call>...</tool_call>` 正则 100% 失配 -> fmt_bad=6/6 -> accept=0
+      * 即使能解析，一次生成 8 个动作而循环只执行第 1 个，消息历史里的"8 个动作"
+        与环境实际执行的 1 个动作对不上，训练信号被污染
+    所以停止判据改成：**闭合标签 或 第一个括号配平的动作 JSON 对象**，
+    这样"一步一动作"在生成侧就被强制住，不需要事后裁剪。
     """
 
     CLOSE = "</tool_call>"
@@ -337,12 +343,63 @@ class _ToolCallStopCriteria:
             if generated_len < self.start_after:
                 continue
             text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:], skip_special_tokens=True)
-            if self.CLOSE in text:
+            if self.CLOSE in text or scan_bare_json_call(text) is not None:
                 self._stop[i] = generated_len
         return len(self._stop) >= rows if rows else True
 
     def stop_len(self, row: int, fallback: int) -> int:
         return self._stop.get(row, fallback)
+
+
+def scan_bare_json_call(text: str) -> Optional[Tuple[int, int]]:
+    """扫出**第一个括号配平、且含 `"action_type"` 的 JSON 对象**。
+
+    返回 `(start, end)`（end 为开区间，指向对象右花括号之后）；没有则 None。
+
+    用括号配平而不是正则：`arguments` 是嵌套对象，`\\{.*?\\}` 这类非贪婪正则在
+    "有嵌套 + 后面还有别的对象"时会切错位置。字符串内部的花括号/引号必须跳过，
+    否则 `{"task_description": "put an apple in {the} bowl"}` 会算错深度。
+
+    ★ 必须排除 `"arguments"` 的**内层对象**（单测抓出来的 bug）：
+    `{"name":"alfworld_tool","arguments":{"action_type":"look"}}` 里，内层
+    `{"action_type":"look"}` 自己也是配平的、也含 `"action_type"`。外层还没闭合时
+    （逐 token 增量判定下必然先出现这一幕），扫描会先命中内层对象就停下 ->
+    **工具调用被从中间的 `}` 截断**，解析出来的是半个 JSON。
+    所以：紧跟在 `"arguments":` 之后的对象要跳过，继续往外找。
+    """
+    n = len(text)
+    i = 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, n):
+            c = text[j]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    cand = text[i:j + 1]
+                    if ('"action_type"' in cand or '"task_description"' in cand) and \
+                            not re.search(r'"arguments"\s*:\s*$', text[:i].rstrip()):
+                        return i, j + 1
+                    break          # 不是完整工具调用，从下一个 '{' 继续找
+        i += 1
 
 
 # --------------------------------------------------------------------------- gradient checkpointing 开关

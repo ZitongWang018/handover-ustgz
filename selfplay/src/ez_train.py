@@ -39,6 +39,7 @@ install_alfworld_compat()
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
 import yaml  # noqa: E402
 
 from alfworld_env import ALFWorldBatchEnv, collect_game_files, load_alfworld_config  # noqa: E402
@@ -48,19 +49,29 @@ from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
 from rollout import HFPolicy, RolloutConfig, build_token_sequence  # noqa: E402
 from train_grpo import (build_model_and_tokenizer, grpo_loss, group_advantages,  # noqa: E402
-                        load_cfg, log0, make_batch, per_token_logps, set_seed,
-                        dist_info)
+                        is_main, load_cfg, log0, make_batch, per_token_logps,
+                        set_seed, setup_dist)
 
 
-_LOG_FH = None
+_LOG_FH = None    # 本 rank 的日志：train_log.rank{rank}.jsonl
+_LOG_FH0 = None   # 仅 rank0：额外的 train_log.jsonl（让现成的判读脚本不用改）
+_RANK = 0
 
 
 def log(msg: str) -> None:
-    """同时落 stdout 和 train_log.jsonl（review P1-4：句柄不能是死的）。"""
-    log0(0, msg)
-    if _LOG_FH is not None:
-        _LOG_FH.write(json.dumps({"t": time.time(), "msg": msg}, ensure_ascii=False) + "\n")
-        _LOG_FH.flush()
+    """同时落 stdout 和日志文件。
+
+    ★ DDP 下 stdout 只有 rank0 会打（`log0`），但**每个 rank 都必须落自己的文件**：
+    否则某个 rank 静默挂掉时，从 rank0 的日志里完全看不出来（8 卡验收第 3 条）。
+    rank0 额外再写一份 `train_log.jsonl`，保持 `ez_check_smoke_ok.py` 无需改动。
+    """
+    log0(_RANK, msg)
+    rec = json.dumps({"t": time.time(), "rank": _RANK, "msg": msg},
+                     ensure_ascii=False) + "\n"
+    for fh in (_LOG_FH, _LOG_FH0):
+        if fh is not None:
+            fh.write(rec)
+            fh.flush()
 
 
 # --------------------------------------------------------------------------- LoRA
@@ -93,6 +104,19 @@ def build_dual_lora(model, cfg: dict):
             n_cast += 1
     if n_cast:
         print(f"[ez] cast {n_cast} 个 LoRA 张量到 fp32")
+    # ★ 8 卡 DDP 红线 C：DDP 在**构造那一刻**按"哪些参数 requires_grad"固定注册
+    #   all-reduce hook（决定 bucket 成员）。之后即使某参数再变成 requires_grad=True，
+    #   它的梯度也**永远不会被同步** —— 而且是静默错，loss 照跑、只有多卡不一致。
+    #   所以两个 adapter 必须在 wrap 之前就都是 trainable。
+    #   相位隔离不再靠 requires_grad，而靠"没参与前向 → unused → 跳过"
+    #   （配 DDP 的 find_unused_parameters=True）。
+    n_tr = 0
+    for _n, p in model.named_parameters():
+        if "lora_" in _n and not p.requires_grad:
+            p.requires_grad_(True)
+            n_tr += 1
+    if n_tr:
+        print(f"[ez] 打开 {n_tr} 个 LoRA 张量的 requires_grad（DDP wrap 前必须，红线 C）")
     model.print_trainable_parameters()
     return model
 
@@ -118,20 +142,46 @@ def tokenize_proposer_rollout(ro: ProposerRollout, policy, gen_cfg) -> ProposerR
 def update_probe(model, opt_params, optimizer, tag: str) -> float:
     """'参数真的动了吗' probe（主线 train_grpo 同款准入门）。
 
-    LoRA 下取中等大小的 adapter 参数张量测 step 前后相对变化量。
+    ⚠️ 实测教训（job 12989450）：旧实现取"**第一个** numel>=4096 的 LoRA 张量"，
+    按 `named_parameters()` 顺序正好命中 `layers.0.self_attn.q_proj.lora_A.<adapter>`。
+    而 peft 把 **lora_B 初始化成全 0**：
+
+        y = W x + B(A x) · s      ⇒   ∂L/∂A = Bᵀ(∂L/∂y) xᵀ ≡ 0     （B == 0 时）
+
+    即该张量在第 0 步的梯度是**精确的 0**（不是"小"，是 0）。AdamW 里
+    exp_avg = 0 ⇒ Δp = 0 ⇒ 打印 `update_rel=0.000e+00`。于是日志出现
+    「真实 backward grad_norm=6.1474e+00（504 个张量有 grad）却 update_rel=0.000e+00」
+    这种自相矛盾的指纹 —— **梯度链是通的，是 probe 挑错了张量**。
+
+    新实现（三条都更硬）：
+      * 对**所有带 grad 的参数**逐个测位移，报 max，而不是只看某一个固定张量；
+      * 报"多少张量真的动了"（n_moved/n_total）—— 这才是"优化器到底动了没"的直接答案；
+      * rel 用**有界**形式 ‖Δp‖/(‖p‖+‖Δp‖) ∈ [0,1)：zero-init 的 lora_B 分母不为 0，
+        给 1.0 而不是 ∞，避免日志里冒出 1e8 这种没意义的数。
+      * 再打 top3 张量名，出问题能直接定位到具体层。
     """
-    probe = None
-    for p in opt_params:
-        if p.numel() >= 4096:
-            probe = p
-            break
-    if probe is None:
-        probe = opt_params[len(opt_params) // 2]
-    before = probe.detach().clone()
+    probes = [p for p in opt_params if p.grad is not None and p.requires_grad]
+    if not probes:
+        log(f"[{tag}] update_rel=0（没有任何参数带 grad，优化器无事可做）")
+        return 0.0
+    _nm = {id(p): n for n, p in model.named_parameters()}
+    before = [p.detach().clone() for p in probes]
     optimizer.step()
+    rows = []          # (rel, |Δp|, ‖p‖, name)
     with torch.no_grad():
-        rel = float((probe.detach() - before).norm() / max(probe.detach().norm().item(), 1e-12))
-    log(f"[{tag}] update_rel={rel:.3e}（必须为 >>1e-10，否则梯度是死的）")
+        for p, b in zip(probes, before):
+            d = float((p.detach() - b).norm())
+            n = float(p.detach().norm())
+            rows.append((d / (n + d) if (n + d) > 0 else 0.0, d, n, _nm.get(id(p), "?")))
+    del before
+    n_moved = sum(1 for r in rows if r[1] > 0.0)
+    rows.sort(key=lambda r: -r[0])
+    rel = rows[0][0] if rows else 0.0
+    _dmax = max((r[1] for r in rows), default=0.0)
+    log(f"[{tag}] update_rel={rel:.3e}"
+        f"（=max ‖Δp‖/(‖p‖+‖Δp‖)；{n_moved}/{len(probes)} 张量真的动了；max‖Δp‖={_dmax:.3e}）")
+    log(f"[{tag}] probe top3 -> " + " | ".join(
+        f"{r[3][-42:]} rel={r[0]:.2e} |Δ|={r[1]:.2e} ‖p‖={r[2]:.2e}" for r in rows[:3]))
     return rel
 
 
@@ -153,6 +203,60 @@ def ez_save(model, tokenizer, run_dir: Path, tag: str, cfg: dict, extra: dict) -
     tmp_dir.rename(ckpt_dir)
 
 
+def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
+    """启动自检：证明**两个 adapter 各自都真的能接到梯度**。
+
+    这条自检刻意不依赖环境、不依赖奖励、不依赖模型能不能完成任务，几秒钟跑完。
+    它回答的是一个和"奖励有没有区分度"**完全无关**的问题：
+
+        前向 -> 该 adapter 的 LoRA 参数 -> loss -> 反向 -> p.grad 非空 ？
+
+    为什么必须单独测：双 adapter + `set_adapter` 的隔离语义、peft 的包装、
+    gradient_checkpointing、以及（将来到 8 卡时）DDP 注册 hook 的时机，
+    都可能让**某一个 adapter 静默收不到梯度** —— 现象就是日志里 update_rel=0，
+    但你无法区分"梯度链断了"和"这组奖励恰好全相同"。
+    有了这条自检，两者就能一刀切开。
+
+    非破坏性：只 backward，不 optimizer.step()，不改任何权重。
+    """
+    out: Dict[str, float] = {}
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], device=device)
+    attn = torch.ones_like(ids)
+    for name in ("proposer", "solver"):
+        try:
+            model.set_adapter(name)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[selfcheck] 切到 adapter {name!r} 失败：{exc}")
+            out[f"{name}_grad_norm"] = float("nan")
+            continue
+        model.zero_grad(set_to_none=True)
+        logits = model(input_ids=ids, attention_mask=attn).logits
+        logits.float().pow(2).mean().backward()
+        tot, n_grad = 0.0, 0
+        for n, p in model.named_parameters():
+            if "lora_" in n and name in n and p.grad is not None:
+                n_grad += 1
+                tot += float(p.grad.detach().float().norm())
+        out[f"{name}_grad_norm"] = tot
+        out[f"{name}_params_with_grad"] = float(n_grad)
+    model.zero_grad(set_to_none=True)
+    model.set_adapter("proposer")
+    return out
+
+
+def _borrow_batch(all_roll, pad_id: int, device):
+    """从已有的 rollout 里借一条造"占位 batch"，用来保持各 rank 的 backward 次数一致。
+
+    DDP 的 all-reduce 是集合通信：某个 rank 少做一次 backward，其它 rank 就会
+    永久卡在 NCCL barrier（红线 B）。空组本身不该出现，但**出现了也绝不能 continue** ——
+    这里用"零 loss 但保留计算图"的 backward 顶上，次数对齐、梯度为 0、结果不受影响。
+    """
+    for r in all_roll:
+        if getattr(r.traj, "input_ids", None):
+            return make_batch([r.traj], pad_id, device)
+    return None
+
+
 # --------------------------------------------------------------------------- 主循环
 
 
@@ -165,14 +269,37 @@ def main() -> int:
 
     cfg = load_cfg(args.config)
     seed = cfg["run"].get("seed", 42)
-    rank, world, local = dist_info()   # 本版 scaffold 按 world==1 设计；DDP 分片 TODO
+    # ★ 必须用 setup_dist()（会 init_process_group），不能用 dist_info()：
+    #   dist_info() 只读环境变量，从不建进程组 —— 8 进程照跑，但 all_reduce /
+    #   broadcast 全部抛 "Default process group has not been initialized"。
+    rank, world, local = setup_dist()
+    global _RANK
+    _RANK = rank
     set_seed(seed, rank)
 
-    run_dir = Path(cfg["run"]["output_dir"]) / f"{cfg['run']['name']}-{time.strftime('%m%d-%H%M')}"
+    if is_main(rank):
+        run_dir = Path(cfg["run"]["output_dir"]) / \
+            f"{cfg['run']['name']}-{time.strftime('%m%d-%H%M')}"
+    else:
+        run_dir = Path(".")          # 占位，马上被广播覆盖
+    if world > 1:
+        # ★ 各 rank 不能各自取时间命名：跨分钟边界时 rank0 与 rank7 会落到**两个目录**，
+        #   表现为"rank0 有日志、rank7 的文件不存在"，很难查。统一由 rank0 决定。
+        _rd = [str(run_dir)]
+        dist.broadcast_object_list(_rd, src=0)
+        run_dir = Path(_rd[0])
     run_dir.mkdir(parents=True, exist_ok=True)
     task_pool_path = run_dir / "task_pool.jsonl"
-    global _LOG_FH
-    _LOG_FH = open(run_dir / "train_log.jsonl", "w")
+    global _LOG_FH, _LOG_FH0
+    _LOG_FH = open(run_dir / f"train_log.rank{rank}.jsonl", "w")
+    _LOG_FH0 = open(run_dir / "train_log.jsonl", "w") if is_main(rank) else None
+    log(f"[dist] rank={rank}/{world} local_rank={local} "
+        f"device=cuda:{torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'} "
+        f"| run_dir={run_dir}")
+    if world > 1 and world != int(os.environ.get("WORLD_SIZE", "1")):
+        log(f"[dist] ⚠️ world={world} 与 WORLD_SIZE={os.environ.get('WORLD_SIZE')} 不一致")
+    if world == 1 and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        log("[dist] ⚠️ 检测到 WORLD_SIZE>1 但进程组未生效 —— torchrun 参数可能没传进去")
 
     tcfg = cfg["train"]
     # 用 is not None 而不是 or：--max-outer 0（只跑构建自检）不会被 falsy 吃掉
@@ -187,17 +314,37 @@ def main() -> int:
     # ★ --dry-run 只把"步数"降到 1 是**不够**的：G=16 × 30 turns 在 A40 debug 分区
     #   （30 min 上限）根本跑不完，会卡到超时。这里把 group / turns / tasks 一并压到
     #   最小，冒烟只验证三件事：链路能通、facts 通道存在、参数真的动了。
+    #
+    #   ⚠️ turns 不能压到 3！prompt 要求"探索 10-20 个动作后才 finish"，turns=3 时
+    #   proposer 必然在 finish 之前就把回合用光 -> accept 恒为 0 -> 任务池空 ->
+    #   solver 相位整个跳过 -> 冒烟"看起来通过"但其实一条真链路都没走。
+    #   实测证据（job 12989069）：fmt_bad=0（解析已修好）但 accept=0/2、mean_turns=3.0。
+    #   12 轮足够让 Qwen3-4B 走到 finish，同时 2 slot × 12 轮在 A40 上约 40s。
     if args.dry_run:
         G = int(os.environ.get("EZ_SMOKE_G", "2"))
         G_P = int(os.environ.get("EZ_SMOKE_G_P", "2"))
         TPS = int(os.environ.get("EZ_SMOKE_TPS", "1"))
         M_P = M_S = 1
-        _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "3"))
+        _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "12"))
         p_max_turns = s_max_turns = _smoke_turns
         log(f"[dry-run] 缩规模：G={G} G_P={G_P} TPS={TPS} turns={_smoke_turns}")
     else:
         p_max_turns = cfg["proposer"].get("max_turns", 30)
         s_max_turns = cfg["solver"].get("max_turns", 30)
+
+    # ---- ★ 8 卡 DDP 红线 B：每个 rank 的 backward 次数必须**完全相同** ----
+    #   DDP 的 all-reduce 是集合通信：rank0 做了 3 次 backward 而 rank7 做了 0 次，
+    #   就会永久卡在 NCCL barrier 上（直到 30 分钟 timeout 才 abort，等于白排一次队）。
+    #   分片后每 rank 处理 TPS/world 个 game，所以 TPS 必须是 world 的正整数倍。
+    #   配置默认 TPS=2 是**单卡**的务实值；8 卡时直接断言会死在起跑线，因此这里
+    #   向上取整到 world 的倍数并**大声抱怨** —— 组语义不变，只是全局 batch 变大。
+    if world > 1 and (TPS % world or TPS < world):
+        TPS_new = max(world, ((TPS + world - 1) // world) * world)
+        log(f"[dist] ⚠️ tasks_per_step={TPS} 不能被 world={world} 整除（或小于 world）。"
+            f"每 rank 的 backward 次数必须一致，否则 DDP 直接死锁（红线 B）。"
+            f"已自动上调为 TPS={TPS_new}（每 rank {TPS_new // world} 个 game）。"
+            f"想固定请设 train.tasks_per_step 或 EZ_SMOKE_TPS 为 {world} 的倍数")
+        TPS = TPS_new
 
     # ---- 环境（facts 通道是 EZ 的命根子，必须开）----
     alf_cfg = load_alfworld_config(
@@ -242,16 +389,19 @@ def main() -> int:
     atexit.register(env_sr.close)
 
     # ---- 模型（共享基座 + 双 LoRA adapter：proposer / solver）----
-    model, tokenizer = build_model_and_tokenizer(cfg, local, world)
-    model = build_dual_lora(model, cfg)
-    policy = HFPolicy(model.module if hasattr(model, "module") else model, tokenizer)
+    # ★ wrap_ddp=False：DDP 必须等**双 adapter 都 trainable 之后**才包（红线 C）。
+    raw, tokenizer = build_model_and_tokenizer(cfg, local, world, wrap_ddp=False)
+    raw = build_dual_lora(raw, cfg)
 
     # ---- 启动自检：dtype / adapter / GC / facts（跑几小时前先炸掉所有致命项）----
-    _p0 = next(model.parameters())
-    _adapters = [n for n, _ in model.named_parameters() if "lora_" in n][:1]
+    _p0 = next(raw.parameters())
+    _adapters = [n for n, _ in raw.named_parameters() if "lora_" in n][:1]
+    _lora_all = [p for n, p in raw.named_parameters() if "lora_" in n]
+    _lora_tr = [p for p in _lora_all if p.requires_grad]
     log(f"[selfcheck] base dtype={_p0.dtype} | lora参数样例={_adapters} | "
-        f"gc={getattr(model, 'is_gradient_checkpointing', '?')} | "
-        f"stop_mode=tool_call | 基座冻结={not any(p.requires_grad for n, p in model.named_parameters() if 'lora_' not in n)}")
+        f"gc={getattr(raw, 'is_gradient_checkpointing', '?')} | "
+        f"stop_mode=tool_call | 基座冻结={not any(p.requires_grad for n, p in raw.named_parameters() if 'lora_' not in n)} "
+        f"| LoRA 可训练 {len(_lora_tr)}/{len(_lora_all)} | lora dtype={_lora_all[0].dtype if _lora_all else '?'}")
     # facts 预检：EZ 没有 facts 就是废的，早炸比跑一半炸好
     from ez_state import assert_facts_mode as _afm
     from ez_proposer import _slot_snapshot as _snp
@@ -261,10 +411,46 @@ def main() -> int:
     _afm(_pre, "startup preflight")
     log(f"[selfcheck] facts 通道 OK（{len(_pre.facts)} 条事实）")
 
-    device = next(model.parameters()).device
-    # ⚠️ 双 adapter 下 peft 靠切换 requires_grad 隔离梯度：optimizer 必须覆盖**两个**
+    # ---- 梯度链自检：两个 adapter 是否各自都能接到梯度（不依赖环境/奖励）----
+    #   在 wrap **之前**跑：DDP 包装后会插 forward hook，自检的裸 forward/backward
+    #   会额外触发 reducer，日志更乱且没有诊断价值。device 见下一行。
+    _gc = grad_chain_selfcheck(raw, tokenizer, next(raw.parameters()).device)
+    log(f"[selfcheck] 梯度链 proposer grad_norm={_gc['proposer_grad_norm']:.4e} "
+        f"({int(_gc.get('proposer_params_with_grad', 0))} 个张量有 grad) | "
+        f"solver grad_norm={_gc['solver_grad_norm']:.4e} "
+        f"({int(_gc.get('solver_params_with_grad', 0))} 个张量有 grad)")
+    for _k in ("proposer_grad_norm", "solver_grad_norm"):
+        _v = _gc.get(_k, 0.0)
+        if not (_v > 0):
+            raise SystemExit(
+                f"[selfcheck] {_k}={_v!r} —— 该 adapter 收不到梯度，训练一定原地不动。"
+                f" 检查：peft set_adapter 的 requires_grad 隔离 / 参数名里是否含 adapter 名")
+
+    device = next(raw.parameters()).device
+
+    # ---- ★ DDP（在双 adapter 都可训练之后才包）----
+    #   find_unused_parameters=True 是**必须**的：proposer 相位里 solver adapter
+    #   不参与前向，它的 bucket 拿不到梯度；不设 True 会直接报
+    #   "Expected to have finished reduction in the prior iteration" 或静默卡住。
+    if world > 1:
+        from torch.nn.parallel import DistributedDataParallel as _DDP
+        model = _DDP(raw, device_ids=[local], output_device=local,
+                     find_unused_parameters=True)
+        log(f"[dist] DDP 已包装：world_size={world} find_unused_parameters=True "
+            f"（adapter 参数量 {sum(p.numel() for p in _lora_all)/1e6:.1f}M × 2 → "
+            f"每步 all-reduce ≈{2*sum(p.numel() for p in _lora_all)*4/1e9:.2f} GB）")
+    else:
+        model = raw
+    # ★ policy 必须持有 **DDP 包装后的**对象：HFPolicy 内部直接 `model(...)`，
+    #   若传 raw（或 raw.module）就绕过了 DDP 的 forward hook —— 梯度永远不会
+    #   all-reduce，8 个 rank 各自静默跑自己的，速度不涨、指标还对不上。
+    policy = HFPolicy(model, tokenizer)
+
+    # ⚠️ 双 adapter 隔离由 peft 的 set_adapter 负责；optimizer 必须覆盖**两个**
     #    adapter 的全部参数（按名字里的 "lora_" 选），否则切到 solver 相位时新参数不在优化器里。
-    opt_params = [p for n, p in model.named_parameters() if "lora_" in n]
+    #    注意这里用 raw.named_parameters()：名字干净（没有 DDP 的 module. 前缀），
+    #    而且是**同一批 Parameter 对象**，DDP 的 hook 会把同步后的 grad 写回它们。
+    opt_params = [p for n, p in raw.named_parameters() if "lora_" in n]
     if not opt_params:
         raise SystemExit("没有找到任何 LoRA 参数，检查 peft 适配是否正常")
     optimizer = torch.optim.AdamW(opt_params, lr=tcfg.get("lr", 1e-4),
@@ -278,28 +464,71 @@ def main() -> int:
     uid_counter = 0
 
     def persist_pool() -> None:
+        """任务池落盘。★ 只 rank0 写：8 个 rank 同时 open(...,"w") 同一文件会互相截断。
+        各 rank 的池子在 all_gather 之后本来就是同一份，所以 rank0 写的即全集。"""
+        if not is_main(rank):
+            return
         with open(task_pool_path, "w") as fh:
             for t in task_pool:
                 fh.write(json.dumps(t.to_json(), ensure_ascii=False) + "\n")
 
     t_start = time.time()
     for outer in range(N):
+        # ⚠️ 冒烟只跑 1 个 outer 的判据必须放在**循环开头**。
+        #    之前写在循环结尾（ez_save 之后），但 solver 空池那条路径会 `continue`
+        #    直接跳到下一轮，把 break 绕过去 —— 实测日志里出现了 outer 0/1/2/3 各跑一遍。
+        if args.dry_run and outer > 0:
+            break
         # ================= proposer 相位 =================
         model.eval()
         for step in range(M_P if not args.dry_run else 1):
             st0 = time.time()
             model.set_adapter("proposer")
-            games = [rng.choice(game_files) for _ in range(TPS)]
+            # ---- ★ 分片采样（红线 B）：全局 TPS 个 game 由 rank0 抽一次后广播 ----
+            #   各 rank 抽各自的会"不重不漏"变成"重且漏"；而 rank0 抽完再切
+            #   `games[rank::world]` 才是严格不重不漏。组语义不变 ——
+            #   每个 game 的 G 条 rollout 仍在**同一个 rank** 上跑完。
+            games: List[str] = []
+            if is_main(rank):
+                games = [rng.choice(game_files) for _ in range(TPS)]
+            if world > 1:
+                _go = [games]
+                dist.broadcast_object_list(_go, src=0)
+                games = _go[0]
+            if len(games) % world:
+                raise SystemExit(f"[dist] 全局 games={len(games)} 不能被 world={world} 整除")
+            local_games = games[rank::world]      # 每 rank 恰好 TPS/world 个
             # 1) 探索 + 提案
+            # ★ 组按 game **逐个**收集（而不是事后按 G 切片）：切片一旦错位，
+            #   组里会混进不同 game 的 rollout（红线 A：组是算法不可分单元）。
             cand: List[ProposerRollout] = []
-            for gf in games:
-                cand.extend(run_proposer_exploration(env_p, policy, gf, p_cfg, log_fn=log))
+            groups: List[List[ProposerRollout]] = []
+            for gf in local_games:
+                _one = run_proposer_exploration(env_p, policy, gf, p_cfg, log_fn=log)
+                cand.extend(_one)
+                groups.append(_one)
+            #   ★ 空组必须"所有 rank 一起炸"：某个 rank 的组是空的就会少一次
+            #     backward，其它 rank 干等 → NCCL 卡 30 分钟。all_reduce MIN 让
+            #     全员同时看到问题并同时退出。
+            _mg = min((len(g) for g in groups), default=0)
+            if world > 1:
+                _t = torch.tensor([_mg], device=device)
+                dist.all_reduce(_t, op=dist.ReduceOp.MIN)
+                _mg = int(_t.item())
+                del _t
+            if _mg == 0 or not groups:
+                raise SystemExit(
+                    f"[EZ][红线B] 存在空的 GRPO 组（全局最小 {_mg}，本 rank {len(groups)} 组）——"
+                    f" 各 rank 的 backward 次数会不一致，DDP 必然死锁。"
+                    f" 检查 run_proposer_exploration 是否有静默丢样本的路径")
             accepted = [c for c in cand if c.accepted and c.task is not None]
             # 2) 冻结 solver 估 solve rate（G_P 条 rollout，不训练；用 batch=G_P 的 env_sr）
             new_tasks: List[ProposedTask] = []
             for c in accepted:
                 t = c.task
-                t.meta["uid"] = f"o{outer}s{step}-{uid_counter}"
+                # ★ uid 必须带 rank：每 rank 各自 proposals，不带 rank 会跨 rank 撞 uid，
+                #   撞了之后 solver 相位的 `task_id == uid` 分组会把不同任务混成一组。
+                t.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
                 model.set_adapter("solver")
                 rollouts = run_ez_solver_rollouts(env_sr, policy, [t] * G_P, s_cfg,
@@ -311,16 +540,22 @@ def main() -> int:
                 c.__dict__["reward_parts"] = parts
                 t.meta["solve_rate"] = p_hat
                 new_tasks.append(t)
+            if world > 1:
+                # ★ 任务池必须**每个 rank 完全一致**：solver 相位要从池里采样，
+                #   各 rank 池子不同则采出的任务数/内容不同 → backward 次数不同 → 死锁。
+                #   all_gather 之后所有人拿到同一份，顺带省掉一个单独的 gather 写盘逻辑。
+                _g: List[Any] = [None] * world
+                dist.all_gather_object(_g, new_tasks)
+                new_tasks = [t for _sub in _g for t in _sub]
+                del _g
             task_pool.extend(new_tasks)
             persist_pool()
-            # 3) proposer GRPO 更新（组 = 同一 game 的 G 条探索轨迹）
-            groups: List[List[ProposerRollout]] = []
-            gi = 0
-            for _gf in games:
-                groups.append(cand[gi:gi + G])
-                gi += G
+            # 3) proposer GRPO 更新（组 = 同一 game 的 G 条探索轨迹；上面已按 game 分好）
+            #   ★ `len(groups)` 是**本 rank 的组数**（=TPS/world）。DDP 会对梯度取平均，
+            #     全局等价于 1/TPS —— 正确，**不要**再手动乘 world（乘了就变成 1/(TPS/world)）。
             model.train()
             optimizer.zero_grad(set_to_none=True)
+            _diag = []
             for groll in groups:
                 for c in groll:
                     tokenize_proposer_rollout(c, policy, p_tok_cfg)
@@ -335,16 +570,43 @@ def main() -> int:
                                          loss_mask=c.__dict__["loss_mask"],
                                          stats=None, advantage=a))
                 bt = make_batch(trajs_like, pad_id, device)
+                _diag.append((round(max(advs) - min(advs), 3), int(bt.n_active),
+                              [len(c.__dict__["input_ids"]) for c in groll],
+                              [int(sum(c.__dict__["loss_mask"])) for c in groll]))
                 # ★ old logps 必须脱离计算图：不包 no_grad 的话 new-old 对参数梯度
                 #   精确抵消，loss 非零但参数一步不动（review P0-1，与主线 train_grpo 一致）
                 with torch.no_grad():
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
                 loss, _st = grpo_loss(model, bt, old, clip_eps)
                 (loss / len(groups)).backward()
+            _nof = {id(p): n for n, p in raw.named_parameters()}
+            _act = [p for p in opt_params if p.grad is not None and p.requires_grad]
+            _gn = float(sum(p.grad.detach().float().norm() for p in _act)) if _act else 0.0
+            # ★ A/B 分开报：peft 把 lora_B 初始化成全 0 ⇒ ∂L/∂A = Bᵀ(...) ≡ 0
+            #   ⇒ **第 0 步 lora_A 的梯度必然是精确的 0**（这是 LoRA 的正常性质，
+            #   不是 bug）。旧 probe 恰好挑中 lora_A，才打出 update_rel=0.000e+00 的假警报。
+            #   把两条分开打，这个性质就永远看得见。
+            _gnA = float(sum(p.grad.detach().float().norm() for p in _act
+                             if ".lora_A." in _nof.get(id(p), "")))
+            _gnB = float(sum(p.grad.detach().float().norm() for p in _act
+                             if ".lora_B." in _nof.get(id(p), "")))
             torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
-            update_probe(model, opt_params, optimizer, f"outer {outer} P{step}")
-            log(f"[outer {outer}][P{step}] pool={len(task_pool)} (+{len(new_tasks)}) "
-                f"| accept={len(accepted)}/{len(cand)} | {time.time()-st0:.0f}s")
+            update_probe(raw, opt_params, optimizer, f"outer {outer} P{step}")
+            # ★ 组奖励必须进日志：只有这样，"update_rel=0" 才能被判成
+            #   「奖励同分（=没信号，正常）」还是「奖励有区分度却不动（=梯度链断，必修）」。
+            #   实测教训（job 12989143 outer 2）：accept=1/2 却 update_rel=0，
+            #   当时日志里连组奖励都没有，完全无法判断 —— 这就是补它的原因。
+            _rw = [round(float(c.reward), 3) for c in cand]
+            log(f"[outer {outer}][P{step}] rank={rank} 本地 games={len(local_games)}/{TPS} "
+                f"| pool={len(task_pool)} (+{len(new_tasks)}) "
+                f"| accept={len(accepted)}/{len(cand)} | rew={_rw} "
+                f"| rew_spread={max(_rw) - min(_rw) if _rw else 0:.3f} | {time.time()-st0:.0f}s")
+            # 断层定位：grad_norm>0 而 update_rel=0 -> 优化器/精度问题；
+            # grad_norm=0 而 adv_spread>0 -> loss 没把梯度传出来（mask/图断）
+            log(f"[outer {outer}][P{step}] 诊断 adv_spread/n_active/len_ids/mask_sum="
+                f"{_diag} | 真实 backward grad_norm={_gn:.4e} "
+                f"({len(_act)} 个张量有 grad；A={_gnA:.4e} B={_gnB:.4e})"
+                f"{'  ← A=0 是正常的（B 初始全 0）' if _gnA == 0.0 and _gnB > 0 else ''}")
             if args.dry_run:
                 break
 
@@ -355,23 +617,50 @@ def main() -> int:
         # （论文是每迭代用冻结 proposer 重新采样；跨 outer 抽旧题会让任务分布与
         #   当前 proposer 脱节 —— review #2）。池子仍全量持久化供分析。
         outer_pool = [t for t in task_pool if str(t.meta.get("uid", "")).startswith(f"o{outer}")]
-        if not outer_pool:
-            log("[solver] 本 outer 任务池为空，跳过 solver 相位")
+        # ★ "跳不跳"必须是**全局决定**：某个 rank 空池就 continue，而别的 rank 继续
+        #   backward —— 空池那个 rank 直接卡死在 NCCL barrier（红线 B）。
+        #   池子经 all_gather 后本来就一致，这里再加一道 MIN all_reduce 兜底。
+        _nlocal = len(outer_pool)
+        if world > 1:
+            _t = torch.tensor([_nlocal], device=device)
+            dist.all_reduce(_t, op=dist.ReduceOp.MIN)
+            _nglob = int(_t.item())
+            del _t
+        else:
+            _nglob = _nlocal
+        if _nglob == 0:
+            log(f"[solver] 本 outer 任务池为空（rank{rank} 本地 {_nlocal} 条，全局最少 {_nglob} 条），"
+                f"所有 rank 一起跳过 solver 相位")
             continue
         for step in range(M_S if not args.dry_run else 1):
             st0 = time.time()
             model.eval()
             # 无放回采样：有放回会让同 uid 的组被合并、loss 双计（review P1-2）
-            batch = rng.sample(outer_pool, k=min(TPS, len(outer_pool)))
+            # ★ k 必须**各 rank 相同**（=min(TPS//world, 池子大小)）：条数不同则
+            #   backward 次数不同，DDP 死锁。池子已跨 rank 一致，所以这个 k 天然一致。
+            k_local = max(1, min(TPS // max(world, 1), len(outer_pool)))
+            batch = rng.sample(outer_pool, k=k_local)
             all_roll: List[EzSolverTrajectory] = []
             for t in batch:
                 all_roll.extend(run_ez_solver_rollouts(env_s, policy, [t] * G, s_cfg,
                                                        tokenize=True, log_fn=log))
             model.train()
             optimizer.zero_grad(set_to_none=True)
+            # ★ backward 次数必须**恒等于 len(batch)**（红线 B）。原来那句
+            #   `if not grp: continue` 会让某个 rank 少一次 backward，其它 rank
+            #   就永久卡在 NCCL barrier 上。空组用"零 loss 但带计算图"的 backward 占位。
+            _n_bwd = 0
             for t in batch:
                 grp = [r for r in all_roll if r.traj.task_id == t.meta["uid"]]
                 if not grp:
+                    _zbt = _borrow_batch(all_roll, pad_id, device)
+                    if _zbt is None:
+                        raise SystemExit(
+                            "[solver][红线B] 整批 rollout 全空，无法保持各 rank 的 "
+                            "backward 次数一致。检查 run_ez_solver_rollouts 是否静默丢样本")
+                    _z = per_token_logps(model, _zbt.input_ids, _zbt.attention_mask).sum() * 0.0
+                    (_z / len(batch)).backward()
+                    _n_bwd += 1
                     continue
                 advs = group_advantages([r.traj.reward for r in grp], [0] * len(grp),
                                         use_std=True)
@@ -381,24 +670,43 @@ def main() -> int:
                 with torch.no_grad():
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
                 loss, stt = grpo_loss(model, bt, old, clip_eps)
+                #   ★ 分母是**本 rank 的 batch 条数**（=TPS/world）：DDP 取平均后
+                #     全局正好是 1/TPS。不要手动乘 world。
                 (loss / len(batch)).backward()
+                _n_bwd += 1
+            if _n_bwd != len(batch):
+                raise SystemExit(f"[solver][红线B] backward 次数 {_n_bwd} != len(batch) {len(batch)}")
             torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
-            update_probe(model, opt_params, optimizer, f"outer {outer} S{step}")
+            update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}")
             rw = [r.traj.reward for r in all_roll]
-            log(f"[outer {outer}][S{step}] reward mean={np.mean(rw):.3f} "
+            log(f"[outer {outer}][S{step}] rank={rank} batch={len(batch)}/{TPS} "
+                f"| reward mean={np.mean(rw):.3f} "
                 f"| final_match={sum(r.verify.final_match for r in all_roll)}/{len(all_roll)} "
-                f"| {time.time()-st0:.0f}s")
+                f"| pool={len(outer_pool)} | {time.time()-st0:.0f}s")
             if args.dry_run:
                 break
 
-        ez_save(model, tokenizer, run_dir, f"outer{outer+1}", cfg, {"outer": outer + 1})
+        # ★ 只在 rank0 存档：peft 保存的是 adapter（几百 MB），8 个 rank 各存一份
+        #   既浪费又会在同一路径上互相踩。（deepspeed 靠不同的 zero stage 存分片，
+        #   我们不走那条路。）
+        if is_main(rank):
+            ez_save(raw, tokenizer, run_dir, f"outer{outer+1}", cfg, {"outer": outer + 1})
 
     env_p.close()
     env_s.close()
     env_sr.close()
     persist_pool()
-    log(f"[done] {N} outer loops in {(time.time()-t_start)/60:.1f} min -> {run_dir}")
-    _LOG_FH.close()
+    # ★ dry-run 只跑 outer 0，但 N 仍是配置里的 4 —— 直接打 N 会让人以为跑了 4 轮
+    _n_done = 1 if (args.dry_run and N > 0) else N
+    log(f"[done] rank={rank} {_n_done} outer loops in {(time.time()-t_start)/60:.1f} min -> {run_dir}")
+    for _fh in (_LOG_FH, _LOG_FH0):
+        if _fh is not None:
+            _fh.close()
+    if world > 1 and dist.is_initialized():
+        # ★ barrier 放在 destroy 之前：某个 rank 先 destroy 会让其它 rank 的
+        #   收尾 all-reduce（如有）直接报 "process group has been destroyed"。
+        dist.barrier()
+        dist.destroy_process_group()
     return 0
 
 

@@ -18,7 +18,7 @@ from ez_state import (StateDelta, StateSnapshot, delta_covers,  # noqa: E402
 from ez_verify import (ProposedTask, SubtaskRef, action_type,  # noqa: E402
                        proposer_reward, redundant_pair, validity_filter,
                        verify_solver_rollout)
-from rollout import _ToolCallStopCriteria                   # noqa: E402
+from rollout import _ToolCallStopCriteria, scan_bare_json_call  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -158,12 +158,55 @@ check("未知动作 -> malformed", p.kind == "malformed")
 p = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"take","object_name":"apple 1"}}</tool_call>')
 check("缺参数 -> malformed", p.kind == "malformed")
 
+print("== 裸 JSON 工具调用（smoke 实测：Qwen3-4B-Instruct-2507 不吐 <tool_call> 标签）==")
+# 现场真实输出的形态：先一行 reasoning，再裸 JSON，不带任何标签
+_REAL = ('Go To: desk 1  \nReasoning: desk is a workspace.  \n\n'
+         '{"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle_name":"desk 1"}}')
+p = parse_tool_call(_REAL)
+check("裸 JSON -> action", p.kind == "action" and p.action == "go to desk 1", p.raw)
+check("裸 JSON -> end_idx 落在对象右括号后", 0 < p.end_idx <= len(_REAL.rstrip()), str(p.end_idx))
+
+# 一轮连写多个动作（现场就是这个形态）：必须只取**第一个**，end_idx 指向第一个对象末尾
+_MULTI = _REAL + ('\n\nOpen: drawer 1\n{"name":"alfworld_tool",'
+                  '"arguments":{"action_type":"open","receptacle_name":"drawer 1"}}')
+p = parse_tool_call(_MULTI)
+check("连写多个动作 -> 只取第一个", p.kind == "action" and p.action == "go to desk 1", p.raw)
+check("连写多个动作 -> end_idx 不含第二个", p.end_idx < len(_MULTI.rstrip()),
+      f"end_idx={p.end_idx} len={len(_MULTI.rstrip())}")
+
+# 字符串里带花括号：括号配平不能被字符串内的 { } 带偏
+_NEST = '{"name":"alfworld_tool","arguments":{"action_type":"finish","task_description":"put an apple in {the} bowl"}}'
+p = parse_tool_call(_NEST)
+check("字符串内含花括号仍配平", p.kind == "finish" and "{the}" in p.task_description, p.raw)
+
+# 工具调用前面有别的 JSON 对象 -> 必须跳过它继续找
+p = parse_tool_call('prefix {"note":"hi"} then {"name":"alfworld_tool","arguments":{"action_type":"look"}}')
+check("跳过不含 action_type 的 JSON", p.kind == "action" and p.action == "look", p.raw)
+
+# 括号没配平（被 max_new_tokens 截断）-> malformed，不能瞎猜
+p = parse_tool_call('{"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle')
+check("截断的 JSON -> malformed", p.kind == "malformed")
+check("纯文本 -> malformed", parse_tool_call("Go To: desk 1\nReasoning: blah").kind == "malformed")
+
+print("== scan_bare_json_call 直接测 ==")
+sp = scan_bare_json_call(_MULTI)
+check("scan 返回 span", sp is not None and sp[1] <= len(_MULTI.rstrip()), str(sp))
+check("scan 无对象 -> None", scan_bare_json_call("no json here") is None)
+check("scan 忽略非工具 JSON", scan_bare_json_call('{"foo":1}') is None)
+# 防回归：envelope 必须**整体**被识别，不能只吃掉内层 arguments 对象
+_ENV = '{"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle_name":"desk 1"}}'
+check("scan envelope 不吃内层", scan_bare_json_call(_ENV) == (0, len(_ENV)),
+      str(scan_bare_json_call(_ENV)))
+_LOOK = '{"name":"alfworld_tool","arguments":{"action_type":"look"}}'
+check("scan 空 arguments 也可识别", scan_bare_json_call(_LOOK) == (0, len(_LOOK)),
+      str(scan_bare_json_call(_LOOK)))
+
 print("== tool_call 停止条件（EZ 专用）==")
 
 
 class _FakeTok:
     """把 token id 直接当字符解码：id n -> 词表第 n 个字符。"""
-    CHARS = ' abcdefghijklmnopqrstuvwxyz<>/{}_-'
+    CHARS = ' abcdefghijklmnopqrstuvwxyz0123456789<>/{}_-":,'
 
     def __init__(self):
         self.chars = self.CHARS
@@ -197,6 +240,38 @@ check("stop_len 记录", crit.stop_len(0, 999) == len(done))
 crit2 = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
 check("从没出现标签 -> 永不触发", crit2(_FakeTensor([partial]), None) is False
       and crit2.stop_len(0, 999) == 999)
+
+# ★ 裸 JSON 停止（现场真实形态）：不吐标签，直接甩 JSON；停在第一个完整动作对象上
+crit3 = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
+_bare_open = _encode(tok, 'go to desk 1 {"name":"alfworld_tool","arguments":{"action_type":"go_to"')
+_bare_done = _encode(
+    tok, 'go to desk 1 {"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle_name":"desk 1"}}')
+check("裸 JSON 未配平不停", crit3(_FakeTensor([_bare_open]), None) is False)
+check("裸 JSON 配平后停", crit3(_FakeTensor([_bare_done]), None) is True)
+check("裸 JSON stop_len 记录", crit3.stop_len(0, 999) == len(_bare_done))
+
+# 停在**第一个**动作对象：后面还跟着第二个动作也必须立刻停。
+# ⚠️ 必须**逐 token 增量喂入**——真实 generate 是每生成一个 token 判一次。
+#    一次性喂整段文本的话 generated_len 恒等于全长，测不出"停在哪"。
+crit4 = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
+_FIRST = '{"name":"alfworld_tool","arguments":{"action_type":"look"}}'
+_FULL = (_FIRST + ' then {"name":"alfworld_tool",'
+                  '"arguments":{"action_type":"inventory"}}')
+_first = _encode(tok, _FIRST)
+_full = _encode(tok, _FULL)
+_fired_at = None
+for _n in range(1, len(_full) + 1):
+    if crit4(_FakeTensor([_full[:_n]]), None):
+        _fired_at = _n
+        break
+check("连写两个动作 -> 第一个配平即停", _fired_at == len(_first),
+      f"fired_at={_fired_at} 期望={len(_first)}")
+check("连写两个动作 -> 不跑到第二个动作", _fired_at is not None and _fired_at < len(_full),
+      f"fired_at={_fired_at} full={len(_full)}")
+
+# 非工具的 JSON 不该触发停止（避免把 reasoning 里的乱 JSON 当动作）
+crit5 = _ToolCallStopCriteria(tok, [0], max_new_tokens=200)
+check("非工具 JSON 不触发", crit5(_FakeTensor([_encode(tok, '{"foo":1}')]), None) is False)
 
 print("== text fallback 降级模式 ==")
 fa = snapshot_from_obs_text("You are in the kitchen.")

@@ -82,38 +82,107 @@
 - [ ] 验证 Eq.7 奖励分布：失败轨迹的子任务完成率是否有区分度（对照 Prop 1：collapse 率应显著低于二值奖励）。
 - **验收**：collapse 率从 ~100%（二值）降到 <50%；`update_rel > 1e-10`（我们的准入门）。
 
-### Phase 3.5 — EZ 端到端冒烟（**代码已就绪，等开服务器**）
+### Phase 3.5 — EZ 端到端冒烟 ✅ **单卡硬通过**（2026-10-12 job 12989496）
 
-代码状态（2026-10-12）：7 个源文件 + 配置 + 2 个脚本已写完，三 agent 交叉 review 抓出的
-2 个 P0（`old logps` 未脱图 / G_P 撞 env batch）+ 6 个 P1 已全部修复，42 项离线单测全绿。
-**下面这条命令就是 Phase 2+3 的合并验收，一条命令跑完。**
+```
+===== EZ 冒烟自检 =====
+  [OK   ] 关0 梯度链通：proposer grad_norm=5.666e+02, solver grad_norm=5.644e+02
+  [OK   ] 关1 facts 通道存在（109 条事实）
+  [OK   ] 关2 update_rel 共 2 处：outer 0 P0=5.00e-01, outer 0 S0=0.00e+00
+  [OK   ] 关2b 优化器实际更新张量数：outer 0 P0=252/504, outer 0 S0=0/504
+  [OK   ] 关3 proposer 有有效提案：[(2, 4)]
+  [WARN ] 关3 solver reward mean=['0.000', ...]（全 0：solver 一次都没完成任务）
+结论：**通过** ✅ 关0/1/2b/3 全过：1 处 update_rel>0，单步最多更新 252 个张量
+```
+
+判据已经从"三关"扩到"四关 + 多卡过关4"，`ez_check_smoke_ok.py` 里逐条实现：
+
+| 关 | 判据 | 落地 |
+|---|---|---|
+| 关0 | 两个 adapter 各自都能接到梯度（`grad_chain_selfcheck`，**不依赖环境/奖励**） | 启动自检，任一 adapter 为 0 直接 `SystemExit` |
+| 关1 | facts 通道存在 | 启动预检 `assert_facts_mode` |
+| 关2 | `update_rel` 对**本组奖励 spread** 判（专治"梯度断" vs "奖励同分"） | job 12989143 的教训 |
+| 关2b | `N/M 张量真的动了` 的 N>0 | job 12989450 的教训，见下 |
+| 关3 | proposer `accept>=1`、solver 奖励不是全 0 | — |
+| 关4 | 8 卡：rank 日志齐 / `world_size==8` / 各 rank `update_rel` 同量级 | 见 `EZ_DDP_PLAN.md` §8 |
+
+**`update_rel=0.000e+00` 的假警报（2026-10-12 job 12989450 → 12989496 定位）**
+
+日志曾长期同时打印「`真实 backward grad_norm=6.1474e+00 (504 个张量有 grad)`」和
+「`update_rel=0.000e+00`」——看着像优化器更新被精度抹掉。**不是。**
+`update_probe` 取"第一个 `numel>=4096` 的 LoRA 张量"，按 `named_parameters()` 顺序恰好
+命中 `layers.0.self_attn.q_proj.lora_A`；peft 把 **`lora_B` 初始化成全 0**，
+于是 `∂L/∂A = Bᵀ(∂L/∂y)xᵀ ≡ 0` —— 该张量第 0 步梯度**精确为 0**，AdamW 的 `exp_avg=0`
+⇒ Δp 精确为 0。梯度链一直是通的，是 probe 挑了个天生零梯度的张量。
+
+修完后同一步的日志：
+
+```
+[outer 0 P0] update_rel=5.000e-01（=max ‖Δp‖/(‖p‖+‖Δp‖)；252/504 张量真的动了；max‖Δp‖=5.571e-02）
+[outer 0][P0] 诊断 ... | 真实 backward grad_norm=4.3530e+00 (504 个张量有 grad；A=0.0000e+00 B=4.3530e+00)
+[outer 0][P0] accept=2/4 | rew=[0.0, 0.0, 1.5, 1.8] | rew_spread=1.800
+```
+
+`252/504` 恰好一半 = 所有 `lora_B` 动了、所有 `lora_A` 没动，完全对上；
+`A=0.0000e+00 B=4.3530e+00` 是同一件事的第二个证据。
+**教训：GRPO 里 `update_rel==0` 有三种成因（梯度链断 / 组内奖励同分 / probe 挑错张量），
+必须用三条独立判据分开，不能用一条猜。**
+
+代码状态（2026-10-12）：7 个源文件 + 配置 + 5 个脚本，三 agent 交叉 review 抓出的
+2 个 P0（`old logps` 未脱图 / G_P 撞 env batch）+ 6 个 P1 已全部修复。
+61 项离线单测 + 12 项判读回归（`scripts/ez_check_smoke_selftest.py`）全绿。
 
 ```bash
 # 二期 · A40 48G · debug 分区（30min 上限，几分钟内起算，先跑这个）
-sbatch -p debug -t 00:30:00 --gres=gpu:1 ~/ztwang/selfplay/scripts/ez_smoke_1gpu.sbatch
+sbatch -p debug -t 00:28:00 --gres=gpu:1 ~/ztwang/selfplay/scripts/ez_smoke_1gpu.sbatch
 
 # 二期 · A800 80G · 单卡（想量真实显存峰值）
 sbatch -p emergency_gpu -t 02:00:00 --gres=gpu:1 ~/ztwang/selfplay/scripts/ez_smoke_1gpu.sbatch
+
+# 8 卡 DDP 验收（必须先过单卡；8 卡作业被策略限定只能投这两个分区）
+sbatch -p i64m1tga800u8ka -t 01:00:00 --gres=gpu:8 ~/ztwang/selfplay/scripts/ez_smoke_8gpu.sbatch
 
 # 三期 · H100（改 account/partition，见脚本头部【三期变体】注释）
 sbatch -p acd_u -A d_tonggehuang_team --qos=normal -t 01:00:00 --gres=gpu:1 .../ez_smoke_1gpu.sbatch
 ```
 
-脚本内部按顺序跑四段：离线单测 → `ez_check_env_facts.py`（**facts 通道，EZ 的命根子**）
-→ `ez_train.py --dry-run` → `ez_check_smoke_ok.py`（产物自检）。
+脚本内部按顺序跑五段：离线单测 → **判读逻辑回归**（`ez_check_smoke_selftest.py`，纯 CPU 秒级）
+→ `ez_check_env_facts.py`（**facts 通道，EZ 的命根子**）→ `ez_train.py --dry-run`
+→ `ez_check_smoke_ok.py`（产物自检）。
 
-冒烟规模会自动缩小（`G=2 G_P=2 TPS=1 turns=3`，因为论文默认 G=16×30turns 在 A40 的
-30min 里跑不完）；想加大用 `--export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=5`。
+冒烟规模会自动缩小（`G=2 G_P=2 TPS=1 turns=12`，因为论文默认 G=16×30turns 在 A40 的
+30min 里跑不完）；想加大用 `--export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=16`。
+**turns 别压到 3**：prompt 要求探索 10-20 个动作后才 `finish`，轮数不够时 proposer
+必然 `accept=0` → 任务池空 → solver 相位整段被跳过，"冒烟看着跑完但其实一条真链路都没走"
+（2026-10-12 job 12989069 实测踩到）。turn=16 时 accept 能到 2/4。
 
-**三关判定（`ez_check_smoke_ok.py` 的判据，别把这三种情况混为一谈）**
+**已修的现场问题（2026-10-12）**
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| `fmt_bad=6/6`（解析 100% 失败） | Qwen3-4B-Instruct-2507 **不吐 `<tool_call>` 标签**，直接甩裸 JSON | `parse_tool_call` 增加裸 JSON 回退（括号配平扫描） |
+| 一轮生成 8 个动作、顶到 max_new_tokens | `</tool_call>` 停止判据对这种输出永不触发 | `_ToolCallStopCriteria` 改为"闭合标签 **或** 第一个完整动作对象"即停 |
+| 停止在**内层** `arguments` 的 `}` 上（截断工具调用） | `{"action_type":"look"}` 自己也是配平对象 | 扫描时跳过紧跟 `"arguments":` 之后的对象 |
+| 跑满 turns 仍 `accept=0` | prompt 要求探索 10-20 动作才 finish，模型走到上限也不收尾 | prompt 加"一次一个动作"+few-shot；临近上限注入 `FINISH_NUDGE`（`NUDGE_WHEN_LEFT=3`） |
+| `update_rel=0.000e+00` 但 `grad_norm` 非零 | probe 挑中了 `lora_A`（B 初始全 0 ⇒ 该张量梯度恒 0） | probe 测**所有**带 grad 的张量，报 `N/M` 计数；A/B 分开打 |
+
+诊断脚本 `src/ez_debug_proposer.py` 可复现上述全部证据（打印 prompt / 原始输出 /
+GC 在 peft 包装下是否真的关掉——**GC 兜底实测正常，不是本次的原因**）。
+
+**判读表（`ez_check_smoke_ok.py` 的判据，别把这几种情况混为一谈）**
 
 | 现象 | 判定 | 该怎么办 |
 |---|---|---|
 | 日志无 "facts 通道 OK" | **FATAL** | textworld 版本不够，改 `request_infos`；否则奖励是废的 |
 | `update_rel = 0` **且** 奖励有区分度 | **FATAL** | 梯度链断了（no_grad / 断图 / lr=0），必修 |
 | `update_rel = 0` **且** 奖励全同分 | **WARN** | 不是 bug：GRPO 组内优势全 0 时梯度天然为 0。缩规模下常见，加大 turns 再看 |
+| `0/504 张量真的动了` 但 `grad_norm` 非零 | **FATAL** | 真断链（probe 已排除挑错张量） |
+| `N/M 张量真的动了` 且 N≈M/2 | **正常** | LoRA 第 0 步：B 初始全 0 ⇒ 所有 A 无梯度，只有 B 动 |
 | proposer `accept=0/N` | **FATAL** | 提案器一条有效任务都没产出，查 prompt/解析/有效性过滤 |
-| 三关全过 | **PASS** | 允许开 8 卡正式作业 |
+| 8 卡：某 rank 的 `train_log.rank*.jsonl` 缺失/为空 | **FATAL** | 那个 rank 提早挂了，看它的 `.err` |
+| 8 卡：各 rank `update_rel` 差 ≥100× | **FATAL** | 该 rank 没参与梯度同步（policy 可能拿了 `raw.module`） |
+| 8 卡：`world_size=1` | **WARN** | torchrun 没生效，8 个进程各跑各的（速度不涨、日志多 8 倍） |
+| 全部通过 | **PASS** | 允许开 8 卡正式作业 |
 
 ### Phase 4 — 完整交替训练（主实验，8 卡）
 - [ ] 交替循环：4 outer × (25 proposer + 25 solver steps)，LoRA r32，实现 Algorithm 1（含 G_P=8 的 solve-rate 估计和 proposer 奖励）。

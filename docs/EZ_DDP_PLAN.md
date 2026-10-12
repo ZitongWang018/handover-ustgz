@@ -9,6 +9,55 @@
 
 ---
 
+## 0.5 落地状态（2026-10-12 更新）
+
+| 阶段 | 状态 | 证据 |
+|---|---|---|
+| 方案文档（本文件） | ✅ | — |
+| P0 代码落地 | ✅ | `ez_train.py` / `train_grpo.py` / `ez_smoke_8gpu.sbatch` / `ez_check_smoke_ok.py` 关4 |
+| 单卡冒烟硬通过 | ✅ | job `12989496`：`结论：**通过** ✅ 关0/1/2b/3 全过`，`update_rel=5.00e-01，252/504 张量真的动了` |
+| P0 后单卡回归（确认没改坏 world==1） | ✅ | job `12989528`（`scripts/ez_smoke_1gpu.sbatch`）|
+| 8 卡冒烟 | ⏳ 排队 | job `12989532` @ `i64m1tga800u8ka`（8 卡作业被策略限定只能投 800u8ka / a40u8ka）|
+
+### 0.5.1 路上清掉的一个"假故障"（值得记住）
+
+单卡冒烟曾长期打出这个指纹：
+
+```
+[outer 0][P0] 诊断 ... | 真实 backward grad_norm=6.1474e+00 (504 个张量有 grad)
+[outer 0 P0] update_rel=0.000e+00（必须为 >>1e-10，否则梯度是死的）
+```
+
+"梯度明明非零，参数却一步不动"——看着像 `optimizer.step()` 被精度抹掉。**不是。**
+
+真因在 `update_probe` 选张量的方式：旧实现取"**第一个** `numel>=4096` 的 LoRA 张量"，
+按 `named_parameters()` 顺序恰好命中 `layers.0.self_attn.q_proj.lora_A.<adapter>`。
+而 peft 把 **`lora_B` 初始化成全 0**：
+
+```
+y = W x + B(A x) · s      ⇒   ∂L/∂A = Bᵀ(∂L/∂y) xᵀ ≡ 0        （B == 0）
+```
+
+所以**该张量在第 0 步的梯度是精确的 0**（不是"很小"，是 0）。AdamW 里 `exp_avg=0`
+⇒ Δp 精确为 0 ⇒ 打印 `0.000e+00`。梯度链一直是通的，是 probe 挑了个天生零梯度的张量。
+
+修法（`ez_train.py::update_probe`）：对**所有带 grad 的参数**逐个测位移、报 `N/M 张量真的动了`，
+并用有界 metric `rel = ‖Δp‖/(‖p‖+‖Δp‖)`（zero-init 张量给 1.0，不给 ∞）。
+另外诊断行把 `lora_A` / `lora_B` 的 grad_norm **分开打**，这件事以后永远看得见：
+
+```
+[outer 0 P0] update_rel=5.000e-01（=max ‖Δp‖/(‖p‖+‖Δp‖)；252/504 张量真的动了；max‖Δp‖=5.571e-02）
+[outer 0][P0] 诊断 ... | 真实 backward grad_norm=4.3530e+00 (504 个张量有 grad；A=0.0000e+00 B=4.3530e+00)  ← A=0 是正常的（B 初始全 0）
+```
+
+`252/504` 恰好一半 = 所有 `lora_B` 动了、所有 `lora_A` 没动，完全对上。
+
+**教训**：GRPO 里 "update_rel == 0" 有三种成因（梯度链断 / 组内奖励同分 / probe 挑错张量），
+`ez_check_smoke_ok.py` 现在用三条独立判据把它们分开：关2 对**组奖励 spread** 判、
+关2b 对**张量计数**判、关0 用不依赖奖励的梯度链自检。
+
+---
+
 ## 0. 现状：现在用 torchrun 8 进程跑，第 3 行就会炸
 
 | 位置 | 现状 | 后果 |
@@ -224,17 +273,32 @@ DDP 平均 8 份 → (1/G) Σ_all a_i ℓ_i ，与单卡完全等价
 
 ## 7. 分阶段落地
 
-### P0 — 让 8 卡能起来（不改算法语义，半天）
-- [ ] `setup_dist()` 接入；`log0(rank, ...)`；per-rank 日志文件
-- [ ] `run_dir` 广播；`ez_save` 仅 rank0；`persist_pool` gather
-- [ ] 两 adapter 都 trainable 后再 DDP，`find_unused_parameters=True`
-- [ ] `TPS % world == 0` 断言 + `did_step` 用 MAX all_reduce 统一
-- [ ] 分片采样（rank0 抽 + broadcast + `games[rank::world]`）
-- [ ] **验收**：`EZ_SMOKE_*` 缩规模下 `torchrun --nproc_per_node=8` 跑完 1 个 outer，
-      8 个 rank 的 `update_rel` 都不为 0，且 loss 与单卡同 seed 量级一致
+### P0 — 让 8 卡能起来（不改算法语义，半天）— ✅ 已落地
+- [x] `setup_dist()` 接入；`log0(rank, ...)`；per-rank 日志文件
+      （`train_log.rank{r}.jsonl`；rank0 额外维护 `train_log.jsonl`，判读脚本不用改）
+- [x] `run_dir` 广播；`ez_save` 仅 rank0；`persist_pool` 仅 rank0（池子靠 all_gather 保证一致）
+- [x] 两 adapter 都 trainable 后再 DDP，`find_unused_parameters=True`
+      （`build_model_and_tokenizer(..., wrap_ddp=False)` → 挂双 LoRA → 全开 requires_grad → DDP）
+- [x] `TPS % world == 0` 兜底：不整除时自动上调到 world 的倍数 + 大声 WARNING（红线 B）
+- [x] 分片采样（rank0 抽 + broadcast + `games[rank::world]`）；`uid` 带 rank 防跨 rank 撞号
+- [x] 死锁的显式守卫：空 GRPO 组 → 全局 MIN all_reduce 后**全员同时退出**；
+      solver 空池 → 全局一致的跳过决定；空组 backward → 零 loss 占位（绝不 `continue`）
+- [ ] **验收**：8 卡跑完 1 个 outer，8 个 rank 的 `update_rel` 都不为 0
+      → job `12989532` 排队中，判据见 §8 关4（已实现）
+
+#### P0 里两个容易写错、但**必须**写对的地方（本次踩点）
+
+1. **`policy` 必须持有 DDP 包装后的对象**。`HFPolicy` 内部直接 `model(...)`；
+   如果传 `raw` 或 `raw.module`，就绕过了 DDP 的 forward hook，梯度**永远不会 all-reduce**
+   —— 8 个 rank 各自静默跑自己的，速度不涨、指标还对不上，且不报任何错。
+   旧代码那句 `model.module if hasattr(model, "module") else model` 正是这个雷。
+
+2. **DDP 必须在双 adapter 都可训练之后才 wrap**（红线 C）。DDP 在构造那一刻按
+   "哪些参数 requires_grad" 固定 bucket 成员；先 wrap 再切 `requires_grad`，
+   非活跃 adapter 的参数**从未进过 bucket 列表**，切到它的相位时梯度不会被同步。
 
 ### P1 — 效率（1 天）
-- [ ] `env_sr` 懒建（省 1/5 slot）；`OMP_NUM_THREADS=1`
+- [ ] `env_sr` 懒建（省 1/5 slot）；`OMP_NUM_THREADS=1`（8 卡脚本里已设）
 - [ ] `no_sync()` 包掉除最后一个 micro-batch 之外的所有 backward（主线同款）
 - [ ] 每 rank 的 env 数写进启动自检日志（防止 320 slot 静默超订）
 
@@ -253,7 +317,7 @@ DDP 平均 8 份 → (1/G) Σ_all a_i ℓ_i ，与单卡完全等价
 
 ```bash
 # P0 完成后，把冒烟脚本换成 8 进程版本跑（见 P0 验收）
-EZ_SMOKE_G=2 EZ_SMOKE_G_P=2 EZ_SMOKE_TPS=8 EZ_SMOKE_TURNS=3 \
+EZ_SMOKE_G=2 EZ_SMOKE_G_P=2 EZ_SMOKE_TPS=8 EZ_SMOKE_TURNS=16 \
   torchrun --nproc_per_node=8 src/ez_train.py --config configs/ez_qwen3_4b.yaml --dry-run
 ```
 

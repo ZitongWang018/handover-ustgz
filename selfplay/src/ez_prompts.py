@@ -36,6 +36,15 @@ IMPORTANT: respond in this format.
 - On each exploration step: the <think></think> tags stay empty; write
 a brief plain-text reasoning AFTER them about what interesting, state-changing action
 to take next, then output your action in <tool_call></tool_call> tags.
+- *** ONE ACTION PER RESPONSE -- THEN STOP IMMEDIATELY. ***
+  Your response must contain EXACTLY ONE <tool_call></tool_call> block and must end right
+  after its closing tag. After emitting it, STOP: do not write a second tool call, do not
+  explain what you would do next. The environment replies with the new observation, and only
+  then do you choose your next action.
+  Example of exactly one well-formed response (nothing before <think>, nothing after the
+  closing tag):
+  <think></think>The desk may hold a small object, so I will walk over and check it.
+  <tool_call>{"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle_name":"desk 1"}}</tool_call>
 """ + _ACTION_SPACE_DOC + """
 WHEN YOU ARE DONE: once you have accomplished something interesting and state-changing, END
 by emitting a single "finish" tool call stating that task:
@@ -56,19 +65,39 @@ finish("Heat some apple and put it on the countertop.")."""
 # 补全了回合数上限与动作合法性提示（U3 决策点：默认不给 admissible_commands，
 # 由 ez_cfg.proposer_give_admissible 开关控制，smoke 时对比两种设定）。
 PROPOSER_USER_TEMPLATE = """{observation}
-Explore this scene. Take one action per turn. When you have reached an interesting
-state-changing result, stop and call `finish` with a `task_description` stating that task
-as an imperative instruction. You have at most {max_turns} turns.
+Explore this scene. Take exactly ONE action per turn, then stop and wait for the observation.
+When you have reached an interesting state-changing result, stop and call `finish` with a
+`task_description` stating that task as an imperative instruction. You have at most {max_turns}
+turns.
 {admissible_hint}"""
 
 # 补全: admissible 提示块（开启 U3 开关时注入；格式与 format_observation 对齐）
 ADMISSIBLE_HINT = "Admissible actions at this step: {admissible}"
+
+# 补全（论文未规定）：**临近回合上限时的收尾提醒**。
+#
+# 为什么必须有：实测（job 12989069/12989143/12989301）Qwen3-4B-Instruct-2507 会把
+# 探索回合跑满也不主动调 `finish` —— mean_turns 恒等于 max_turns、accept=0，
+# 于是 proposer 相位一条任务都产不出来、solver 相位整段被跳过，整轮训练白跑。
+# 只在**剩余 <= NUDGE_WHEN_LEFT 轮**时注入一次，不影响正常节奏；
+# 语义上它只是"提醒该收尾了"，不改变奖励/过滤规则。
+FINISH_NUDGE = """You have {remaining} turn(s) left out of {total}.
+If the actions above have already produced an interesting, reproducible state change, call
+`finish` NOW with the imperative `task_description`. A declared task whose end state has been
+reached is worth far more than more exploration steps. If you still need one more sub-step,
+do it this turn and call `finish` on the very next turn."""
+
+#: 剩余多少轮时注入 FINISH_NUDGE
+NUDGE_WHEN_LEFT = 3
 
 SOLVER_SYSTEM = """You are an AI assistant playing ALFWorld, a text-based household environment.
 Your goal is to complete household tasks by interacting with objects.
 IMPORTANT: You MUST respond in the following format:
 1. The <think></think> tags stay empty; write your brief plain-text plan AFTER them
 2. Then, output your action in <tool_call></tool_call> tags
+*** ONE ACTION PER RESPONSE -- THEN STOP IMMEDIATELY. ***
+Emit EXACTLY ONE <tool_call></tool_call> block per response and end your response right after
+its closing tag. Do not write a second tool call, do not keep planning further steps.
 """ + _ACTION_SPACE_DOC
 
 # 补全: 附录 G Fig.14 的 user 轮含 "# Example Omitted" + "{current_observation}" +

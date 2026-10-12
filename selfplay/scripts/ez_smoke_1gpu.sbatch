@@ -31,9 +31,12 @@
 #   [关3] 奖励非退化    proposer 行 accept>=1，solver 行 reward 不是全 0
 #   任一条不过 → 直接 exit 1，别往下开 8 卡。
 #
-# 规模说明：--dry-run 会**自动缩规模**（G=2 G_P=2 TPS=1 turns=3），因为论文
+# 规模说明：--dry-run 会**自动缩规模**（G=2 G_P=2 TPS=1 turns=12），因为论文
 #   默认的 G=16 × 30 turns 在 A40 的 30 min 上限里跑不完。想加大：
-#   sbatch --export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=5 ...
+#   sbatch --export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=16 ...
+#   ⚠️ turns 别压得太低：prompt 要求探索 10-20 个动作后才 finish，给 3 轮的话
+#      proposer 永远走不到 finish -> accept=0 -> 任务池空 -> solver 相位整段跳过，
+#      冒烟会"看着跑完但其实一条真链路都没走"（实测 job 12989069 就是这么假通过的）。
 # ============================================================================
 #SBATCH --job-name=ez-smoke
 #SBATCH --account=root
@@ -100,7 +103,7 @@ if ! python scripts/ez_check_env_facts.py; then
 fi
 
 # ---------- [2/3] dry-run：1 step proposer + 1 step solver ----------
-echo "--- [2/3] EZ dry-run（自动缩规模 G=${EZ_SMOKE_G:-2} G_P=${EZ_SMOKE_G_P:-2} turns=${EZ_SMOKE_TURNS:-3}）---"
+echo "--- [2/3] EZ dry-run（自动缩规模 G=${EZ_SMOKE_G:-2} G_P=${EZ_SMOKE_G_P:-2} turns=${EZ_SMOKE_TURNS:-12}）---"
 export MASTER_ADDR=$(hostname)
 export NCCL_DEBUG=WARN
 torchrun --nproc_per_node=1 --nnodes=1 \

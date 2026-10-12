@@ -124,7 +124,15 @@ def build_task_pool(config: dict, cfg: dict, rank: int, world: int) -> List[Dict
 # --------------------------------------------------------------------------- 模型
 
 
-def build_model_and_tokenizer(cfg: dict, local_rank: int, world: int):
+def build_model_and_tokenizer(cfg: dict, local_rank: int, world: int, wrap_ddp: bool = True):
+    """构建模型 + tokenizer。
+
+    `wrap_ddp=False` 时**只**返回未包装的 HF 模型（但仍然搬到 cuda:local_rank）。
+    Explorer-Zero 必须用 False：它要在模型上再挂**两个 LoRA adapter**，而 DDP 的
+    all-reduce hook 是在**构造时刻**按当时 requires_grad 的参数集合注册的 ——
+    先 wrap 再挂 adapter，adapter 的梯度永远不会被同步（静默错）。
+    EZ 的流程是：建模型 → 挂双 adapter → 让两个 adapter 都 trainable → 才 DDP。
+    """
     import torch
 
     # ⚠️ 单卡（world==1）时原来没有任何地方把模型搬到 GPU，
@@ -169,7 +177,7 @@ def build_model_and_tokenizer(cfg: dict, local_rank: int, world: int):
     #    而所有冒烟都是单卡跑的，所以这个雷一直藏到第一次真 8 卡才爆。
     if torch.cuda.is_available():
         model = model.to(torch.device("cuda", local_rank))
-    if world > 1:
+    if world > 1 and wrap_ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     return model, tokenizer
 
