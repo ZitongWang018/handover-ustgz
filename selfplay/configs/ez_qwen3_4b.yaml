@@ -53,6 +53,16 @@ train:
   lr: 1.0e-4                          # Table 3
   weight_decay: 0.0
   clip_eps: 0.3                       # Table 3: ε1=ε2=0.3
+  # GRPO surrogate 的归约口径（2026-10-12 交叉 review 抓到的真 bug，已修）：
+  #   seq   = 论文公式(4)语义：先每条序列内部按 token 平均，再组内等权 —— 默认
+  #   token = 旧行为：组内所有 token 混在一起平均 = 按长度加权 → length bias
+  #           实测 G=8/长度20~300/奖励4好4坏：seq 净信号恒 0，token 均值 0.149、
+  #           最大 0.614，方向纯由长度决定（scripts/ez_repro_lossnorm.py）
+  loss_norm: seq
+  # 组内优势的标准差用无偏估计（ddof=1）还是总体标准差（ddof=0，numpy 默认）：
+  #   ddof=1 = TRL/DeepSeekMath 口径 —— 默认
+  #   ddof=0 = 旧行为，低估 std ⇒ 放大优势：G=16 放大 3.3%，G=2 放大 41%
+  adv_ddof: 1
   max_grad_norm: 1.0
   w_sub: 0.3                          # Table 3
   w_div: 0.3                          # Table 3

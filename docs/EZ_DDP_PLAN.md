@@ -1,5 +1,12 @@
 # Explorer-Zero 8 卡 DDP 方案
 
+> 📌 **本文档只管"8 卡能不能跑起来"（DDP 接线）。**
+> **"算法语义对不对"另见 [`EZ_ALGO_REVIEW.md`](EZ_ALGO_REVIEW.md)** ——
+> 那边记的是 2026-10-12 用两个不同模型交叉 review、再逐条回源码核实的结果，
+> 抓到并修掉了两条真 bug（`grpo_loss` 归约口径写成了 token 级、
+> solver 多卡采样重复），也推翻了 review 误报的 4 条。
+> 那边改了 loss 语义，所以 **smoke 基线不能拿旧的判新的**。
+
 > 目标：把 `src/ez_train.py` 从"单进程 scaffold"改成能在 8×A800 / 8×H100 上跑，
 > 且**算法语义与论文一致**（这是前提，速度是次要的）。
 >

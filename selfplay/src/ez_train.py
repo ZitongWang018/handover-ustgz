@@ -523,8 +523,30 @@ def main() -> int:
     clip_eps = tcfg.get("clip_eps", 0.3)
     max_grad_norm = tcfg.get("max_grad_norm", 1.0)
     pad_id = tokenizer.pad_token_id
+    # GRPO surrogate 的归约口径：
+    #   "seq"   = 论文语义（先每条序列内部按 token 平均，再组间等权）—— 默认
+    #   "token" = 旧行为（把组里所有 token 混在一起平均 = 按长度加权，有 length bias）
+    # 详见 src/grpo_norm.py 的模块 docstring，以及 scripts/ez_repro_lossnorm.py 的实测。
+    loss_norm = tcfg.get("loss_norm", "seq")
+    if loss_norm not in ("seq", "token"):
+        raise ValueError(f"train.loss_norm 必须是 'seq' 或 'token'，收到 {loss_norm!r}")
+    if loss_norm == "token" and is_main(rank):
+        log("[warn] train.loss_norm='token'：组内按长度加权，会有 length bias "
+            "（论文语义是 'seq'）。确认这是有意为之。")
+    # 组内优势的标准差用无偏估计（ddof=1，TRL/DeepSeekMath 口径）还是
+    # 总体标准差（ddof=0，numpy 默认）。ddof=0 会低估 std ⇒ 放大优势：
+    # G=16 放大大 3.3%，G=2 放大 41%，跟 max_grad_norm 的阈值也对不上。
+    adv_ddof = int(tcfg.get("adv_ddof", 1))
+    if adv_ddof not in (0, 1):
+        raise ValueError(f"train.adv_ddof 必须是 0 或 1，收到 {adv_ddof!r}")
+    if is_main(rank):
+        log(f"[selfcheck] loss_norm={loss_norm} adv_ddof={adv_ddof} "
+            f"clip_eps={clip_eps} max_grad_norm={max_grad_norm}")
 
-    rng = random.Random(seed)
+    # ★ rng 必须按 rank 偏移：`set_seed(seed, rank)` 里的 `seed + rank` 只是**局部**
+    #   变量，改不到这里，直接用 `seed` 会让所有 rank 的 rng 状态完全一致
+    #   （多卡采样重复的根因）。加上 rank 偏移，各 rank 的随机流才真正分开。
+    rng = random.Random(seed + rank)
     task_pool: List[ProposedTask] = []
     uid_counter = 0
 
@@ -625,7 +647,8 @@ def main() -> int:
                 for c in groll:
                     tokenize_proposer_rollout(c, policy, p_tok_cfg)
                 advs = group_advantages([c.reward for c in groll],
-                                        [0] * len(groll), use_std=True)
+                                        [0] * len(groll), use_std=True,
+                                        ddof=adv_ddof)
                 trajs_like = []
                 from rollout import Trajectory as _T
                 for c, a in zip(groll, advs):
@@ -642,7 +665,7 @@ def main() -> int:
                 #   精确抵消，loss 非零但参数一步不动（review P0-1，与主线 train_grpo 一致）
                 with torch.no_grad():
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
-                loss, _st = grpo_loss(model, bt, old, clip_eps)
+                loss, _st = grpo_loss(model, bt, old, clip_eps, loss_norm=loss_norm)
                 (loss / len(groups)).backward()
             _nof = {id(p): n for n, p in raw.named_parameters()}
             _act = [p for p in opt_params if p.grad is not None and p.requires_grad]
@@ -700,11 +723,34 @@ def main() -> int:
         for step in range(M_S if not args.dry_run else 1):
             st0 = time.time()
             model.eval()
-            # 无放回采样：有放回会让同 uid 的组被合并、loss 双计（review P1-2）
+            # ★★ 采样改为**按 rank 分片**，不用 `rng.sample`（多卡下是真 bug，见下）
+            #   旧写法 `rng.sample(outer_pool, k)`：rng 是 `random.Random(seed)`，
+            #   各 rank 的 seed **完全相同**，而池子经 all_gather 后也完全一致 ——
+            #   于是所有 rank 采到**同一批任务**。实测 8 卡 + k=1 时
+            #   rank1..rank7 全部采到同一个任务，全局只用到 2 个不同任务
+            #   （有效 batch 缩水到 25%，8 卡的算力白扔 6/8）。
+            #   改成分片后：跨 rank **天然不重复**，也不再依赖 rng 状态同步。
+            #
+            # 无放回：有放回会让同 uid 的组被合并、loss 双计（review P1-2）
             # ★ k 必须**各 rank 相同**（=min(TPS//world, 池子大小)）：条数不同则
             #   backward 次数不同，DDP 死锁。池子已跨 rank 一致，所以这个 k 天然一致。
             k_local = max(1, min(TPS // max(world, 1), len(outer_pool)))
-            batch = rng.sample(outer_pool, k=k_local)
+            # ★ `k_local` 直接决定 backward 次数，次数不同 = NCCL 永久卡死（红线 B）。
+            #   上面那句只依赖"池子已跨 rank 一致"这个**注释里的假设** —— 假设破了
+            #   就是 30 分钟 timeout 才炸。显式 all_reduce MIN 同步一次，顺带在
+            #   假设真破了的时候把不一致打到日志里，而不是让人去猜死锁原因。
+            if world > 1:
+                _kt = torch.tensor([k_local], device=device)
+                dist.all_reduce(_kt, op=dist.ReduceOp.MIN)
+                _kmin = int(_kt.item())
+                del _kt
+                if _kmin != k_local:
+                    log(f"[warn] solver k 跨 rank 不一致（rank{rank} 本地 {k_local}，"
+                        f"全局最小 {_kmin}）→ 统一取 {_kmin}。"
+                        f"这说明 outer_pool 并非真的跨 rank 一致，去查 all_gather")
+                k_local = _kmin
+            batch = [outer_pool[(rank + i * world) % len(outer_pool)]
+                     for i in range(k_local)]
             all_roll: List[EzSolverTrajectory] = []
             for t in batch:
                 all_roll.extend(run_ez_solver_rollouts(env_s, policy, [t] * G, s_cfg,
@@ -728,13 +774,13 @@ def main() -> int:
                     _n_bwd += 1
                     continue
                 advs = group_advantages([r.traj.reward for r in grp], [0] * len(grp),
-                                        use_std=True)
+                                        use_std=True, ddof=adv_ddof)
                 for r, a in zip(grp, advs):
                     r.traj.advantage = a
                 bt = make_batch([r.traj for r in grp], pad_id, device)
                 with torch.no_grad():
                     old = per_token_logps(model, bt.input_ids, bt.attention_mask)
-                loss, stt = grpo_loss(model, bt, old, clip_eps)
+                loss, stt = grpo_loss(model, bt, old, clip_eps, loss_norm=loss_norm)
                 #   ★ 分母是**本 rank 的 batch 条数**（=TPS/world）：DDP 取平均后
                 #     全局正好是 1/TPS。不要手动乘 world。
                 (loss / len(batch)).backward()

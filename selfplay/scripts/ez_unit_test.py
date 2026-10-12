@@ -281,5 +281,154 @@ check("fallback 相同观测无变化", state_delta(fa, fb).is_empty())
 check("fallback 不同观测有变化", not state_delta(fa, fc).is_empty())
 check("fallback 匹配", match_reference(fa, fc, [fa, fc]))
 
+print("== 多卡采样：跨 rank 不得重复（job 12989532 实测踩到的真 bug）==")
+# ★ 背景：solver 相位旧写法是 `rng.sample(outer_pool, k)`，
+#   而 rng 是 `random.Random(seed)` —— 各 rank 的 seed 完全相同
+#   （`set_seed(seed, rank)` 里的 `seed + rank` 只是局部变量，改不到这里），
+#   池子又经 all_gather 后完全一致 ⇒ 所有 rank 采到同一批任务。
+#   实测 8 卡 k=1：rank1..rank7 全部采到同一个任务，全局只用到 2 个不同任务，
+#   有效 batch 缩水到 25%。
+#   修法两条：① rng 加 rank 偏移 ② 采样改成按 rank 分片（本例验证的是 ②）。
+POOL = list(range(24))
+for _world in (2, 4, 8):
+    _k = max(1, 8 // _world)
+    _picked = [tuple(POOL[(r + i * _world) % len(POOL)] for i in range(_k))
+               for r in range(_world)]
+    _all = [t for p in _picked for t in p]
+    _uniq = len(set(_all))
+    check(f"world={_world} 分片采样：{_uniq}/{len(_all)} 个不同任务（应==总数）",
+          _uniq == len(_all), f"采到 {_picked}")
+    check(f"world={_world} 各 rank 条数一致（红线 B）",
+          len({len(p) for p in _picked}) == 1, f"{[len(p) for p in _picked]}")
+
+# 对照：旧写法（rng 不带 rank 偏移）确实会采重 —— 把这个退化行为也钉住，
+# 免得有人"优化"回 rng.sample 而没加 rank 偏移。
+import random as _random                                     # noqa: E402
+
+# ① 纯 rng（无人额外消耗）：8 个 rank 采到**完全相同**的一批
+_old = []
+for _r in range(8):
+    _rng = _random.Random(42)
+    _old.append(tuple(_rng.sample(POOL, k=1)))
+check("旧写法(random.Random(42) 不分片)：8 个 rank 采到同一批（bug 复现）",
+      len(set(_old)) == 1, f"{_old}")
+
+# ② 真实情形：rank0 在 proposer 相位调过 rng.choice，所以只有它不同
+_old2 = []
+for _r in range(8):
+    _rng = _random.Random(42)
+    if _r == 0:
+        for _ in range(8):                    # 复现行 558 的 `rng.choice(game_files)`
+            _rng.choice(range(3553))
+    _old2.append(tuple(_rng.sample(POOL, k=1)))
+check("旧写法(rank0 消耗过 rng)：全局只有 2 个不同任务，有效 batch 25%",
+      len(set(_old2)) == 2, f"{set(_old2)}")
+check("旧写法退化了：rank1..7 全部撞车",
+      len(set(_old2[1:])) == 1, f"{_old2[1:]}")
+
+# ===========================================================================
+# grpo_loss 的归约口径：token 级 vs 序列级（2026-10-12 交叉 review 抓到的真 bug）
+#
+# 为什么单独测：`grpo_loss` 在 train_grpo.py 里，而那个模块顶层要 import
+# transformers / alfworld / rollout，离线环境根本 import 不进来。所以把归约
+# 数学抽到 `src/grpo_norm.py`（只依赖 torch），这里测的就是**线上跑的那份代码**，
+# 不是复刻实现。
+#
+# 判据不看 loss 的**值**（序列级下 Σadv=0 会让它恒为 0，看不出差别），
+# 而是看**梯度** —— 梯度才是真正决定更新方向的东西。
+# ===========================================================================
+try:
+    import torch  # noqa: E402
+    from grpo_norm import grpo_reduce  # noqa: E402
+    _HAS_TORCH = True
+except ImportError as _e:                                    # pragma: no cover
+    print(f"\n== grpo 归约口径 ==\n  ⚠️ 跳过（缺依赖：{_e}）")
+    _HAS_TORCH = False
+
+if _HAS_TORCH:
+    print("\n== grpo 归约口径（token 级 vs 序列级）==")
+
+    # G=2：一条短(20 token)答对，一条长(200 token)答错
+    LEN = [20, 200]
+    ADV = [1.0, -1.0]
+    W = max(LEN)
+    _mask = torch.zeros(2, W)
+    for _i, _L in enumerate(LEN):
+        _mask[_i, :_L] = 1.0
+
+    def _grads(norm: str):
+        """per_tok[i,t] = -adv_i * θ_i ⇒ ∂loss/∂θ_i 就是"序列 i 拿到的权重×(-adv_i)"。"""
+        th = torch.zeros(2, requires_grad=True)
+        adv = torch.tensor(ADV).unsqueeze(1)                 # (2,1)
+        per_tok = -adv * th.unsqueeze(1)                     # (2,W)
+        loss = grpo_reduce(per_tok, _mask, loss_norm=norm)
+        loss.backward()
+        return th.grad.clone(), float(loss.item())
+
+    g_seq, v_seq = _grads("seq")
+    g_tok, v_tok = _grads("token")
+
+    # ① 序列级：两条序列等权，梯度幅度必须相等（与长度无关！）
+    check("序列级：两条序列梯度幅度相等（等权，与长度无关）",
+          abs(abs(g_seq[0]) - abs(g_seq[1])) < 1e-6, f"{g_seq.tolist()}")
+    check("序列级：梯度幅度 == |adv|/G = 0.5",
+          abs(abs(g_seq[0]) - 0.5) < 1e-6, f"{g_seq.tolist()}")
+
+    # ② token 级：长度加权，200/20 = 10 倍
+    _ratio = abs(g_tok[1]) / abs(g_tok[0])
+    check(f"token 级：长度加权，长/短 = {_ratio:.1f}（应 == 200/20 = 10）",
+          abs(_ratio - 10.0) < 1e-4, f"{g_tok.tolist()}")
+    check("token 级确实放大了长序列（这就是 length bias）",
+          abs(g_tok[1]) > abs(g_seq[1]) * 1.5, f"tok={g_tok.tolist()} seq={g_seq.tolist()}")
+
+    # ③ 组内净优势：Σ adv = 0 ⇒ 序列级必须给 0 净信号，token 级不该给 0
+    def _net(norm: str):
+        s = torch.zeros(1, requires_grad=True)
+        adv = torch.tensor(ADV).unsqueeze(1)
+        per_tok = -adv * s                                   # 所有序列共用一个缩放
+        loss = grpo_reduce(per_tok, _mask, loss_norm=norm)
+        loss.backward()
+        return float(s.grad[0].item())
+
+    # ⚠️ 阈值用 1e-6 而不是 1e-9：float32 下 0.5-0.5 的累加误差就有 ~6e-8，
+    #    拿 1e-9 卡只会在换机器上时随机红。
+    check("序列级：组内奖励对称 ⇒ 净信号恒为 0（GRPO 应有性质）",
+          abs(_net("seq")) < 1e-6, f"{_net('seq')}")
+    check("token 级：同样的对称奖励却给出非零净信号（bug 复现）",
+          abs(_net("token")) > 0.5, f"{_net('token')}")
+
+    # ④ sanity：长度全相等时两种口径必须完全一致
+    _meq = torch.ones(2, 50)
+    _adv = torch.tensor(ADV).unsqueeze(1)
+    _th1 = torch.zeros(2, requires_grad=True)
+    _l1 = grpo_reduce(-_adv * _th1.unsqueeze(1), _meq, "seq")
+    _th2 = torch.zeros(2, requires_grad=True)
+    _l2 = grpo_reduce(-_adv * _th2.unsqueeze(1), _meq, "token")
+    check("长度全相等时 seq == token（口径差异只来自长度）",
+          abs(float(_l1.item()) - float(_l2.item())) < 1e-9,
+          f"{_l1.item()} vs {_l2.item()}")
+
+    # ⑤ mask 全 0 的行不能进平均（否则会稀释），也不能让 loss 断图
+    _mz = torch.zeros(3, W)
+    _mz[0, :10] = 1.0                                        # 只有第 0 行有效
+    _th3 = torch.zeros(3, requires_grad=True)
+    _l3 = grpo_reduce(-torch.tensor([1.0, -1.0, 1.0]).unsqueeze(1) * _th3.unsqueeze(1),
+                      _mz, "seq")
+    check("mask 全 0 的行有 grad_fn（不能断图，否则红线 B 死锁）",
+          _l3.requires_grad and _l3.grad_fn is not None, str(_l3))
+    _l3.backward()
+    check("mask 全 0 的行拿不到梯度", float(_th3.grad[2].item()) == 0.0,
+          f"{_th3.grad.tolist()}")
+    check("有效行不受空行稀释（权重仍是 1/1 而非 1/3）",
+          abs(abs(_th3.grad[0].item()) - 1.0) < 1e-6, f"{_th3.grad.tolist()}")
+
+    # ⑥ 非法口径必须报错，不能悄悄走默认分支
+    _bad = False
+    try:
+        grpo_reduce(torch.zeros(1, 4), torch.ones(1, 4), "oops")
+    except ValueError:
+        _bad = True
+    check("非法 loss_norm 抛 ValueError", _bad)
+
 print(f"\n{'全部通过 ✅' if FAIL == 0 else f'失败 {FAIL} 项 ❌'} ({PASS} passed)")
 sys.exit(1 if FAIL else 0)

@@ -86,7 +86,18 @@ def test_advantages() -> None:
     print("\n== group advantage ==")
     check("全同分 -> 全 0", R.group_advantages([1, 1, 1, 1], [0, 0, 0, 0]) == [0.0] * 4)
     a = R.group_advantages([1, 0, 1, 0], [0, 0, 0, 0])
-    check("1/0 分组 -> ±1", abs(a[0] - 1) < 1e-3 and abs(a[1] + 1) < 1e-3, str(a))
+    # G=4、ddof=1（默认，对齐 TRL/论文）：std = sqrt(1/3) = 0.5774 → adv = ±0.866
+    check("1/0 分组 -> ±0.866 (ddof=1)", abs(a[0] - 0.866) < 1e-3 and abs(a[1] + 0.866) < 1e-3, str(a))
+    # 对照：ddof=0 是旧行为，G=4 下 std = 0.5 → adv = ±1，幅度凭空大 15.5%
+    a_old = R.group_advantages([1, 0, 1, 0], [0, 0, 0, 0], ddof=0)
+    check("ddof=0 旧行为 -> ±1（放大 15.5%）",
+          abs(a_old[0] - 1.0) < 1e-3 and abs(a_old[1] + 1.0) < 1e-3, str(a_old))
+    # G=2 是差距最大的情形：±0.707 vs ±1.0，差 41%
+    a2g = R.group_advantages([1, 0], [0, 0])
+    check("G=2 ddof=1 -> ±0.707", abs(abs(a2g[0]) - 0.707) < 1e-3, str(a2g))
+    a2g0 = R.group_advantages([1, 0], [0, 0], ddof=0)
+    check("G=2 ddof=0 -> ±1（放大 41%）", abs(abs(a2g0[0]) - 1.0) < 1e-3, str(a2g0))
+    check("ddof 越小 advantage 越大", abs(a2g[0]) < abs(a2g0[0]), f"{a2g} vs {a2g0}")
     a2 = R.group_advantages([1, 0, 0.5, 0.5], [0, 0, 1, 1])
     check("退化组 -> 0", abs(a2[2]) < 1e-9 and abs(a2[3]) < 1e-9, str(a2))
     st = R.summarize_grouping([1, 0, 0, 0], [0, 0, 1, 1])

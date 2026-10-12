@@ -134,11 +134,25 @@ def group_advantages(
     group_ids: Sequence[int],
     eps: float = 1e-4,
     use_std: bool = True,
+    ddof: int = 1,
 ) -> List[float]:
     """按 group 做 GRPO 标准化：A_i = (R_i - mean_g) / (std_g + eps)。
 
     `use_std=False` 时只减均值（Dr.GRPO 风格，避免 std 太小时放大噪声）。
     **组内全同分时直接返回 0**，否则会除出一个放大的噪声方向。
+
+    ⚠️⚠️ `ddof`（2026-10-12 由 0 改为 1，两个模型的 review 都独立指出）
+
+        `np.std` 默认是 **ddof=0**（总体标准差），会**低估**组内离散度，
+        从而**放大** advantage。G 越小放大越离谱：
+
+            G=16：std 低估 sqrt(15/16) = 0.968  → adv 放大 3.3%
+            G=4 ：std 低估 sqrt(3/4)   = 0.866  → adv 放大 15.5%
+            G=2 ：ddof=0 给 ±1.000，ddof=1 给 ±0.707 → **幅度差 41%**
+
+        TRL `GRPOTrainer` 用的是 `torch.std`（默认 `unbiased=True`，即 ddof=1），
+        DeepSeekMath 参考实现同样走无偏估计。这里对齐到 ddof=1，
+        否则小 G 下梯度幅度会凭空大 40%，跟 clip_grad_norm 的阈值也对不上。
     """
     rewards = np.asarray(rewards, dtype=np.float64)
     group_ids = np.asarray(group_ids)
@@ -148,7 +162,8 @@ def group_advantages(
         grp = rewards[m]
         if grp.size <= 1:
             continue
-        std = grp.std()
+        # ddof=1 要求 size > 1，上面的 continue 已经保证了
+        std = grp.std(ddof=ddof)
         if std < eps:
             # 组内无区分度：不给梯度（这正是稀疏奖励下的常态，靠过程奖励打破）
             adv[m] = 0.0

@@ -47,6 +47,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 from alfworld_env import ALFWorldBatchEnv, collect_game_files, load_alfworld_config, task_instance_id, task_type_of  # noqa: E402
+from grpo_norm import grpo_reduce  # noqa: E402
 from reward import RewardConfig, group_advantages, make_reward_cfg, summarize_grouping  # noqa: E402
 from rollout import HFPolicy, RolloutConfig, Trajectory, generation_mode, run_rollouts  # noqa: E402
 
@@ -296,7 +297,33 @@ def grpo_loss(
     batch: BatchTensors,
     old_logps: torch.Tensor,
     clip_eps: float,
+    loss_norm: str = "seq",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """GRPO/PPO-clip  surrogate loss。
+
+    ⚠️⚠️ `loss_norm`（2026-10-12 修，交叉 review 时由第二个模型独立指出、我再自己推一遍核实）
+
+        `"seq"`（默认，**论文语义**，DeepSeekMath 公式 4）：
+            J = (1/G) Σ_i [ (1/|o_i|) Σ_t ( ... ) ]
+            先每条序列内部按 token 平均，再**组间等权**平均。
+
+        `"token"`（旧行为，**有长度偏置**）：
+            J = ( Σ_i Σ_t (...) ) / ( Σ_i |o_i| )
+            把 G 条序列的 token 混在一起平均 = 按长度加权。
+
+        为什么必须改：`ratio ≡ 1` 时 `per_tok = -adv_i` 在**序列内是常数**，于是
+
+            token 级： loss = - Σ_i |o_i|·adv_i / Σ_i |o_i|    ← 长度加权
+            序列级：   loss = - (1/G) Σ_i adv_i                ← 组内等权
+
+        GRPO 归一化后 Σ_i adv_i = 0，所以序列级下"组内奖励对称"必然给出
+        净信号 0（这是 GRPO *应有*的性质）；而 token 级下**长度本身变成信号**。
+        实测（scripts/ez_repro_lossnorm.py，G=8、长度 20~300、奖励 4 好 4 坏、
+        2000 组）：序列级净信号恒为 0，token 级 |净信号| 均值 0.149、最大 0.614
+        —— 方向完全由长度分布决定。极端例子：G=2、长度 20 vs 200、
+        一好一坏，token 级权重是 (0.091, 0.909)，长序列独占 91%。
+        这就是 Dr.GRPO 点名的 length bias：模型会去学"写长/写短"，而不是"答对"。
+    """
     new_logps = per_token_logps(model, batch.input_ids, batch.attention_mask)
     # 对齐 mask：logp[:, i] 预测的是 input_ids[:, i+1]
     mask = batch.loss_mask[:, 1:]
@@ -306,10 +333,19 @@ def grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     per_tok = -torch.min(surr1, surr2)
     denom = mask.sum().clamp(min=1.0)
-    loss = (per_tok * mask).sum() / denom
+    # 归约口径单独放在 `grpo_norm.grpo_reduce`（只依赖 torch），
+    # 这样离线单测能直接测到**跑的这份代码**，而不是测一份复刻实现。
+    loss = grpo_reduce(per_tok, mask, loss_norm=loss_norm)
+
     with torch.no_grad():
         clipped = ((ratio - 1.0).abs() > clip_eps).float()
         stats = {
+            # ★ 这个式子看着像随手写的残差，其实是标准的 **k3 KL 估计**
+            #   （Schulman）：令 Δ = new - old，则
+            #       E_old[ exp(Δ) - 1 - Δ ] = Σ_old·(new/old) - 1 - E_old[Δ]
+            #                               = 1 - 1 - E_old[Δ] = KL(old ‖ new)
+            #   一阶项 -Δ 就是 k1，k3 比 k1 多了个非负的二阶项，方差更低且无偏。
+            #   别"顺手改成 (old - new).mean()" —— 那退化成 k1 了。
             "kl_approx": float(((ratio - 1.0) - (new_logps - old_logps)).mean().item()) if mask.sum() > 0 else 0.0,
             "clip_frac": float((clipped * mask).sum().item() / max(denom.item(), 1.0)),
             "ratio_mean": float(((ratio * mask).sum() / denom).item()),
