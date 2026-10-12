@@ -195,6 +195,16 @@ class BatchStep:
     won: List[bool] = field(default_factory=list)
     admissible: List[List[str]] = field(default_factory=list)
     expert_plan: List[Optional[str]] = field(default_factory=list)
+    facts: List[Any] = field(default_factory=list)   # EZ：textworld facts（with_facts=True 时）
+
+
+def _facts_or_none(infos: Dict[str, Any], n: int) -> List[Any]:
+    f = infos.get("facts")
+    if not f:
+        return [None] * n
+    out = list(f)
+    out.extend([None] * (n - len(out)))
+    return out[:n]
 
 
 class ALFWorldBatchEnv:
@@ -213,6 +223,7 @@ class ALFWorldBatchEnv:
         seed: Optional[int] = None,
         game_files: Optional[Sequence[str]] = None,
         with_expert: bool = False,
+        with_facts: bool = False,   # EZ：请求 textworld facts（状态快照验证用）
     ) -> None:
         if split not in SPLITS:
             raise ValueError(f"split 必须是 {list(SPLITS)} 之一，收到 {split!r}")
@@ -228,6 +239,7 @@ class ALFWorldBatchEnv:
         self.batch_size = batch_size
         self.seed_value = seed
         self.with_expert = with_expert
+        self.with_facts = with_facts
 
         self._alfred = AlfredTWEnv(config, train_eval=split)
         if game_files is not None:
@@ -270,6 +282,14 @@ class ALFWorldBatchEnv:
         wrappers = [alfred_demangler, AlfredInfos]
 
         request_infos = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
+        # ⚠️ EZ 复现：facts 需要 textworld>=1.5。旧版 EnvInfos 可能不接受 facts 字段，
+        #    构造失败时降级（不报错），由 ez 侧在 smoke 时检查 facts 是否真的存在。
+        if self.with_facts:
+            try:
+                request_infos.facts = True
+            except (AttributeError, TypeError):
+                import warnings
+                warnings.warn("当前 textworld 不支持 EnvInfos.facts，EZ 状态验证将降级为观测签名模式")
         expert_type = config["env"]["expert_type"]
         training_method = config["general"]["training_method"]
 
@@ -326,6 +346,8 @@ class ALFWorldBatchEnv:
         admissible = [list(a) for a in infos["admissible_commands"]]
         views = [parse_obs(o) for o in obs]
         expert_plan = _extract_expert_plan(infos, self.batch_size)
+        # EZ：facts 通过属性暴露（不改 reset 返回值签名，保持既有调用方兼容）
+        self.last_reset_facts = _facts_or_none(infos, self.batch_size)
         return list(obs), views, admissible, used, expert_plan
 
     def step(self, actions: Sequence[str]) -> BatchStep:
@@ -339,6 +361,7 @@ class ALFWorldBatchEnv:
             won=[bool(w) for w in infos.get("won", [False] * self.batch_size)],
             admissible=[list(a) for a in infos.get("admissible_commands", [[]] * self.batch_size)],
             expert_plan=_extract_expert_plan(infos, self.batch_size),
+            facts=_facts_or_none(infos, self.batch_size),
         )
 
     def close(self) -> None:
