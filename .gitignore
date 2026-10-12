@@ -24,6 +24,11 @@ runs/
 wandb/
 results/
 
+# ALFWorld / TextWorld 兼容层产物与 --target 装的依赖（体积大、可重建）
+third_party/
+*.so
+*.so.*
+
 # 缓存
 __pycache__/
 *.py[cod]

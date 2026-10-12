@@ -1,0 +1,84 @@
+{
+  "host": "mgmt-3",
+  "cpus": 64,
+  "python": "3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]",
+  "total_wall": 71.5,
+  "results": [
+    {
+      "batch_size": 1,
+      "init_env": 0.0049,
+      "reset_cold": 3.4024,
+      "reset_warm_list": [
+        2.6812,
+        2.9914,
+        2.5677
+      ],
+      "reset_warm_avg": 2.7468,
+      "n_resets_during_steps": 0,
+      "step_avg": 0.0996,
+      "step_p50": 0.0994,
+      "step_p90": 0.1002,
+      "step_min": 0.0988,
+      "step_max": 0.103,
+      "env_steps_per_sec": 10.04,
+      "wall_steps_per_sec": 10.04
+    },
+    {
+      "batch_size": 2,
+      "init_env": 0.0734,
+      "reset_cold": 3.1074,
+      "reset_warm_list": [
+        2.9768,
+        3.2925,
+        3.0365
+      ],
+      "reset_warm_avg": 3.1019,
+      "n_resets_during_steps": 0,
+      "step_avg": 0.124,
+      "step_p50": 0.1263,
+      "step_p90": 0.1342,
+      "step_min": 0.1019,
+      "step_max": 0.1554,
+      "env_steps_per_sec": 16.12,
+      "wall_steps_per_sec": 8.06
+    },
+    {
+      "batch_size": 4,
+      "init_env": 0.0912,
+      "reset_cold": 3.2562,
+      "reset_warm_list": [
+        3.2839,
+        3.1561,
+        3.1474
+      ],
+      "reset_warm_avg": 3.1958,
+      "n_resets_during_steps": 0,
+      "step_avg": 0.14,
+      "step_p50": 0.138,
+      "step_p90": 0.1568,
+      "step_min": 0.1188,
+      "step_max": 0.1777,
+      "env_steps_per_sec": 28.57,
+      "wall_steps_per_sec": 7.14
+    },
+    {
+      "batch_size": 8,
+      "init_env": 0.1621,
+      "reset_cold": 3.4279,
+      "reset_warm_list": [
+        3.2707,
+        3.2116,
+        3.2814
+      ],
+      "reset_warm_avg": 3.2546,
+      "n_resets_during_steps": 0,
+      "step_avg": 0.1356,
+      "step_p50": 0.1312,
+      "step_p90": 0.1487,
+      "step_min": 0.118,
+      "step_max": 0.1543,
+      "env_steps_per_sec": 59.0,
+      "wall_steps_per_sec": 7.37
+    }
+  ]
+}

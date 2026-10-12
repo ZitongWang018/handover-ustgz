@@ -1,0 +1,80 @@
+# 单卡端到端冒烟（**fp32 + adafactor**）—— 为的是在「真模型 + 真 dtype」下
+# 验证整条链路，而不是像 train_smoke.yaml 那样故意用 bf16 去实证舍入问题。
+#
+# 为什么用 adafactor 而不是 AdamW：
+#   fp32 参数 16G + fp32 梯度 16G + AdamW 二阶动量 32G ≈ 64G，A40(48G) 装不下。
+#   Adafactor 用分解二阶动量，状态几乎为 0 -> 静态占用 ~32G，A40 能塞下，
+#   于是可以**立刻**（debug 分区常年有空卡）验证 fp32 这条生产路径。
+#   A800(80G) 上仍然用 AdamW（见 configs/train_qwen3_4b.yaml）。
+#
+# 这份配置要验证的四件事（缺一不可）：
+#   1) fp32 参数 + flash_attention_2 能否正常 forward / generate
+#      （generate 已加 bf16 autocast，见 rollout.HFPolicy.generate）
+#   2) invalid_rate 是否 ≈ 0（gradient_checkpointing 修掉后应如此）
+#   3) 奖励是否有区分度 -> advantage 非零 -> loss 非零
+#   4) update_rel > 0（fp32 下 lr=1e-6 的更新量不会被舍入抹掉）
+#
+# 用法：
+#   cd ~/ztwang/selfplay
+#   torchrun --nproc_per_node=1 --master_port=29521 src/train_grpo.py \
+#       --config configs/train_smoke_fp32.yaml
+
+run:
+  name: qwen3-4b-alfworld-grpo-fp32
+  seed: 42
+  output_dir: runs
+
+model:
+  path: $ZTWANG_MODEL_PATH
+  dtype: float32                    # ← 生产 dtype，故意保留，就是为了测它
+  attn_implementation: flash_attention_2   # ← 故意保留，测 fp32+FA2+autocast 组合
+  gradient_checkpointing: true
+
+env:
+  config_path: configs/base_config.yaml
+  split: train
+  eval_split: eval_out_of_distribution
+  # ⚠️ 步数和组都不能太小：6 步 × 2 条的冒烟里，两条轨迹很容易"都 wandering 到底、
+  #    非法次数相同" -> 奖励全同 -> 组内 std=0 -> adv=0，什么也验证不了。
+  #    15 步 × 4 条能给采样留出足够的发散空间（不同的非法次数/步数 -> 奖励有区分度）。
+  max_episode_steps: 15
+  n_tasks_per_iter: 1
+  group_size: 4                     # 每 iter 4 条轨迹（同任务多采样，GRPO 的标准做法）
+  task_types: [1, 2, 3, 4, 5, 6]
+
+rollout:
+  max_new_tokens: 64
+  temperature: 1.0
+  top_p: 0.95
+  repetition_penalty: 1.05
+  max_context_tokens: 4096
+  keep_recent_turns: 6
+  invalid_action_mode: raw
+  fuzzy_threshold: 0.6
+
+reward:
+  use_sparse_only: false
+  success: 1.0
+  invalid_action_penalty: 0.10
+  format_violation_penalty: 0.10
+  repeat_penalty: 0.05
+  valid_step_bonus: 0.01
+  admissible_ratio_bonus: 0.0
+  efficiency_bonus: 0.10
+  step_penalty: 0.0
+  clip_min: -1.0
+  clip_max: 2.0
+
+train:
+  total_iters: 3
+  lr: 1.0e-6                        # ← 真实 lr：fp32 下这个量级也必须能推动参数
+  weight_decay: 0.0
+  warmup_iters: 1                   # it=0 就是满 lr，避免 warmup 把 update_rel 压成 0
+  clip_eps: 0.2
+  max_grad_norm: 1.0
+  adv_use_std: true
+  micro_batch_size: 1
+  optimizer: adafactor
+  save_every: 1000                  # 存断点已在上一轮冒烟验证过，这轮跳过省时间
+  eval_every: 1000                  # 别触发评测（最后一轮会触发一次，见 sbatch 注释）
+  eval_tasks: 8

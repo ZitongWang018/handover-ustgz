@@ -1,0 +1,81 @@
+# ALFWorld × Qwen3-4B-Instruct-2507 的 GRPO 训练配置
+#
+# 用法：
+#   cd ~/ztwang/selfplay
+#   torchrun --nproc_per_node=8 src/train_grpo.py --config configs/train_qwen3_4b.yaml
+# 覆盖任意字段（点号路径）：--max-iters 5 或改这份 yaml。
+
+run:
+  name: qwen3-4b-alfworld-grpo
+  seed: 42
+  output_dir: runs
+
+model:
+  # 二期本机已有：/hpc2hdd/home/xyu608/thinktool/models/qwen3_4b_inst_2507
+  # 支持 $VAR 展开，方便两个集群共用同一份配置（sbatch 里 export 即可）
+  path: $ZTWANG_MODEL_PATH
+  # ⚠️ 必须是 float32。纯 bfloat16 参数 + AdamW(lr=1e-6) 时，更新量(~1e-6)远小于
+  #    bf16 在 |w|≈2e-2 处的 ulp(≈1.6e-4)，`p.addcdiv_()` 会把更新**舍入抹掉** ——
+  #    loss 非零、梯度非零、日志一切正常，但参数一步都没动。
+  #    fp32 参数 + bf16 autocast（见 train_grpo._autocast_bf16）是标准解法。
+  #    代价：静态显存 参数16G + 梯度16G + AdamW 32G ≈ 64G，A800 80G 仍可容纳。
+  dtype: float32
+  attn_implementation: flash_attention_2   # 没有 flash-attn 就改成 sdpa
+  gradient_checkpointing: true
+
+env:
+  config_path: configs/base_config.yaml
+  split: train
+  eval_split: eval_out_of_distribution      # 论文口径：valid_unseen
+  max_episode_steps: 30                     # 官方评测常用 50；训练先 30 省算力
+  n_tasks_per_iter: 2                       # 每个 rank 每次迭代采几个任务
+  group_size: 4                             # 每个任务采几条轨迹 -> 每 rank 8 条
+  task_types: [1, 2, 3, 4, 5, 6]
+
+rollout:
+  max_new_tokens: 96
+  temperature: 1.0
+  top_p: 0.95
+  repetition_penalty: 1.05
+  max_context_tokens: 8192
+  # ⚠️ 这个值直接决定训练序列长度，进而决定显存：
+  #    per_token_logps 要物化 bf16 的 B×W×vocab 张量（vocab=151936）。
+  #    keep_recent_turns=12 → W≈8k；B=1 时 logits 已经 2.5GB，B=2 就 5GB。
+  #    先用 8（W≈5k）保守起步，跑稳了再往上调。
+  keep_recent_turns: 8
+  invalid_action_mode: raw                  # raw=照原样丢给环境（诚实）| best_match=模糊对齐
+  fuzzy_threshold: 0.6
+
+reward:
+  # --- 论文式最素设定：只留 success，其它全 0 ---
+  # 见 configs/train_qwen3_4b_sparse.yaml（同一份配置的 use_sparse_only: true 版本）
+  use_sparse_only: false
+  success: 1.0
+  # --- 过程信号：稀疏奖励下打破"组内全 0 -> advantage 全 0"的僵局 ---
+  # ⚠️ 这些逐步骤累加项在 compute_reward 里会**除以 max_episode_steps** 归一化，
+  #    否则长局的负分会撞到 clip 边界，让所有失败轨迹同分（组内 std=0 -> 无梯度）。
+  invalid_action_penalty: 0.10
+  format_violation_penalty: 0.10
+  repeat_penalty: 0.05
+  valid_step_bonus: 0.01
+  admissible_ratio_bonus: 0.0
+  efficiency_bonus: 0.10
+  step_penalty: 0.0
+  clip_min: -1.0
+  clip_max: 2.0
+
+train:
+  # ⚠️ 24h 时限（sbatch --time=1-00:00:00）装不下 300 iter：按 3-6 min/iter 估算，
+  #    300 iter 要 15-30h，一定会被 Slurm 在半路硬杀。220 iter ≈ 11-22h，留有余量。
+  #    断点每 25 iter 存一次（只保留最新一个），即使触顶也只损失最后一个断点段。
+  total_iters: 220
+  lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_iters: 20
+  clip_eps: 0.2
+  max_grad_norm: 1.0
+  adv_use_std: true
+  micro_batch_size: 1                       # 轨迹很长，micro 调大会线性放大 logits 显存，保持 1
+  save_every: 25                            # 只保留最新一个断点（铁律二）
+  eval_every: 25
+  eval_tasks: 16

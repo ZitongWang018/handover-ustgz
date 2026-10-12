@@ -252,3 +252,56 @@ envs: [ReVision, revision, pytorch, pytorch251, pytorch271, pytorch2.14.0,
 4. **单用户 GPU 上限 16 张** → 同时最多 2 个 8 卡作业。
 5. **最长 7 天**（二期有 14 天队列，三期没有）。
 
+---
+
+# 系统级约束（2026-10-12 实测）
+
+## glibc / 操作系统
+
+| | 二期 | 三期 |
+|---|---|---|
+| 登录节点 | Ubuntu 20.04, **glibc 2.31** (`mgmt-3`) | Rocky Linux 8.10, **glibc 2.28** (`ACD-Login-1`) |
+| 计算节点 | Ubuntu 20.04, **glibc 2.31** (`gpu3-9` via `srun -p debug`) | Rocky 8.6, **glibc 2.28** (`ACD1-63`) |
+
+> **登录节点和计算节点是同一个镜像**，不要指望"计算节点版本更新"来绕开依赖问题。
+
+### 后果：TextWorld 的规划器跑不起来（已解决）
+
+`fast_downward_textworld==20.6.4` 里的 `libdownward.so` 在 glibc≥2.32 上编译，
+需要 `GLIBC_2.32`（唯一用到的新符号是 `__libc_single_threaded`）与 `GLIBCXX_3.4.29`。
+而 ALFWorld 的 `.tw-pddl` 游戏走 `textworld.envs.pddl.Env`，其 `__init__` 第一句就是
+`fast_downward.load_lib()` → 直接 `OSError: version 'GLIBC_2.32' not found`。
+
+**解决方案**（只写自己目录，不动外部环境）：`ztwang/selfplay/env_setup/patch_libdownward.py`
++ `ztwang/selfplay/src/alfworld_compat.py`。关键点：
+
+1. 把 `.gnu.version_r` 里对 `libc.so.6` 的 `GLIBC_2.32` 需求改成 `GLIBC_2.17`，
+   **必须同时改 `vna_hash`**（只改字符串会报 `version 'GLIBC_2.17' not found`）；
+2. `__libc_single_threaded` 用一个一行 C 垫片提供，在 `import fast_downward` 之前
+   用 `ctypes.CDLL(..., RTLD_GLOBAL)` 预加载 —— **`LD_PRELOAD` 救不了**，
+   因为版本需求记在 `libc.so.6` 头上而不是调用方；
+3. 运行时把 `fast_downward.interface.DOWNWARD_LIB_PATH` 指向 patched 副本
+   （`load_lib()` 每次调用都读这个模块全局变量）。
+
+## 可用的训练环境（二期）
+
+| 环境 | Python | 关键包 |
+|---|---|---|
+| `thinktool` | 3.10.19 | torch 2.6.0+cu124, transformers 4.57.3, **trl 0.26.2**, vllm 0.8.5.post1, peft 0.18.0, accelerate 1.12.0, deepspeed 0.18.3, ray 2.53.0, sglang 0.4.6, flash-attn 2.7.4, numpy 1.26.4 |
+| `agentenv-alfworld` | 3.9.25 | torch 2.8.0, textworld 1.6.2, alfworld 0.3.3, fast_downward_textworld 20.6.4, gym 0.26.2, numpy 2.0.2 |
+
+⚠️ **`trl 0.26.2` 的 `rollout_func` 只在 `use_vllm=True` 时生效**，而 vLLM 0.8.5 < TRL 要求的 0.10.2，
+所以 selfplay 用的是自研 GRPO（见 `docs/SELFPLAY.md`）。
+
+`~/.cache/alfworld` = 3.5G（`json_2.1.1/{train,valid_seen,valid_train,valid_unseen}` + `logic/` + `detectors/`）。
+
+## PyPI wheel 可用性（二期有外网，已实测）
+
+```
+textworld-1.6.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   ✅
+alfworld-0.3.3-py3-none-any.whl                                              ✅
+fast_downward_textworld-20.6.4                                                ✅
+gym==0.26.2                                                                  ⚠️ 无匹配 wheel，需退到 sdist / 复制
+```
+
+

@@ -1,0 +1,184 @@
+{
+  "checks": [
+    {
+      "name": "alfworld_compat.install()",
+      "ok": true,
+      "secs": 0.0375,
+      "value": "None"
+    },
+    {
+      "name": "import numpy",
+      "ok": true,
+      "secs": 0.0,
+      "value": "'1.26.4'"
+    },
+    {
+      "name": "import torch",
+      "ok": true,
+      "secs": 2.4035,
+      "value": "'2.6.0+cu124'"
+    },
+    {
+      "name": "import textworld",
+      "ok": true,
+      "secs": 1.3829,
+      "value": "'1.6.2'"
+    },
+    {
+      "name": "import gym",
+      "ok": true,
+      "secs": 0.4611,
+      "value": "'0.26.2'"
+    },
+    {
+      "name": "import alfworld",
+      "ok": true,
+      "secs": 0.0038,
+      "value": "'/hpc2hdd/home/xyu608/ztwang/selfplay/third_party/py310deps/alfworld/__init__.py'"
+    },
+    {
+      "name": "import alfworld.agents.environment.alfred_tw_env",
+      "ok": true,
+      "secs": 3.4322,
+      "value": "<class 'alfworld.agents.environment.alfred_tw_env.AlfredTWEnv'>"
+    },
+    {
+      "name": "fast_downward.load_lib()",
+      "ok": true,
+      "secs": 0.0378,
+      "value": "True"
+    }
+  ],
+  "timing": {
+    "construct_env_and_scan": 0.333,
+    "init_env": 0.069,
+    "reset": 3.16,
+    "step_avg": 0.1266,
+    "step_min": 0.1197,
+    "step_max": 0.1341
+  },
+  "steps": [
+    {
+      "i": 0,
+      "actions": [
+        "go to cabinet 1",
+        "go to cabinet 1"
+      ],
+      "secs": 0.1341,
+      "won": [
+        false,
+        false
+      ],
+      "done": [
+        false,
+        false
+      ],
+      "n_admissible": [
+        29,
+        27
+      ]
+    },
+    {
+      "i": 1,
+      "actions": [
+        "examine cabinet 1",
+        "examine cabinet 1"
+      ],
+      "secs": 0.1277,
+      "won": [
+        false,
+        false
+      ],
+      "done": [
+        false,
+        false
+      ],
+      "n_admissible": [
+        29,
+        27
+      ]
+    },
+    {
+      "i": 2,
+      "actions": [
+        "examine cabinet 1",
+        "examine cabinet 1"
+      ],
+      "secs": 0.1203,
+      "won": [
+        false,
+        false
+      ],
+      "done": [
+        false,
+        false
+      ],
+      "n_admissible": [
+        29,
+        27
+      ]
+    },
+    {
+      "i": 3,
+      "actions": [
+        "examine cabinet 1",
+        "examine cabinet 1"
+      ],
+      "secs": 0.1314,
+      "won": [
+        false,
+        false
+      ],
+      "done": [
+        false,
+        false
+      ],
+      "n_admissible": [
+        29,
+        27
+      ]
+    },
+    {
+      "i": 4,
+      "actions": [
+        "examine cabinet 1",
+        "examine cabinet 1"
+      ],
+      "secs": 0.1197,
+      "won": [
+        false,
+        false
+      ],
+      "done": [
+        false,
+        false
+      ],
+      "n_admissible": [
+        29,
+        27
+      ]
+    }
+  ],
+  "ok": true,
+  "python": "3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]",
+  "executable": "/hpc2hdd/home/xyu608/miniconda3/envs/thinktool/bin/python",
+  "args": {
+    "batch_size": 2,
+    "steps": 5,
+    "config": "/hpc2hdd/home/xyu608/ztwang/selfplay/configs/base_config.yaml",
+    "split": "eval_out_of_distribution",
+    "max_games": 0,
+    "json": "/tmp/check_n2.json"
+  },
+  "n_games_total": 134,
+  "reset_obs0": "-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a cabinet 6, a cabinet 5, a cabinet 4, a cabinet 3, a cabinet 2, a cabinet 1, a coffeemachine 1, a countertop 3, a countertop 2, a countertop 1, a drawer 3, a drawer 2, a drawer 1, a fridge 1, a garbagecan 1, a microwave 1, a shelf 3, a shelf 2, a shelf 1, a sinkbasin 1, a stoveburner 4, a stoveburner 3, a stoveburner 2, a stoveburner 1, and a toaster 1.\n\nYour task is to: put a clean mug in coffeemachine.",
+  "reset_n_admissible": 27,
+  "reset_won": [
+    false,
+    false
+  ],
+  "reset_gamefiles": [
+    "/hpc2hdd/home/xyu608/.cache/alfworld/json_2.1.1/valid_unseen/pick_clean_then_place_in_recep-Mug-None-CoffeeMachine-10/trial_T20190907_221300_362511/game.tw-pddl",
+    "/hpc2hdd/home/xyu608/.cache/alfworld/json_2.1.1/valid_unseen/pick_clean_then_place_in_recep-Knife-None-CounterTop-10/trial_T20190909_110531_148235/game.tw-pddl"
+  ]
+}

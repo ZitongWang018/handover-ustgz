@@ -1,0 +1,162 @@
+=== phase3 Stage-1 install ===
+python : 3.11  (/share/anaconda3/envs/vllm017/bin/python)
+wheels : /data/user/xyu608/ztwang/selfplay/third_party/wheels
+target : /data/user/xyu608/ztwang/selfplay/third_party/py311deps
+==============================
+--- pip install --target (离线, --no-deps) ---
+Looking in links: /data/user/xyu608/ztwang/selfplay/third_party/wheels
+Processing ./ztwang/selfplay/third_party/wheels/ai2thor-2.1.0-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 1))
+Processing ./ztwang/selfplay/third_party/wheels/alfworld-0.3.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 2))
+Processing ./ztwang/selfplay/third_party/wheels/annotated_doc-0.0.5-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 3))
+Processing ./ztwang/selfplay/third_party/wheels/annotated_types-0.8.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 4))
+Processing ./ztwang/selfplay/third_party/wheels/anyio-4.15.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 5))
+Processing ./ztwang/selfplay/third_party/wheels/blinker-1.9.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 6))
+Processing ./ztwang/selfplay/third_party/wheels/blis-1.3.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 7))
+Processing ./ztwang/selfplay/third_party/wheels/catalogue-2.0.10-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 8))
+Processing ./ztwang/selfplay/third_party/wheels/certifi-2026.7.22-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 9))
+Processing ./ztwang/selfplay/third_party/wheels/cffi-2.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 10))
+Processing ./ztwang/selfplay/third_party/wheels/charset_normalizer-3.5.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 11))
+Processing ./ztwang/selfplay/third_party/wheels/click-8.5.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 12))
+Processing ./ztwang/selfplay/third_party/wheels/cloudpathlib-0.26.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 13))
+Processing ./ztwang/selfplay/third_party/wheels/cloudpickle-3.1.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 14))
+Processing ./ztwang/selfplay/third_party/wheels/confection-1.3.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 15))
+Processing ./ztwang/selfplay/third_party/wheels/cymem-2.0.13-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 16))
+Processing ./ztwang/selfplay/third_party/wheels/exceptiongroup-1.3.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 17))
+Processing ./ztwang/selfplay/third_party/wheels/fast_downward_textworld-20.6.4-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 18))
+Processing ./ztwang/selfplay/third_party/wheels/flask-3.1.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 19))
+Processing ./ztwang/selfplay/third_party/wheels/gym-0.26.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 20))
+Processing ./ztwang/selfplay/third_party/wheels/gym_notices-0.1.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 21))
+Processing ./ztwang/selfplay/third_party/wheels/h11-0.16.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 22))
+Processing ./ztwang/selfplay/third_party/wheels/hashids-1.3.1-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 23))
+Processing ./ztwang/selfplay/third_party/wheels/httpcore-1.0.9-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 24))
+Processing ./ztwang/selfplay/third_party/wheels/httpx-0.28.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 25))
+Processing ./ztwang/selfplay/third_party/wheels/idna-3.20-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 26))
+Processing ./ztwang/selfplay/third_party/wheels/itsdangerous-2.2.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 27))
+Processing ./ztwang/selfplay/third_party/wheels/jericho-3.3.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 28))
+Processing ./ztwang/selfplay/third_party/wheels/jinja2-3.1.6-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 29))
+Processing ./ztwang/selfplay/third_party/wheels/markdown_it_py-4.2.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 30))
+Processing ./ztwang/selfplay/third_party/wheels/markupsafe-3.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 31))
+Processing ./ztwang/selfplay/third_party/wheels/mdurl-0.1.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 32))
+Processing ./ztwang/selfplay/third_party/wheels/mementos-1.3.1-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 33))
+Processing ./ztwang/selfplay/third_party/wheels/more_itertools-11.1.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 34))
+Processing ./ztwang/selfplay/third_party/wheels/murmurhash-1.0.15-cp311-cp311-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 35))
+Processing ./ztwang/selfplay/third_party/wheels/networkx-3.4.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 36))
+Processing ./ztwang/selfplay/third_party/wheels/opencv_python-4.12.0.88-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 37))
+Processing ./ztwang/selfplay/third_party/wheels/opencv_python_headless-4.12.0.88-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 38))
+Processing ./ztwang/selfplay/third_party/wheels/packaging-26.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 39))
+Processing ./ztwang/selfplay/third_party/wheels/pandas-2.3.3-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 40))
+Processing ./ztwang/selfplay/third_party/wheels/preshed-3.0.13-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 41))
+Processing ./ztwang/selfplay/third_party/wheels/progressbar2-4.6.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 42))
+Processing ./ztwang/selfplay/third_party/wheels/prompt_toolkit-3.0.53-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 43))
+Processing ./ztwang/selfplay/third_party/wheels/pycparser-3.11-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 44))
+Processing ./ztwang/selfplay/third_party/wheels/pydantic-2.14.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 45))
+Processing ./ztwang/selfplay/third_party/wheels/pydantic_core-2.50.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 46))
+Processing ./ztwang/selfplay/third_party/wheels/pygments-2.21.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 47))
+Processing ./ztwang/selfplay/third_party/wheels/python_dateutil-2.9.0.post0-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 48))
+Processing ./ztwang/selfplay/third_party/wheels/python_utils-4.1.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 49))
+Processing ./ztwang/selfplay/third_party/wheels/pytz-2026.5-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 50))
+Processing ./ztwang/selfplay/third_party/wheels/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 51))
+Processing ./ztwang/selfplay/third_party/wheels/requests-2.34.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 52))
+Processing ./ztwang/selfplay/third_party/wheels/rich-15.0.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 53))
+Processing ./ztwang/selfplay/third_party/wheels/setuptools-84.0.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 54))
+Processing ./ztwang/selfplay/third_party/wheels/shellingham-1.5.4-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 55))
+Processing ./ztwang/selfplay/third_party/wheels/six-1.17.0-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 56))
+Processing ./ztwang/selfplay/third_party/wheels/smart_open-8.0.2-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 57))
+Processing ./ztwang/selfplay/third_party/wheels/spacy-3.8.16-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 58))
+Processing ./ztwang/selfplay/third_party/wheels/spacy_legacy-3.0.12-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 59))
+Processing ./ztwang/selfplay/third_party/wheels/spacy_loggers-1.0.5-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 60))
+Processing ./ztwang/selfplay/third_party/wheels/srsly-2.5.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 61))
+Processing ./ztwang/selfplay/third_party/wheels/TatSu-5.8.3-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 62))
+Processing ./ztwang/selfplay/third_party/wheels/termcolor-3.3.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 63))
+Processing ./ztwang/selfplay/third_party/wheels/textworld-1.6.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 64))
+Processing ./ztwang/selfplay/third_party/wheels/thinc-8.3.13-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 65))
+Processing ./ztwang/selfplay/third_party/wheels/tqdm-4.70.1-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 66))
+Processing ./ztwang/selfplay/third_party/wheels/typer-0.27.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 67))
+Processing ./ztwang/selfplay/third_party/wheels/typing_extensions-4.16.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 68))
+Processing ./ztwang/selfplay/third_party/wheels/typing_inspection-0.4.4-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 69))
+Processing ./ztwang/selfplay/third_party/wheels/tzdata-2025.3-py2.py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 70))
+Processing ./ztwang/selfplay/third_party/wheels/urllib3-2.8.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 71))
+Processing ./ztwang/selfplay/third_party/wheels/wasabi-1.1.3-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 72))
+Processing ./ztwang/selfplay/third_party/wheels/wcwidth-0.9.2-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 73))
+Processing ./ztwang/selfplay/third_party/wheels/weasel-1.0.0-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 74))
+Processing ./ztwang/selfplay/third_party/wheels/werkzeug-3.1.4-py3-none-any.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 75))
+Processing ./ztwang/selfplay/third_party/wheels/wrapt-2.5.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (from -r /data/user/xyu608/ztwang/selfplay/third_party/requirements_env_common.txt (line 76))
+Installing collected packages: pytz, mementos, gym-notices, fast_downward_textworld, alfworld, ai2thor, wrapt, werkzeug, weasel, wcwidth, wasabi, urllib3, tzdata, typing-inspection, typing_extensions, typer, tqdm, thinc, textworld, termcolor, TatSu, srsly, spacy-loggers, spacy-legacy, spacy, smart_open, six, shellingham, setuptools, rich, requests, PyYAML, python-utils, python-dateutil, Pygments, pydantic_core, pydantic, pycparser, prompt_toolkit, progressbar2, preshed, pandas, packaging, opencv-python-headless, opencv-python, networkx, murmurhash, more-itertools, mdurl, MarkupSafe, markdown-it-py, Jinja2, jericho, itsdangerous, idna, httpx, httpcore, hashids, h11, gym, flask, exceptiongroup, cymem, confection, cloudpickle, cloudpathlib, click, charset-normalizer, cffi, certifi, catalogue, blis, blinker, anyio, annotated-types, annotated-doc
+
+Successfully installed Jinja2-3.1.6 MarkupSafe-3.0.4 PyYAML-6.0.3 Pygments-2.21.0 TatSu-5.8.3 ai2thor-2.1.0 alfworld-0.3.3 annotated-doc-0.0.5 annotated-types-0.8.0 anyio-4.15.1 blinker-1.9.0 blis-1.3.3 catalogue-2.0.10 certifi-2026.7.22 cffi-2.1.1 charset-normalizer-3.5.2 click-8.5.0 cloudpathlib-0.26.0 cloudpickle-3.1.2 confection-1.3.3 cymem-2.0.13 exceptiongroup-1.3.1 fast_downward_textworld-20.6.4 flask-3.1.3 gym-0.26.2 gym-notices-0.1.0 h11-0.16.0 hashids-1.3.1 httpcore-1.0.9 httpx-0.28.1 idna-3.20 itsdangerous-2.2.0 jericho-3.3.1 markdown-it-py-4.2.0 mdurl-0.1.2 mementos-1.3.1 more-itertools-11.1.0 murmurhash-1.0.15 networkx-3.4.2 opencv-python-4.12.0.88 opencv-python-headless-4.12.0.88 packaging-26.3 pandas-2.3.3 preshed-3.0.13 progressbar2-4.6.0 prompt_toolkit-3.0.53 pycparser-3.11 pydantic-2.14.0 pydantic_core-2.50.0 python-dateutil-2.9.0.post0 python-utils-4.1.1 pytz-2026.5 requests-2.34.2 rich-15.0.0 setuptools-84.0.0 shellingham-1.5.4 six-1.17.0 smart_open-8.0.2 spacy-3.8.16 spacy-legacy-3.0.12 spacy-loggers-1.0.5 srsly-2.5.4 termcolor-3.3.0 textworld-1.6.2 thinc-8.3.13 tqdm-4.70.1 typer-0.27.3 typing-inspection-0.4.4 typing_extensions-4.16.0 tzdata-2025.3 urllib3-2.8.0 wasabi-1.1.3 wcwidth-0.9.2 weasel-1.0.0 werkzeug-3.1.4 wrapt-2.5.0
+pip rc=0
+
+--- 纯 import 级自检 (只在登录节点, 不构造环境/不 step/不 srun) ---
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+
+========================================================================
+1) 解释器与 PYTHONPATH
+========================================================================
+python      : 3.11.15 (/share/anaconda3/envs/vllm017/bin/python)
+PYTHONPATH  : /data/user/xyu608/ztwang/selfplay/src:/data/user/xyu608/ztwang/selfplay/third_party/py311deps
+sys.path[:3]:
+    /data/user/xyu608/ztwang/selfplay/env_setup
+    /data/user/xyu608/ztwang/selfplay/src
+    /data/user/xyu608/ztwang/selfplay/third_party/py311deps
+[ OK ] src 在 sys.path 前部  -> /data/user/xyu608/ztwang/selfplay/src
+[ OK ] deps 在 sys.path 前部  -> /data/user/xyu608/ztwang/selfplay/third_party/py311deps
+
+========================================================================
+0) alfworld_compat.install()  [必须早于 import textworld]
+========================================================================
+[alfworld_compat] libdownward.so -> /data/user/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
+[alfworld_compat] shim            -> /data/user/xyu608/ztwang/selfplay/third_party/glibc232/libglibc_single_threaded_shim.so
+[ OK ] install() 完成  -> compat_dir=/data/user/xyu608/ztwang/selfplay/third_party/glibc232
+
+========================================================================
+2) import torch / transformers / textworld / gym
+========================================================================
+[ OK ] import torch  -> 2.10.0+cu128
+[ OK ] import transformers  -> 4.57.6
+[ OK ] import textworld  -> 1.6.2
+[ OK ] import gym  -> 0.26.2
+[ OK ] import alfworld  -> /data/user/xyu608/ztwang/selfplay/third_party/py311deps/alfworld
+[ OK ] import AlfredTWEnv (未构造环境)  -> AlfredTWEnv
+[ OK ] import textworld.gym
+
+========================================================================
+3) fast_downward.interface.load_lib()  [glibc 2.28 硬骨头]
+========================================================================
+[ OK ] load_lib() -> OK
+
+========================================================================
+4) glibc232 兼容层核验
+========================================================================
+DOWNWARD_LIB_PATH : /data/user/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
+ALFWORLD_GLIBC_COMPAT_DIR : /data/user/xyu608/ztwang/selfplay/third_party/glibc232
+[ OK ] DOWNWARD_LIB_PATH 指向 glibc232 降级副本
+--- ldd /data/user/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so ---
+	linux-vdso.so.1 (0x00007fffb6346000)
+	libstdc++.so.6 => /share/anaconda3/envs/vllm017/lib/libstdc++.so.6 (0x00007fe1f95f4000)
+	libgcc_s.so.1 => /share/anaconda3/envs/vllm017/lib/libgcc_s.so.1 (0x00007fe1f98de000)
+	libc.so.6 => /lib64/libc.so.6 (0x00007fe1f921e000)
+	libm.so.6 => /lib64/libm.so.6 (0x00007fe1f8e9c000)
+	libdl.so.2 => /lib64/libdl.so.2 (0x00007fe1f8c98000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007fe1f97e9000)
+[ OK ] ldd 全部可解析
+
+========================================================================
+5) LD_LIBRARY_PATH 与 GLIBCXX_3.4.29
+========================================================================
+LD_LIBRARY_PATH : /data/user/xyu608/ztwang/selfplay/third_party/py311deps/cv2/../../lib64:/share/anaconda3/envs/vllm017/lib
+[ OK ] LD_LIBRARY_PATH 含 conda env 的 lib 目录
+libstdc++ /share/anaconda3/envs/vllm017/lib/libstdc++.so.6: GLIBCXX_3.4.29 x2
+[ OK ] libstdc++ 提供 GLIBCXX_3.4.29
+
+========================================================================
+SUMMARY
+========================================================================
+ALL 5 CHECKS PASSED
+verify rc=0
+
+### STAGE-1 INSTALL OK ###
+
+[exit=0]

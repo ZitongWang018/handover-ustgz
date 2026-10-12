@@ -1,0 +1,157 @@
+=== job=12986056 node=gpu1-42 date=Mon Oct 12 13:34:40 CST 2026 ===
+CFG=configs/train_qwen3_4b.yaml  WARMUP_ITERS=5
+model=/hpc2hdd/home/xyu608/thinktool/models/qwen3_4b_inst_2507
+ALFWORLD_DATA=/hpc2hdd/home/xyu608/.cache/alfworld
+GPU 0: NVIDIA A800-SXM4-80GB (UUID: GPU-ddcfdaea-2753-1bc3-5e1f-02ae331689e1)
+GPU 1: NVIDIA A800-SXM4-80GB (UUID: GPU-5c87ba72-1baa-5adb-e89d-f151d74d1d39)
+GPU 2: NVIDIA A800-SXM4-80GB (UUID: GPU-d1ff4cff-552a-c89e-9ae4-7843204410b4)
+GPU 3: NVIDIA A800-SXM4-80GB (UUID: GPU-e8f37ed1-0ead-3ef6-605f-838128a55007)
+GPU 4: NVIDIA A800-SXM4-80GB (UUID: GPU-3ef4acd4-118a-9a46-9300-bb209250e60f)
+GPU 5: NVIDIA A800-SXM4-80GB (UUID: GPU-9d1518ae-93a0-4ee7-c2e5-ecf444e0a37c)
+GPU 6: NVIDIA A800-SXM4-80GB (UUID: GPU-501bac23-ee08-c282-a24d-581b50843007)
+GPU 7: NVIDIA A800-SXM4-80GB (UUID: GPU-12f3a5a3-2c4f-539f-78fc-905bc05e42d0)
+Python 3.10.19
+--- [0/2] smoke: env ---
+[alfworld_compat] libdownward.so -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
+[alfworld_compat] shim            -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libglibc_single_threaded_shim.so
+
+=== [1/4] 环境：构造 + reset + step ===
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+  init_env(2) 耗时 8.8s，任务池 3553
+  reset() 耗时 2.5s
+  --- slot 0 --- game=pick_two_obj_and_place-CreditCard-None-ArmChair-207/trial_T20190906_201711_370043
+      task: Your task is to: find two creditcard and put them in armchair.
+      obs : You are in the middle of a room. Looking quickly around you, you see a armchair 2, a armchair 1, a coffeetable
+      adm : 17 条，例如 ['go to armchair 1', 'go to armchair 2', 'go to coffeetable 1']
+  --- slot 1 --- game=pick_and_place_simple-Glassbottle-None-DiningTable-23/trial_T20190908_071034_583787
+      task: Your task is to: put a glassbottle in diningtable.
+      obs : You are in the middle of a room. Looking quickly around you, you see a cabinet 10, a cabinet 9, a cabinet 8, a
+      adm : 26 条，例如 ['go to cabinet 1', 'go to cabinet 10', 'go to cabinet 2']
+  5 次 step() 总耗时 0.46s（avg 0.093s/step）
+
+*** 冒烟测试通过 ***
+--- [0/2] smoke: rollout（会顺带打奖励分布，reward 全同分就说明这步白跑）---
+[alfworld_compat] libdownward.so -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
+[alfworld_compat] shim            -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libglibc_single_threaded_shim.so
+
+=== [1/4] 环境：构造 + reset + step ===
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+  init_env(8) 耗时 8.8s，任务池 3553
+  reset() 耗时 2.9s
+  --- slot 0 --- game=pick_and_place_simple-Lettuce-None-CounterTop-25/trial_T20190907_000052_389529
+      task: Your task is to: put some lettuce on countertop.
+      obs : You are in the middle of a room. Looking quickly around you, you see a cabinet 13, a cabinet 12, a cabinet 11,
+      adm : 31 条，例如 ['go to cabinet 1', 'go to cabinet 10', 'go to cabinet 11']
+  --- slot 1 --- game=pick_and_place_simple-Vase-None-Safe-204/trial_T20190919_000336_714640
+      task: Your task is to: put a vase in safe.
+      obs : You are in the middle of a room. Looking quickly around you, you see a armchair 1, a coffeetable 1, a desk 1, 
+      adm : 20 条，例如 ['go to armchair 1', 'go to coffeetable 1', 'go to desk 1']
+  --- slot 2 --- game=pick_two_obj_and_place-TissueBox-None-Drawer-427/trial_T20190909_061046_921697
+      task: Your task is to: put two tissuebox in drawer.
+      obs : You are in the middle of a room. Looking quickly around you, you see a bathtubbasin 1, a countertop 1, a drawe
+      adm : 19 条，例如 ['go to bathtubbasin 1', 'go to countertop 1', 'go to drawer 1']
+  --- slot 3 --- game=look_at_obj_in_light-Pencil-None-DeskLamp-303/trial_T20190909_064559_200594
+      task: Your task is to: examine the pencil with the desklamp.
+      obs : You are in the middle of a room. Looking quickly around you, you see a bed 1, a desk 1, a drawer 5, a drawer 4
+      adm : 24 条，例如 ['go to bed 1', 'go to desk 1', 'go to drawer 1']
+  --- slot 4 --- game=pick_cool_then_place_in_recep-Potato-None-SideTable-21/trial_T20190907_040229_877234
+      task: Your task is to: put a cool potato in sidetable.
+      obs : You are in the middle of a room. Looking quickly around you, you see a cabinet 4, a cabinet 3, a cabinet 2, a 
+      adm : 22 条，例如 ['go to cabinet 1', 'go to cabinet 2', 'go to cabinet 3']
+  --- slot 5 --- game=pick_two_obj_and_place-Statue-None-SideTable-214/trial_T20190909_065635_751813
+      task: Your task is to: find two statue and put them in sidetable.
+      obs : You are in the middle of a room. Looking quickly around you, you see a armchair 1, a coffeetable 1, a garbagec
+      adm : 10 条，例如 ['go to armchair 1', 'go to coffeetable 1', 'go to garbagecan 1']
+  --- slot 6 --- game=pick_cool_then_place_in_recep-Pot-None-StoveBurner-4/trial_T20190906_190550_905525
+      task: Your task is to: cool some pot and put it in stoveburner.
+      obs : You are in the middle of a room. Looking quickly around you, you see a cabinet 2, a cabinet 1, a coffeemachine
+      adm : 24 条，例如 ['go to cabinet 1', 'go to cabinet 2', 'go to coffeemachine 1']
+  --- slot 7 --- game=pick_and_place_simple-CreditCard-None-Desk-307/trial_T20190907_143649_550638
+      task: Your task is to: put a creditcard in desk.
+      obs : You are in the middle of a room. Looking quickly around you, you see a bed 1, a desk 1, a drawer 3, a drawer 2
+      adm : 12 条，例如 ['go to bed 1', 'go to desk 1', 'go to drawer 1']
+  5 次 step() 总耗时 0.57s（avg 0.113s/step）
+
+=== [2/4] rollout：走完整一局 ===
+  [rollout] 2 tasks × 4 = 8 trajs | won=0/8 (0.0%) | mean_steps=4.0 | mean_tokens=0 | 0.3s
+  smoke0: won=False steps=4 reward=0.0100 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_185320_708158
+  smoke0: won=False steps=4 reward=0.0100 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_185320_708158
+  smoke0: won=False steps=4 reward=0.0100 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_185320_708158
+  smoke0: won=False steps=4 reward=-0.0025 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_185320_708158
+  smoke1: won=False steps=4 reward=0.0100 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_043859_833063
+  smoke1: won=False steps=4 reward=0.0100 invalid=0 fmt_bad=0 tokens=0 game=trial_T20190908_043859_833063
+  --- 奖励分布 --- min=-0.0025 max=0.0100 mean=0.0084 n_distinct=2
+  --- group 连续性检查（group_size=4, 8 条轨迹）---
+    group 0: task_id=['smoke0'] n=4 OK
+    group 1: task_id=['smoke1'] n=4 OK
+  OK：返回顺序是 task-major / 组连续，且每组 game_file 一致
+
+*** 冒烟测试通过 ***
+--- [1/2] 8-rank DDP 冒烟：5 iter ---
+NCCL version 2.21.5+cuda12.4
+[alfworld_compat] libdownward.so -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
+[alfworld_compat] shim            -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libglibc_single_threaded_shim.so
+Initializing AlfredTWEnv...Initializing AlfredTWEnv...
+
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Initializing AlfredTWEnv...
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Initializing AlfredTWEnv...
+[data] rank0: 445 train tasks  (pick_two_obj_and_place)
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Initializing AlfredTWEnv...
+Training with 3553 games
+Initializing AlfredTWEnv...
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+Overall we have 3553 games in split=train
+Training with 3553 games
+[env] batch_size=8 max_episode_steps=50 pool=3553
+[model] $ZTWANG_MODEL_PATH
+[model] dtype=torch.float32 attn=flash_attention_2 gradient_checkpointing=True autocast=bf16
+Initializing AlfredTWEnv...
+Overall we have 134 games in split=eval_out_of_distribution
+Evaluating with 134 games
+Initializing AlfredTWEnv...
+Overall we have 134 games in split=eval_out_of_distribution
+Evaluating with 134 games
+[eval] 16 held-out tasks from eval_out_of_distribution
+[iter 0] [rollout] 2 tasks × 4 = 8 trajs | won=0/8 (0.0%) | mean_steps=30.0 | mean_tokens=6079 | 158.6s

@@ -1,0 +1,50 @@
+=== phase3 Stage-1 push  2026-10-12T02:55:27+08:00  DRY= ===
+--- A) 代码 + 依赖清单 + wheel 集 ---
+
+Number of files: 192 (reg: 180, dir: 12)
+Number of created files: 185 (reg: 177, dir: 8)
+Number of deleted files: 0
+Number of regular files transferred: 180
+Total file size: 365,213,071 bytes
+Total transferred file size: 365,213,071 bytes
+Literal data: 365,203,710 bytes
+Matched data: 9,361 bytes
+File list size: 0
+File list generation time: 0.001 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 365,309,831
+Total bytes received: 3,605
+
+sent 365,309,831 bytes  received 3,605 bytes  48,708,458.13 bytes/sec
+total size is 365,213,071  speedup is 1.00
+--- B) ALFWorld eval 数据 (logic + valid_seen/train/unseen) ---
+
+Number of files: 3,459 (reg: 2,218, dir: 1,241)
+Number of created files: 3,457 (reg: 2,218, dir: 1,239)
+Number of deleted files: 0
+Number of regular files transferred: 2,218
+Total file size: 223,876,604 bytes
+Total transferred file size: 223,876,604 bytes
+Literal data: 223,876,604 bytes
+Matched data: 0 bytes
+File list size: 262,081
+File list generation time: 0.001 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 224,168,234
+Total bytes received: 51,394
+
+sent 224,168,234 bytes  received 51,394 bytes  7,600,665.36 bytes/sec
+total size is 223,876,604  speedup is 1.00
+--- C) 三期落地校验 ---
+327183988	/data/user/xyu608/ztwang/selfplay/third_party/wheels
+34724326	/data/user/xyu608/ztwang/selfplay/third_party/glibc232
+33317	/data/user/xyu608/.cache/alfworld/logic
+80496742	/data/user/xyu608/.cache/alfworld/json_2.1.1/valid_seen
+64074402	/data/user/xyu608/.cache/alfworld/json_2.1.1/valid_train
+84478159	/data/user/xyu608/.cache/alfworld/json_2.1.1/valid_unseen
+--- wheels 数:
+94
+--- 下一步: 三期执行 phase3_install_stage1.sh <env_python>
+=== phase3 Stage-1 push DONE  2026-10-12T02:56:06+08:00 ===
+
+[exit=0]

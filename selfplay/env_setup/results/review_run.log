@@ -1,0 +1,9 @@
+--- 调用 DeepSeek: 01_rollout (effort=high) ...
+    done 248.4s  prompt_tok=2005 completion_tok=31200 len=8508
+saved -> C:\Users\dasou\WorkBuddy\2026-10-11-20-52-14\ztwang\selfplay\env_setup\results/deepseek_01_rollout.md
+--- 调用 DeepSeek: 02_train (effort=high) ...
+    done 146.6s  prompt_tok=1656 completion_tok=15997 len=7905
+saved -> C:\Users\dasou\WorkBuddy\2026-10-11-20-52-14\ztwang\selfplay\env_setup\results/deepseek_02_train.md
+--- 调用 DeepSeek: 03_reward (effort=high) ...
+    done 151.3s  prompt_tok=1173 completion_tok=17370 len=5385
+saved -> C:\Users\dasou\WorkBuddy\2026-10-11-20-52-14\ztwang\selfplay\env_setup\results/deepseek_03_reward.md
