@@ -1,4 +1,4 @@
-# 当前状态（2026-10-12 13:42 CST）
+# 当前状态（2026-10-12 晚 CST）
 
 > 本文档由协作 AI 维护，反映最近一次同步时的真实状态。改动前请先读 `docs/SELFPLAY.md`（技术路线）与 `selfplay/README.md`（代码说明）。
 
@@ -20,8 +20,14 @@ Qwen3-4B-Instruct 在 ALFWorld 上复现 SPADE（arXiv:2608.19197）的 GRPO 训
 - `metrics_prod_rank0.jsonl` —— 训练指标（含历史 bug 时期的坏行，供对照）。
 
 ## 正在运行 🏃
-- 二期 8 卡 A800 作业（`scripts/train_a800x8.sbatch`）：阶段0 预检 → 阶段1 五 iter DDP 冒烟 → 准入门 → 阶段2 正式训练（total_iters=220，save/eval 每 25 iter，只留最新断点）。
+- ⚠️ 二期 8 卡作业 12986056 曾报失败，因断网**未拿到报错日志、未确诊**（疑似显存/NCCL）。
 - 流程：排了十几个小时后于 2026-10-12 下午提前起算；曾因「旧代码无 deepspeed 修复」和「DDP 未搬 GPU」两次快速失败，均已修复后重提。
+
+## 代码审计修复（2026-10-12 晚，纯本地、未上集群；commit 36a7fa4e 已推 GitHub）
+多 agent 交叉 review 后修复，本地 py_compile + unit_test.py 全过：
+- **P1** `task_type_weights` 原本乘在 reward 上——组内归一化严格约掉、纯死代码；改为乘在**归一化后的 advantage** 上才真正生效（reward.py 删死代码 + train_grpo.py 赋值处乘 w）。
+- **P2×5** save_every=0 时最后一轮也存最终模型；env_eval.close()；`--max-iters 0` 改 `is not None` 判断；micro-batch 加 `no_sync()` 减 DDP 通信；删死代码 `require_backward_grad_sync=True`；NCCL timeout 放宽到 30 分钟（默认 10 分钟会被 rollout 卡顿误判杀队）。
+- 8 卡作业**重投前**建议先用含本次修复的代码重跑阶段1 冒烟。
 
 ## 本轮修掉的关键 bug（全部实测定位）
 1. **奖励符号反转**（`reward.py` penalty 写成 `+=`）——离线验证排序已修正。
@@ -35,6 +41,7 @@ Qwen3-4B-Instruct 在 ALFWorld 上复现 SPADE（arXiv:2608.19197）的 GRPO 训
 9. 冒烟准入门新增 `update_rel`（参数真动了吗）与 `invalid_reward_corr`（奖励符号）两个 FAIL 判据。
 
 ## 待办 / 下一步
+- [ ] 网络/服务器恢复后：取 8 卡 job 12986056 报错日志确诊 → 用含审计修复的代码重投阶段1 冒烟。
 - [ ] 监督 8 卡作业阶段1 冒烟指标 + 准入门，通过后进阶段2 全程训练。
 - [ ] 持续用 `scripts/monitor_runs.py` 监控（重点 `update_rel`、`invalid_reward_corr`、异常率 A1~A9）。
 - [ ] 8 卡跑稳后把训练流程搬到三期 ACD（H100，代码靠 `tools/sync_ztwang.py --host hpc3` 推）。
