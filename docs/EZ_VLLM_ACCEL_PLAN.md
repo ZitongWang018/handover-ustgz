@@ -47,11 +47,26 @@
 
 ## 2. 分阶段实施（每阶段都能独立验证、独立回退）
 
-### P0 — 环境与 PoC（0.5 天）
-- 独立 venv 装 vLLM（**不污染训练用的 `thinktool`**）：`~/ztwang/vllm_venv`。
-- PoC：加载 `qwen3_4b`，用 vLLM offline `LLM.generate` 跑一批 96-token 生成，
-  与 HF `generate` 对比吞吐；确认 A800 上单卡能吃满。
-- 产出：`scripts/ez_vllm_poc.py` + 速度/显存数字。
+### P0 — 环境与 PoC（✅ 已完成 2026-10-13）
+
+**环境**（独立 venv `~/ztwang/vllm_venv`，不污染训练用的 `thinktool`）：
+
+| 包 | 固定版本 | 说明 |
+|---|---|---|
+| vllm | **0.8.5** | ⚠️ 必须 pin；pip 默认装的 0.31 是 **CUDA 13** 版，A800 驱动 570 跑不起来 |
+| torch | 2.6.0+cu124 | 匹配驱动 570（cu13 要 ≥580） |
+| transformers | **4.51.3** | ⚠️ 必须 pin；vllm 0.8.5 对 transformers 没上界 → pip 解析到 5.19 → tokenizer API 崩 |
+| tokenizers | 0.21.4 | |
+| xformers | 0.0.29.post2 | |
+
+**PoC 结果**（`scripts/ez_vllm_poc.py`，job 13008318 @ A40 gpu3-9）：
+
+- 模型加载 163.6s
+- **32 seqs × 96 tokens 一次生成 = 1.95s，吞吐 1576 tok/s**（prefix caching 开）
+- 对比 HF 版：32 slot 每回合 ~9.7s ⇒ vLLM 单次批量生成快 **5~10×**
+
+**结论**：vLLM 0.8.5 在二期可用；token-in/token-out（`prompt_token_ids` 进、`outputs[0].token_ids` 出）
+走的通，与 EZ 训练序列"assistant 段用真实生成 token id"的要求一致。
 
 ### P1 — solve rate 接 vLLM（收益最大、最好隔离）
 **为什么先做这段**：solver 在整个 proposer 相位**冻结**，权重不用每步刷新 —— 最适合常驻引擎 + 前缀缓存。
