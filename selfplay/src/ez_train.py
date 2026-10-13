@@ -576,7 +576,9 @@ def main() -> int:
         _smoke_default_g = int(tcfg.get("group_size", 16))
         G = int(os.environ.get("EZ_SMOKE_G", str(_smoke_default_g)))
         G_P = int(os.environ.get("EZ_SMOKE_G_P", str(max(2, world))))
-        TPS = int(os.environ.get("EZ_SMOKE_TPS", str(TPS)))
+        # ★ 显式默认 1：冒烟必须最小规模。**不能**再用 str(TPS) 兜底 —— 正式配置
+        #   TPS 一旦调大（如 8），兜底会把冒烟也一起放大 8 倍，违背本节"压到最小"的初衷。
+        TPS = int(os.environ.get("EZ_SMOKE_TPS", "1"))
         G_local = local_group_size(int(G), world)
         M_P = M_S = 1
         _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "12"))
@@ -623,8 +625,24 @@ def main() -> int:
         max_context_tokens=p_cfg.max_context_tokens,
         keep_recent_turns=p_cfg.keep_recent_turns, stop_mode="tool_call")
 
+    # ★ 批量探索规模：proposer 相位每次把 n_groups 个 game **一次性**交给
+    #   run_proposer_exploration（批量接口），其前置条件是
+    #       env.batch_size == group_size(=G_local) × len(game_files)
+    #   n_groups = min(TPS, len(game_files)) 只依赖 TPS 和 game 池大小，二者此刻都已
+    #   确定，所以这里直接把 env_p 的 batch 建成"实际会用到的规模"，运行期不存在
+    #   batch 不匹配。若反过来把 batch 建成固定上界 G_local×TPS，当池子不够
+    #   （len(game_files) < TPS）时就会在批量调用深处才断言失败，且已白白跑过一次
+    #   reset —— 这里提前算、提前报，是更稳的写法。
+    n_groups_eff = min(TPS, len(game_files))
+    if n_groups_eff < 1:
+        raise ValueError(
+            f"train.tasks_per_step={TPS} 与 game 池 {len(game_files)} 不匹配，无法构造批量探索环境")
+    if n_groups_eff < TPS:
+        log(f"[warn] game 池仅 {len(game_files)} < tasks_per_step={TPS}，"
+            f"批量探索降为 {n_groups_eff} 个 game/步（env_p.batch_size={G_local * n_groups_eff}）")
+    env_p_batch = G_local * n_groups_eff
     env_p = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                             batch_size=G_local, max_episode_steps=p_cfg.max_turns,
+                             batch_size=env_p_batch, max_episode_steps=p_cfg.max_turns,
                              with_facts=True, ignore_benchmark_done=True)
     env_s = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
                              batch_size=G_local, max_episode_steps=s_cfg.max_steps,
@@ -850,13 +868,21 @@ def main() -> int:
                 seed + 13007, rank, world, dist)
             games = [game_files[i] for i in selected_games]
             local_games = games
-            # 1) 探索 + 提案
-            # ★ 组按 game **逐个**收集（而不是事后按 G 切片）：切片一旦错位，
-            #   组里会混进不同 game 的 rollout（红线 A：组是算法不可分单元）。
+            # 1) 探索 + 提案（**批量**：一次把 local_games 全部 game 一起探索）
+            # ★ 批量接口返回的外层顺序 == 传入的 local_games 顺序，所以组按 game
+            #   **逐个**收集即可（而不是事后按 G 切片）：切片一旦错位，组里会混进
+            #   不同 game 的 rollout（红线 A：组是算法不可分单元）。
             cand: List[ProposerRollout] = []
             groups: List[List[ProposerRollout]] = []
-            for gf in local_games:
-                _one = run_proposer_exploration(env_p, policy, gf, p_cfg, log_fn=log)
+            # env_p 按"实际规模"建好后应恒等于本次 game 数 × G_local；不符说明调用侧与
+            # 环境侧对 n_groups 的理解漂移了，早炸好过让 ez_proposer 深处报错。
+            if env_p.batch_size != G_local * len(local_games):
+                raise ValueError(
+                    f"批量探索环境不匹配：env_p.batch_size={env_p.batch_size} != "
+                    f"G_local×len(local_games)={G_local * len(local_games)}"
+                    f"（G_local={G_local}, len(local_games)={len(local_games)}）")
+            grouped = run_proposer_exploration(env_p, policy, local_games, p_cfg, log_fn=log)
+            for _one in grouped:
                 cand.extend(_one)
                 groups.append(_one)
             #   ★ 空组必须"所有 rank 一起炸"：某个 rank 的组是空的就会少一次

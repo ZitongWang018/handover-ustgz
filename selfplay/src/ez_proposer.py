@@ -183,16 +183,21 @@ def _slot_snapshot(facts_slot: Any, obs_text: str) -> StateSnapshot:
     return snapshot_from_infos(infos, obs_text)
 
 
-def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
-                             log_fn: Optional[Callable[[str], None]] = None) -> List[ProposerRollout]:
-    """一个 GRPO 组的 proposer 探索：G 条轨迹共享初始状态 s0。
+def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: ProposerConfig,
+                             log_fn: Optional[Callable[[str], None]] = None) -> List[List[ProposerRollout]]:
+    """多个 GRPO 组的 proposer 探索：每个 game 一个组，组内 G 条轨迹共享初始状态 s0。
 
-    `env.batch_size` 必须等于 cfg.group_size。
-    返回 G 个 ProposerRollout（顺序 = slot 顺序）。
+    `env.batch_size` 必须等于 `cfg.group_size * len(game_files)`。
+    返回 `List[List[ProposerRollout]]`：外层顺序 = game_files 顺序，内层是该 game 的 G 个 rollout。
     """
     g = cfg.group_size
-    if env.batch_size != g:
-        raise ValueError(f"env.batch_size={env.batch_size} != group_size={g}")
+    n_groups = len(game_files)
+    n_slots = g * n_groups
+    if n_groups == 0:
+        # 空输入：没有组可跑（调用方另有"空组"红线守卫，这里只做安全兜底）
+        return []
+    if env.batch_size != n_slots:
+        raise ValueError(f"env.batch_size={env.batch_size} != group_size×n_groups={n_slots}")
 
     from rollout import RolloutConfig as _RC  # 借 HFPolicy.generate 的 cfg 形态
 
@@ -203,26 +208,63 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                   keep_recent_turns=cfg.keep_recent_turns,
                   stop_mode="tool_call", max_batch_size=cfg.generation_max_batch_size)
 
-    obs_list, views, admissible, used, _ = env.reset([game_file] * g)
-    s0_facts = list(getattr(env, "last_reset_facts", [None] * g))
-    s0_snaps = [_slot_snapshot(s0_facts[s], obs_list[s]) for s in range(g)]
-    for s in range(g):
-        assert_facts_mode(s0_snaps[s], f"proposer reset slot {s}")
-    # Every local shard must begin from the same benchmark game state; otherwise
-    # cross-rank reward normalization would compare different initial conditions.
+    # 每个 game 重复 g 次 → 一个 game 一个 GRPO 组。textworld batch env 在 reset()
+    # 里会对 gamefiles 做 rng.shuffle，所以下面的 slot 顺序 **不能** 直接按请求顺序算。
+    games = [gf for gf in game_files for _ in range(g)]
+    obs_list, views, admissible, used, _ = env.reset(games)
+
+    # slot → game 组索引：按 used 里同一 gamefile 的出现次数逐个消耗，消除 shuffle 影响；
+    # 允许 game_files 内部有重复 game（此时多个组装载同一 game，s0 指纹相同）。
     from collections import Counter
-    fingerprints = [tuple(sorted(Counter(s.facts).items())) for s in s0_snaps]
-    local_same = all(f == fingerprints[0] for f in fingerprints)
+
+    from rollout import _align_slot_tasks
+    slot_group = _align_slot_tasks(games, used, g)
+
+    s0_facts = list(getattr(env, "last_reset_facts", [None] * n_slots))
+    s0_snaps = [_slot_snapshot(s0_facts[s], obs_list[s]) for s in range(n_slots)]
+    for s in range(n_slots):
+        assert_facts_mode(s0_snaps[s], f"proposer reset slot {s}")
+    # ★ 按组校验 s0：同一 game 组内 G 个 slot 必须共享同一初始状态（组是算法不可分单元）；
+    #   不同 game 的 s0 本来就不同，所以不再要求整个 batch 一致。
+    #   注意：所有 raise 统一放到下面的 all_gather_object **之后**，保证任何 rank 都先进入
+    #   collective 再报错 —— 否则单 rank 先抛异常会让其它 rank 卡在集合通信上（NCCL 死锁）。
+    fingerprints = [tuple(sorted(Counter(sn.facts).items())) for sn in s0_snaps]
+    rep_slot: List[Optional[int]] = [None] * n_groups
+    for s in range(n_slots):
+        gi = slot_group[s]
+        if rep_slot[gi] is None:
+            rep_slot[gi] = s
+    local_same = True
+    local_err = ""
+    for gi in range(n_groups):
+        members = [s for s in range(n_slots) if slot_group[s] == gi]
+        if len(members) != g or rep_slot[gi] is None:
+            local_same = False
+            local_err = (f"proposer group {gi} 的 slot 数={len(members)} != group_size={g}"
+                         "（slot 分组失败，检查 _align_slot_tasks）")
+            break
+        if any(fingerprints[s] != fingerprints[rep_slot[gi]] for s in members):
+            local_same = False
+            local_err = f"proposer group {gi} reset to different initial facts across slots"
+            break
+    # 跨 rank：本 rank 每个组的 s0 指纹都要和其它 rank 对齐（同一 benchmark task 的初始
+    # 条件必须全局一致，否则跨 rank reward 归一化会拿不同初始条件比较）。组顺序 = game_files
+    # 顺序，各 rank 收到的 game_files 相同，所以按组对齐即可。
+    group_fingerprints = [fingerprints[rs] if rs is not None else None for rs in rep_slot]
     try:
         import torch.distributed as _dist
     except ImportError:
         _dist = None
+    cross_rank_same = True
     if _dist is not None and _dist.is_available() and _dist.is_initialized():
-        all_fingerprints = [None] * _dist.get_world_size()
-        _dist.all_gather_object(all_fingerprints, fingerprints[0])
-        local_same = local_same and all(x == all_fingerprints[0] for x in all_fingerprints)
+        all_group_fps = [None] * _dist.get_world_size()
+        _dist.all_gather_object(all_group_fps, group_fingerprints)
+        ref_fps = all_group_fps[0]
+        cross_rank_same = all(x == ref_fps for x in all_group_fps)
     if not local_same:
-        raise RuntimeError("global proposer group reset to different initial facts across slots/ranks")
+        raise RuntimeError(local_err)
+    if not cross_rank_same:
+        raise RuntimeError("global proposer group reset to different initial facts across ranks")
     # 每个 slot 的"当前状态"沿轨迹更新（sub_finish/finish 快照取当前值）
     cur_snaps = list(s0_snaps)
     cur_facts = list(s0_facts)
@@ -230,13 +272,13 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
     messages: List[List[Dict[str, str]]] = []
     token_buffers: List[List[int]] = []
     token_masks: List[List[int]] = []
-    gen_ids_log: List[List[List[int]]] = [[] for _ in range(g)]
-    subtask_bufs: List[List[SubtaskRef]] = [[] for _ in range(g)]
-    action_bufs: List[List[str]] = [[] for _ in range(g)]
-    active = [True] * g
-    stats = [{"fmt": 0, "inv": 0, "turns": 0} for _ in range(g)]
+    gen_ids_log: List[List[List[int]]] = [[] for _ in range(n_slots)]
+    subtask_bufs: List[List[SubtaskRef]] = [[] for _ in range(n_slots)]
+    action_bufs: List[List[str]] = [[] for _ in range(n_slots)]
+    active = [True] * n_slots
+    stats = [{"fmt": 0, "inv": 0, "turns": 0} for _ in range(n_slots)]
 
-    for s in range(g):
+    for s in range(n_slots):
         v = views[s]
         adm = admissible[s] if cfg.give_admissible else ()
         msg = build_proposer_messages(v.env_desc or v.raw, cfg.max_turns, adm)
@@ -255,7 +297,7 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
     for turn in range(cfg.max_turns):
         if not any(active):
             break
-        idxs = [s for s in range(g) if active[s]]
+        idxs = [s for s in range(n_slots) if active[s]]
         # ★ 临近回合上限时注入一次收尾提醒。没有它，模型会把回合跑满也不 finish
         #   （实测 mean_turns == max_turns、accept=0，整轮 proposer 白跑）。
         _left = cfg.max_turns - turn
@@ -269,7 +311,7 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
         texts, gen_ids, _ = policy.generate_from_token_ids([token_buffers[s] for s in idxs], gen_cfg)
 
         # ---- 解析 + 分类 ----
-        env_actions = ["look"] * g
+        env_actions = ["look"] * n_slots
         todo: List[Tuple[int, ParsedToolCall, str]] = []
         for k, s in enumerate(idxs):
             parsed = parse_tool_call(texts[k])
@@ -305,14 +347,14 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
         bs = env.step(env_actions) if need_step else None
         if bs is not None:
             cur_facts = list(bs.facts) if bs.facts else cur_facts
-            for s in range(g):
+            for s in range(n_slots):
                 if active[s]:
                     cur_snaps[s] = _slot_snapshot(
                         cur_facts[s] if s < len(cur_facts) else None, bs.obs[s])
                     assert_facts_mode(cur_snaps[s], f"proposer step slot {s}")
             # ★ 官方底层任务被误完成 → episode 提前结束：冻结该 slot。
             #   此刻还没 finish 的提案永远等不到了，直接按无效收尾（review P1-6）。
-            for s in range(g):
+            for s in range(n_slots):
                 if active[s] and bool(bs.dones[s]):
                     stats[s]["_reason"] = "env_done_no_finish"
                     active[s] = False
@@ -362,7 +404,7 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                     ref_final=final_snap,
                     ref_final_delta=state_delta(s0_snaps[s], final_snap, parsed.task_description),
                     subtasks=subtask_bufs[s],
-                    game_file=used[s] if s < len(used) else game_file,
+                    game_file=used[s],
                     proposer_actions=action_bufs[s],
                     proposer_action_types=[action_type(a) for a in action_bufs[s]],
                     meta={"proposer_turns": stats[s]["turns"],
@@ -386,7 +428,7 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
 
     # ---- 收尾：没 finish 的轨迹 = 无效提案（论文：无 finish 任务描述直接拒）----
     rollouts: List[ProposerRollout] = []
-    for s in range(g):
+    for s in range(n_slots):
         task = stats[s].get("_task")
         accepted = bool(stats[s].get("_accepted", False))
         reason = stats[s].get("_reason", "no_finish")
@@ -400,13 +442,18 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
         rollouts[-1].training_ids = token_buffers[s]
         rollouts[-1].training_mask = token_masks[s]
 
+    # 按 game 组打包回请求顺序：外层 = game_files 顺序，内层 = 该 game 的 g 条 rollout
+    grouped: List[List[ProposerRollout]] = [[] for _ in range(n_groups)]
+    for s in range(n_slots):
+        grouped[slot_group[s]].append(rollouts[s])
+
     if log_fn:
         acc = sum(1 for r in rollouts if r.accepted)
-        dropped = sum(stats[s].get("dropped_sub", 0) for s in range(g))
-        extra = sum(stats[s].get("extra", 0) for s in range(g))
-        log_fn(f"[proposer] {acc}/{g} accepted | mean_turns="
+        dropped = sum(stats[s].get("dropped_sub", 0) for s in range(n_slots))
+        extra = sum(stats[s].get("extra", 0) for s in range(n_slots))
+        log_fn(f"[proposer] {acc}/{n_slots} accepted | groups={n_groups} | mean_turns="
                f"{np.mean([r.n_turns for r in rollouts]):.1f} | "
                f"fmt_bad={sum(r.n_format_violation for r in rollouts)} | "
                f"dropped_sub={dropped} | extra_after_call={extra} | "
                f"{time.time()-t0:.1f}s")
-    return rollouts
+    return grouped
