@@ -243,7 +243,7 @@ def _resume_signature(cfg: dict, world: int) -> dict:
 
 def ez_save(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
             extra: dict, task_pool: list, rank: int, world: int,
-            uid_counter: int = 0, dry_run: bool = False) -> None:
+            uid_counter: int = 0, dry_run: bool = False, keep: int = 0) -> None:
     """Write complete resume state, then atomically promote it while retaining old ckpt."""
     import shutil
     ckpt_dir, tmp_dir, backup_dir = (run_dir / "ckpt", run_dir / "ckpt.tmp",
@@ -299,6 +299,28 @@ def ez_save(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
             shutil.rmtree(backup_dir, ignore_errors=True)
     if world > 1:
         dist.barrier()
+    # ★「断点留多个」：keep>0 时把刚写完的最新断点完整复制成一份历史快照，
+    #   供中间评测加载 solver adapter、以及从中间状态恢复。keep<=0 保持旧行为（只留最新）。
+    #   ⚠️ 复制必须 rank0 做完后**再一起 barrier**：若放在上面的 barrier 之后，
+    #   rank0 会落后其它 rank（它们在下一个 outer 的集合通信里干等 → 死锁）。
+    if keep and keep > 0 and rank == 0:
+        snap_dir = run_dir / "checkpoints"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        dest = snap_dir / f"ckpt-{tag}"
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        try:
+            shutil.copytree(ckpt_dir, dest)
+        except Exception as _e:  # noqa: BLE001
+            log(f"[ckpt] 历史断点存档失败 {tag}: {_e}（继续训练，不影响最新断点）")
+        snaps = sorted([p for p in snap_dir.iterdir()
+                        if p.is_dir() and p.name.startswith("ckpt-")],
+                       key=lambda p: p.stat().st_mtime)
+        for _old in snaps[:-keep]:
+            shutil.rmtree(_old, ignore_errors=True)
+            log(f"[ckpt] 清理旧历史断点 {_old.name}（保留最近 {keep} 个）")
+    if world > 1 and keep and keep > 0:
+        dist.barrier()
 
 
 def load_ez_resume(ckpt_dir: Path, cfg: dict, world: int, rank: int):
@@ -342,6 +364,41 @@ def resolve_resume_directory(path: Path, rank: int) -> Path:
         if all(p.exists() for p in required):
             return candidate
     raise ValueError(f"neither {path} nor its previous checkpoint is complete")
+
+
+def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
+                    max_new_tokens, max_context_tokens, batch_size, seed, log_fn):
+    """在 valid_unseen 上评测当前 solver adapter（只读，不改权重、不动优化器）。
+
+    判胜用官方 benchmark_done（ignore_benchmark_done=False），与训练内
+    verify.final_match（状态匹配）口径不同 —— 这才是论文/官方 valid_unseen 成功率。
+    rollout 复用 eval_ez._rollout_batch（已验证的官方评测链路）。
+    """
+    from alfworld_env import task_instance_id, task_type_of
+    from eval_ez import _rollout_batch
+    select_adapter(raw, "solver")
+    raw.eval()
+    eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
+                             max_new_tokens=max_new_tokens, temperature=temperature,
+                             top_p=0.95, top_k=0, repetition_penalty=1.05,
+                             max_context_tokens=max_context_tokens,
+                             stop_mode="tool_call", max_batch_size=batch_size)
+    won = []
+    for start in range(0, len(games), batch_size):
+        gb = games[start:start + batch_size]
+        records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
+                    "sample": 0} for g in gb]
+        env = ALFWorldBatchEnv(alf_cfg, split="eval_out_of_distribution",
+                               batch_size=len(gb), seed=seed + start,
+                               with_expert=False, with_facts=False,
+                               ignore_benchmark_done=False)
+        try:
+            won.extend(r["won"] for r in _rollout_batch(
+                env, policy, gb, records, eval_cfg, max_steps))
+        finally:
+            env.close()
+    select_adapter(raw, "proposer")
+    return (sum(won) / len(won)) if won else 0.0, won
 
 
 def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
@@ -499,6 +556,12 @@ def main() -> int:
     G_local = local_group_size(int(G), world)
     w_sub = tcfg.get("w_sub", 0.3)
     w_div = tcfg.get("w_div", 0.3)
+    # ★「断点留多个」+「训练中间评测」开关（见 ez_save 的 keep 与 mid_eval_solver）
+    checkpoint_keep = int(tcfg.get("checkpoint_keep", 4))
+    eval_every_outer = int(tcfg.get("eval_every_outer", 1))
+    eval_n_tasks = int(tcfg.get("eval_n_tasks", 16))
+    eval_batch = int(tcfg.get("eval_batch", 2))
+    eval_max_steps = int(tcfg.get("eval_max_steps", cfg["solver"].get("max_turns", 30)))
 
     # ★ --dry-run 只把"步数"降到 1 是**不够**的：G=16 × 30 turns 在 A40 debug 分区
     #   （30 min 上限）根本跑不完，会卡到超时。这里把 group / turns / tasks 一并压到
@@ -534,6 +597,8 @@ def main() -> int:
         else str((SRC_DIR.parent / cfg["env"]["config_path"]).resolve()))
     game_files = collect_game_files(alf_cfg, split=cfg["env"].get("split", "train"))
     log(f"[data] {len(game_files)} train games")
+    # 中间评测用 valid_unseen（官方口径）。排序保证各次评测/各 rank 一致可比。
+    eval_game_files = sorted(collect_game_files(alf_cfg, "eval_out_of_distribution"))
 
     p_cfg = ProposerConfig(
         group_size=G_local, max_turns=p_max_turns,
@@ -1091,7 +1156,38 @@ def main() -> int:
                 ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-S{step}", cfg,
                         {"next_outer": next_outer, "next_phase": next_phase,
                          "next_step": next_step}, task_pool, rank, world,
-                        uid_counter=uid_counter, dry_run=args.dry_run)
+                        uid_counter=uid_counter, dry_run=args.dry_run,
+                        keep=(checkpoint_keep if s_done else 0))
+                # ★ 中间评测：每个 outer 完成时，rank0 在 valid_unseen 上评一次 solver，
+                #   其余 rank 在 barrier 等待。结果进日志 + SwanLab，用户能实时看进展。
+                #   EZ_SMOKE_EVAL=1 时 dry-run 也评测（冒烟顺带验证评测链路，task 数压到 4）。
+                _force_eval = bool(int(os.environ.get("EZ_SMOKE_EVAL", "0")))
+                if s_done and (not args.dry_run or _force_eval) and eval_every_outer > 0 \
+                        and (outer + 1) % eval_every_outer == 0:
+                    if world > 1:
+                        dist.barrier()
+                    if is_main(rank):
+                        _n = min(eval_n_tasks, 4) if args.dry_run else eval_n_tasks
+                        _eg = eval_game_files[:_n] if _n > 0 else eval_game_files
+                        _t0 = time.time()
+                        _sr, _won = mid_eval_solver(
+                            raw, policy, alf_cfg, _eg,
+                            max_steps=eval_max_steps,
+                            temperature=cfg["solver"].get("temperature", 1.0),
+                            max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
+                            max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
+                            batch_size=eval_batch, seed=seed + outer + 1,
+                            log_fn=log)
+                        log(f"[eval] outer {outer} 完成 valid_unseen SR={_sr:.4f} "
+                            f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
+                            f"{(time.time() - _t0) / 60:.1f}min)")
+                        _REPORTER.log({
+                            "eval/valid_unseen_sr": _sr,
+                            "eval/n_won": int(sum(_won)),
+                            "eval/n_tasks": len(_eg),
+                        }, step=(outer + 1) * (M_P + M_S))
+                    if world > 1:
+                        dist.barrier()
             if args.dry_run:
                 break
 
