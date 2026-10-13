@@ -562,8 +562,8 @@ def main() -> int:
     eval_n_tasks = int(tcfg.get("eval_n_tasks", 16))
     eval_batch = int(tcfg.get("eval_batch", 2))
     eval_max_steps = int(tcfg.get("eval_max_steps", cfg["solver"].get("max_turns", 30)))
-    # ★ solve rate 每批并行处理的任务数（TPS>1 时把"逐任务串行"改成批量并行 rollout）
-    sr_tasks = max(1, int(tcfg.get("solve_rate_batch_tasks", 4)))
+    # ★ solve rate 每批并行处理的任务数（与 TPS 取 min：TPS=1 时退化为逐任务，避免补齐浪费）
+    sr_tasks = max(1, min(int(tcfg.get("solve_rate_batch_tasks", 4)), TPS))
 
     def _game_unique_calls(items, key_of, max_per_call):
         """把 items 按 key_of（= game_file）轮转分组，保证**每次调用内 game 唯一**。
