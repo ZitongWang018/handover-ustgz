@@ -69,7 +69,7 @@ train:
   kl_beta: 0.001                      # frozen base reference via PEFT disable_adapter()
   sync_bucket_mb: 25
   check_adapter_sync_every: 5             # plus first update of every phase
-  generation_max_batch_size: 2
+  generation_max_batch_size: 8            # solve rate 8 条 rollout 一次 batch generate（原 2，省 3/4 生成时间）
   # ★ 断点留多个 + 训练中间评测（2026-10-13 用户要求）
   checkpoint_keep: 4          # 每个 outer 结束存一份历史断点到 checkpoints/，保留最近 N 个（0=只留最新）
   eval_every_outer: 1         # 每 N 个 outer 评测一次 valid_unseen（0=关闭）
