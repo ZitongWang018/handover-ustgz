@@ -801,6 +801,29 @@ def main() -> int:
             for t in task_pool:
                 fh.write(json.dumps(t.to_json(), ensure_ascii=False) + "\n")
 
+    # ★ 评测链路自测（EZ_EVAL_PRETEST=1 时）：训练前先在 valid_unseen 上评一次，
+    #   确保 mid_eval_solver 不炸。评测是本次新增，正式 8 卡作业里第一次触发在
+    #   第一个 outer 结束（30-60min 后）——提前 3 分钟验证，把「评测 bug 烧 8 卡 1 小时」
+    #   降成「烧 8 卡 3 分钟」。
+    if os.environ.get("EZ_EVAL_PRETEST") == "1" and not args.dry_run:
+        if world > 1:
+            dist.barrier()
+        if is_main(rank):
+            _pt0 = time.time()
+            _pt_n = max(1, min(eval_n_tasks, 4))
+            _sr0, _won0 = mid_eval_solver(
+                raw, policy, alf_cfg, eval_game_files[:_pt_n],
+                max_steps=eval_max_steps,
+                temperature=cfg["solver"].get("temperature", 1.0),
+                max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
+                max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
+                batch_size=eval_batch, seed=seed,
+                log_fn=log)
+            log(f"[eval-pretest] 评测链路 OK：SR={_sr0:.4f} "
+                f"({int(sum(_won0))}/{len(_won0)}，{(time.time() - _pt0) / 60:.1f}min)")
+        if world > 1:
+            dist.barrier()
+
     t_start = time.time()
     for outer in range(start_outer, N):
         # ⚠️ 冒烟只跑 1 个 outer 的判据必须放在**循环开头**。

@@ -51,9 +51,13 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     observations, views, _admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
         raise RuntimeError("ALFWorld reset returned a different number of evaluation slots")
-    for i, (actual, expected) in enumerate(zip(used, game_files)):
-        if os.path.realpath(actual) != os.path.realpath(expected):
-            raise RuntimeError(f"eval slot {i} mapped to unexpected game {actual!r}")
+    # ★ textworld 批量环境会 shuffle gamefiles（textworld_batch.py 的 rng.shuffle），
+    #   `used`（实际装载）与 `game_files`（请求）顺序不一致是**正常**的，不能按序比对。
+    #   views 与 used 是同一次 shuffle 后的对齐顺序，所以用 `used` 现场重算
+    #   task_id/task_type，才是 slot 的真实对应关系。
+    records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
+                "sample": (task_records[0]["sample"] if task_records else 0)}
+               for g in used]
     prompts = [build_solver_messages(views[i].env_desc or views[i].raw,
                                      views[i].task_desc or "") for i in range(len(used))]
     buffers = [policy.initial_prompt_ids(m, cfg) for m in prompts]
@@ -93,8 +97,8 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
             suffix = (policy.assistant_end_ids() + policy.append_feedback_ids(feedback) +
                       policy.next_generation_prefix_ids(feedback))
             buffers[slot].extend(suffix)
-    return [{"task_id": task_records[i]["task_id"], "task_type": task_records[i]["task_type"],
-             "game_file": game_files[i], "sample": task_records[i]["sample"],
+    return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
+             "game_file": used[i], "sample": records[i]["sample"],
              "won": won[i], "steps": steps[i], "actions": actions[i],
              "max_steps_reached": bool(active[i])} for i in range(len(used))]
 
