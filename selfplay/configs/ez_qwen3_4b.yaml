@@ -69,10 +69,11 @@ train:
   kl_beta: 0.001                      # frozen base reference via PEFT disable_adapter()
   sync_bucket_mb: 25
   check_adapter_sync_every: 5             # plus first update of every phase
-  generation_max_batch_size: 8            # solve rate 8 条 rollout 一次 batch generate（原 2，省 3/4 生成时间）
+  generation_max_batch_size: 16           # = TPS(8)×G_local(2) 的活跃 slot 数，一次 generate 全覆盖（冒烟显存仅 13.9G/80G）
   # ★ 断点留多个 + 训练中间评测（2026-10-13 用户要求）
   checkpoint_keep: 4          # 每个 outer 结束存一份历史断点到 checkpoints/，保留最近 N 个（0=只留最新）
   eval_every_outer: 1         # 每 N 个 outer 评测一次 valid_unseen（0=关闭）
   eval_n_tasks: 16            # 每次评测的 valid_unseen task 数（0=全量 134 个）
   eval_batch: 2               # 评测 batch
   eval_max_steps: 30          # 评测最大回合
+  solve_rate_batch_tasks: 4   # solve rate 每批并行处理的任务数（env_sr 一次跑 4×G_P=32 slot）

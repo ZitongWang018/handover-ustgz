@@ -562,6 +562,30 @@ def main() -> int:
     eval_n_tasks = int(tcfg.get("eval_n_tasks", 16))
     eval_batch = int(tcfg.get("eval_batch", 2))
     eval_max_steps = int(tcfg.get("eval_max_steps", cfg["solver"].get("max_turns", 30)))
+    # ★ solve rate 每批并行处理的任务数（TPS>1 时把"逐任务串行"改成批量并行 rollout）
+    sr_tasks = max(1, int(tcfg.get("solve_rate_batch_tasks", 4)))
+
+    def _game_unique_calls(items, key_of, max_per_call):
+        """把 items 按 key_of（= game_file）轮转分组，保证**每次调用内 game 唯一**。
+
+        `run_ez_solver_rollouts` 不允许同一批里同一 game_file 出现多个不同 task_desc
+        （slot 按 gamefile 反查会混淆），所以同 game 的多个提案必须分到不同批。
+        逐轮：每轮从每个 game 各取一个 → 同 game 的多个提案天然分到不同轮。
+        yield (实参 sub, 补齐到 max_per_call 的 fill)：不足时用 sub[0] 补齐（同 game 同
+        desc，不触发守卫；补出来的槽位结果调用方忽略）。
+        """
+        by: Dict[Any, List[Any]] = {}
+        for it in items:
+            by.setdefault(key_of(it), []).append(it)
+        _ri = 0
+        while True:
+            _r = [q[_ri] for q in by.values() if len(q) > _ri]
+            if not _r:
+                break
+            for _i in range(0, len(_r), max_per_call):
+                _sub = _r[_i:_i + max_per_call]
+                yield _sub, list(_sub) + [_sub[0]] * (max_per_call - len(_sub))
+            _ri += 1
 
     # ★ --dry-run 只把"步数"降到 1 是**不够**的：G=16 × 30 turns 在 A40 debug 分区
     #   （30 min 上限）根本跑不完，会卡到超时。这里把 group / turns / tasks 一并压到
@@ -645,7 +669,8 @@ def main() -> int:
                              batch_size=env_p_batch, max_episode_steps=p_cfg.max_turns,
                              with_facts=True, ignore_benchmark_done=True)
     env_s = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                             batch_size=G_local, max_episode_steps=s_cfg.max_steps,
+                             batch_size=G_local * min(TPS, len(game_files)),
+                             max_episode_steps=s_cfg.max_steps,
                              with_facts=True, ignore_benchmark_done=True)
     # ★ 估 solve rate 用独立 env（batch=G_P）：run_ez_solver_rollouts 要求 batch==len(tasks)，
     #   G_P(8) ≠ G(16) 时复用 env_s 会在第一个被接受提案处 ValueError（review P0-2）
@@ -663,7 +688,7 @@ def main() -> int:
             raise RuntimeError("[EZ] 环境已关闭，不能再懒建 env_sr")
         if env_sr is None:
             env_sr = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                                      batch_size=G_P, max_episode_steps=s_cfg.max_steps,
+                                      batch_size=G_P * sr_tasks, max_episode_steps=s_cfg.max_steps,
                                       with_facts=True, ignore_benchmark_done=True)
             atexit.register(env_sr.close)
         return env_sr
@@ -900,24 +925,32 @@ def main() -> int:
                     f" 各 rank 的 backward 次数会不一致，DDP 必然死锁。"
                     f" 检查 run_proposer_exploration 是否有静默丢样本的路径")
             accepted = [c for c in cand if c.accepted and c.task is not None]
-            # 2) 冻结 solver 估 solve rate（G_P 条 rollout，不训练；用 batch=G_P 的 env_sr）
+            # 2) 冻结 solver 估 solve rate —— **批量并行**（原为逐任务串行，TPS>1 时成主瓶颈）。
+            #    每批 sr_tasks 个任务，把它们的 G_P 条 rollout 合并成一次调用（env_sr 一次跑
+            #    sr_tasks×G_P 个 slot）；末尾不足一批时用最后一个任务补齐（补的槽位结果忽略）。
             new_tasks: List[ProposedTask] = []
             for c in accepted:
-                t = c.task
                 # ★ uid 必须带 rank：每 rank 各自 proposals，不带 rank 会跨 rank 撞 uid，
                 #   撞了之后 solver 相位的 `task_id == uid` 分组会把不同任务混成一组。
-                t.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
+                c.task.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
+            if accepted:
                 select_adapter(raw, "solver")
-                rollouts = run_ez_solver_rollouts(_ensure_env_sr(), policy, [t] * G_P, s_cfg,
-                                                  tokenize=False, log_fn=log)
+                for _sub, _fill in _game_unique_calls(accepted, lambda c: c.task.game_file, sr_tasks):
+                    _input: List[ProposedTask] = []
+                    for c in _fill:
+                        _input.extend([c.task] * G_P)
+                    _outs = run_ez_solver_rollouts(_ensure_env_sr(), policy, _input, s_cfg,
+                                                   tokenize=False, log_fn=log)
+                    for _j, c in enumerate(_sub):
+                        _grp = _outs[_j * G_P:(_j + 1) * G_P]
+                        _p_hat = sum(r.verify.final_match for r in _grp) / G_P
+                        _rt, _parts = proposer_reward(c.task, _p_hat, w_sub=w_sub, w_div=w_div)
+                        c.reward = _rt
+                        c.__dict__["reward_parts"] = _parts
+                        c.task.meta["solve_rate"] = _p_hat
+                        new_tasks.append(c.task)
                 select_adapter(raw, "proposer")
-                p_hat = sum(r.verify.final_match for r in rollouts) / G_P
-                r_total, parts = proposer_reward(t, p_hat, w_sub=w_sub, w_div=w_div)
-                c.reward = r_total
-                c.__dict__["reward_parts"] = parts
-                t.meta["solve_rate"] = p_hat
-                new_tasks.append(t)
             if world > 1:
                 # ★ 任务池必须**每个 rank 完全一致**：solver 相位要从池里采样，
                 #   各 rank 池子不同则采出的任务数/内容不同 → backward 次数不同 → 死锁。
@@ -1100,10 +1133,16 @@ def main() -> int:
                                             outer * max(M_S, 1) + step,
                                             seed + 104729, rank, world, dist)
             batch = [outer_pool[i] for i in chosen]
-            solver_groups: List[List[EzSolverTrajectory]] = []
-            for t in batch:
-                solver_groups.append(run_ez_solver_rollouts(
-                    env_s, policy, [t] * G_local, s_cfg, tokenize=True, log_fn=log))
+            # ★ 批量并行：本步**所有任务**的 rollout 合并成一次调用（原逐任务串行，是 TPS>1
+            #   时的第二个瓶颈）。按 game_file 轮转分批（同一批内同 game 只出现一次），
+            #   env_s.batch = G_local×TPS，末尾不足时用 sub[0] 补齐（补的槽位结果忽略）。
+            _res: Dict[str, Any] = {}
+            for _sub, _fill in _game_unique_calls(batch, lambda t: t.game_file, TPS):
+                _flat = [t for t in _fill for _ in range(G_local)]
+                _outs = run_ez_solver_rollouts(env_s, policy, _flat, s_cfg, tokenize=True, log_fn=log)
+                for _j, t in enumerate(_sub):
+                    _res[t.meta["uid"]] = _outs[_j * G_local:(_j + 1) * G_local]
+            solver_groups: List[List[EzSolverTrajectory]] = [_res[t.meta["uid"]] for t in batch]
             _rollout_s = time.time() - st0
             model.train()
             optimizer.zero_grad(set_to_none=True)
