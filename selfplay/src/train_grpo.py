@@ -24,6 +24,7 @@ import json
 import math
 import os
 import random
+import inspect
 import shutil
 import sys
 import time
@@ -218,17 +219,57 @@ def _autocast_bf16(model):
 
 
 def per_token_logps(model, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                    chunk: int = _LOGSOFTMAX_CHUNK) -> torch.Tensor:
+                    chunk: int = _LOGSOFTMAX_CHUNK,
+                    loss_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """返回**每个位置**的 log p(target_token)。
 
     数学上就是 `logits.log_softmax(-1).gather(targets)`，但把 softmax 沿序列维分块算，
     避免一次性物化 fp32 的 B×W×vocab 中间张量（这是长上下文 RL 最典型的显存杀手）。
     """
-    with _autocast_bf16(model):
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = out.logits[:, :-1, :]          # 切片是 view，不额外占显存
     targets = input_ids[:, 1:]
-    width = logits.size(1)
+    selected_positions = None
+    model_kwargs = dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    if loss_mask is not None:
+        # logit position t predicts input token t+1. Select the union of required
+        # positions across rows; masked positions are zeroed after gathering.
+        positions = torch.nonzero(loss_mask[:, 1:].bool().any(dim=0), as_tuple=False).flatten()
+        try:
+            supports_select = "logits_to_keep" in inspect.signature(base.forward).parameters
+        except (TypeError, ValueError):
+            supports_select = False
+        if supports_select:
+            selected_positions = positions
+            model_kwargs["logits_to_keep"] = selected_positions
+    if loss_mask is not None and selected_positions is not None and selected_positions.numel() == 0:
+        # Zero-mask batch: preserve a zero graph via a tiny logits probe at position 0.
+        model_kwargs["logits_to_keep"] = torch.zeros((1,), dtype=torch.long, device=input_ids.device)
+        selected_positions = model_kwargs["logits_to_keep"]
+    with _autocast_bf16(model):
+        out = model(**model_kwargs)
+    logits = out.logits
+    if selected_positions is None:
+        logits = logits[:, :-1, :]
+        positions = None
+    else:
+        positions = selected_positions
+    width = targets.size(1)
+    if positions is not None:
+        selected_targets = targets.index_select(1, positions)
+        selected_mask = loss_mask[:, 1:].index_select(1, positions).to(dtype=torch.float32)
+        parts = []
+        for s in range(0, logits.size(1), chunk):
+            lc = logits[:, s:s + chunk, :]
+            tc = selected_targets[:, s:s + chunk]
+            if torch.is_grad_enabled():
+                parts.append(torch.utils.checkpoint.checkpoint(_chunk_logp, lc, tc, use_reentrant=False))
+            else:
+                parts.append(_chunk_logp(lc, tc))
+        selected_logps = torch.cat(parts, dim=1) if parts else logits.sum(dim=-1) * 0.0
+        selected_logps = selected_logps * selected_mask
+        dense = torch.zeros_like(targets, dtype=selected_logps.dtype)
+        dense.index_copy_(1, positions, selected_logps)
+        return dense
     if width <= chunk:
         return _chunk_logp(logits, targets)
     parts: List[torch.Tensor] = []
@@ -298,6 +339,9 @@ def grpo_loss(
     old_logps: torch.Tensor,
     clip_eps: float,
     loss_norm: str = "seq",
+    ref_logps: Optional[torch.Tensor] = None,
+    beta: float = 0.0,
+    sequence_reduction: str = "mean",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """GRPO/PPO-clip  surrogate loss。
 
@@ -324,18 +368,34 @@ def grpo_loss(
         一好一坏，token 级权重是 (0.091, 0.909)，长序列独占 91%。
         这就是 Dr.GRPO 点名的 length bias：模型会去学"写长/写短"，而不是"答对"。
     """
-    new_logps = per_token_logps(model, batch.input_ids, batch.attention_mask)
+    new_logps = per_token_logps(model, batch.input_ids, batch.attention_mask,
+                                loss_mask=batch.loss_mask)
     # 对齐 mask：logp[:, i] 预测的是 input_ids[:, i+1]
     mask = batch.loss_mask[:, 1:]
-    ratio = torch.exp(new_logps - old_logps)
     adv = batch.advantages.unsqueeze(1)
+    # Selected-logit path writes zero at masked positions, while legacy old_logps
+    # may be dense. Zero the log-ratio before exp so masked entries stay finite.
+    log_ratio = torch.where(mask.bool(), new_logps - old_logps,
+                            torch.zeros_like(new_logps))
+    ratio = torch.exp(log_ratio)
     surr1 = ratio * adv
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     per_tok = -torch.min(surr1, surr2)
+    kl_mean = 0.0
+    if beta and ref_logps is None:
+        raise ValueError("beta > 0 requires frozen-reference log probabilities")
+    if beta and ref_logps is not None:
+        # Non-negative k3 estimate of KL(policy || frozen base), evaluated on
+        # exactly the same generated-token mask as the policy objective.
+        delta = torch.where(mask.bool(), ref_logps - new_logps,
+                            torch.zeros_like(new_logps))
+        kl = torch.exp(delta) - delta - 1.0
+        per_tok = per_tok + float(beta) * kl
     denom = mask.sum().clamp(min=1.0)
     # 归约口径单独放在 `grpo_norm.grpo_reduce`（只依赖 torch），
     # 这样离线单测能直接测到**跑的这份代码**，而不是测一份复刻实现。
-    loss = grpo_reduce(per_tok, mask, loss_norm=loss_norm)
+    loss = grpo_reduce(per_tok, mask, loss_norm=loss_norm,
+                       sequence_reduction=sequence_reduction)
 
     with torch.no_grad():
         clipped = ((ratio - 1.0).abs() > clip_eps).float()
@@ -346,9 +406,10 @@ def grpo_loss(
             #                               = 1 - 1 - E_old[Δ] = KL(old ‖ new)
             #   一阶项 -Δ 就是 k1，k3 比 k1 多了个非负的二阶项，方差更低且无偏。
             #   别"顺手改成 (old - new).mean()" —— 那退化成 k1 了。
-            "kl_approx": float(((ratio - 1.0) - (new_logps - old_logps)).mean().item()) if mask.sum() > 0 else 0.0,
+            "kl_approx": float((((ratio - 1.0) - log_ratio) * mask).sum().item() / max(denom.item(), 1.0)) if mask.sum() > 0 else 0.0,
             "clip_frac": float((clipped * mask).sum().item() / max(denom.item(), 1.0)),
             "ratio_mean": float(((ratio * mask).sum() / denom).item()),
+            "kl_ref": float(((torch.exp(torch.where(mask.bool(), ref_logps - new_logps, torch.zeros_like(new_logps))) - torch.where(mask.bool(), ref_logps - new_logps, torch.zeros_like(new_logps)) - 1.0) * mask).sum().item() / max(denom.item(), 1.0)) if ref_logps is not None else 0.0,
         }
     return loss, stats
 

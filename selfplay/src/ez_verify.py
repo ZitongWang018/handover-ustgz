@@ -57,6 +57,7 @@ class ProposedTask:
 
     def to_json(self) -> dict:
         return {
+            "schema_version": 2,
             "task_desc": self.task_desc,
             "s0": self.s0.to_json(),
             "ref_final": self.ref_final.to_json(),
@@ -70,6 +71,8 @@ class ProposedTask:
 
     @staticmethod
     def from_json(d: dict) -> "ProposedTask":
+        meta = dict(d.get("meta", {}))
+        meta.setdefault("pool_schema_version", int(d.get("schema_version", 1)))
         return ProposedTask(
             task_desc=d["task_desc"],
             s0=StateSnapshot.from_json(d["s0"]),
@@ -79,13 +82,29 @@ class ProposedTask:
             game_file=d.get("game_file", ""),
             proposer_actions=d.get("proposer_actions", []),
             proposer_action_types=d.get("proposer_action_types", []),
-            meta=d.get("meta", {}),
+            meta=meta,
         )
 
 
 # --------------------------------------------------------------------------- 有效性过滤（§3.2）
 
 _WORD_RE = re.compile(r"[a-z]+")
+_ALFWORLD_TYPES = {
+    "alarmclock", "apple", "armchair", "baseballbat", "basketball", "bathtub",
+    "bathtubbasin", "bed", "blinds", "book", "boots", "bottle", "bowl", "box",
+    "bread", "butterknife", "cabinet", "candle", "cart", "cd", "cellphone",
+    "chair", "cloth", "coffeetable", "countertop", "creditcard", "cup", "desk",
+    "desklamp", "dishsponge", "drawer", "dresser", "egg", "floorlamp", "flooring",
+    "fork", "fridge", "garbagecan", "glassbottle", "handtowel", "handtowelholder",
+    "houseplant", "kettle", "keychain", "knife", "ladle", "laptop", "laundryhamper",
+    "lettuce", "microwave", "mug", "newspaper", "ottoman", "painting", "pan",
+    "papertowel", "papertowelroll", "paper", "pen", "pencil", "pepper",
+    "pillow", "plate", "plunger", "pot", "potato", "remotecontrol", "safe", "saltshaker",
+    "scrubbrush", "shelf", "showercurtain", "showerdoor", "showerglass", "sink", "sinkbasin",
+    "soapbar", "soapbottle", "sofa", "spatula", "spoon", "spraybottle", "statue", "stoveburner",
+    "table", "teapot", "tennisracket", "tissuebox", "toilet", "toiletpaper", "tomato", "towel",
+    "tv", "vacuumcleaner", "watch", "wateringcan", "window", "winebottle", "melon"
+}
 
 
 def _words(text: str) -> set:
@@ -120,18 +139,46 @@ def validity_filter(task: ProposedTask, jaccard_threshold: float = 0.6) -> Tuple
             if redundant_pair(a.description, a.ref_delta, b.description, b.ref_delta,
                               jaccard_threshold):
                 return False, f"redundant_subtask:{i}:{j}"
-    # 规则 iii：任务描述里点名的物体/应用必须出现在 proposer 轨迹中。
-    # 实现：任务描述里的每个"物体词"至少要出现在某条动作或子任务描述里。
-    # ALFWorld 动作形如 "heat apple 1 with microwave 1"，先取动作的物体部分。
-    traj_text = " ".join(task.proposer_actions + [s.description for s in task.subtasks]).lower()
-    # 从 task_desc 抽候选物体词：去掉停用词后的实词
+    # Rule iii: concrete targets must occur in actions or actual observations/facts.
+    # Subtask prose is deliberately excluded: repeating an unsupported noun there is
+    # not evidence that the proposer ever encountered that object.
+    evidence = " ".join(task.proposer_actions).lower()
+    for snap in (task.s0, task.ref_final, *(s.ref_snapshot for s in task.subtasks)):
+        evidence += " " + " ".join(snap.facts).lower()
+    words = _WORD_RE.findall(task.task_desc.lower())
     stop = {"a", "an", "the", "in", "on", "at", "and", "then", "with", "to", "of",
             "put", "place", "take", "go", "heat", "clean", "cool", "open", "close",
-            "look", "use", "some", "it", "into", "from"}
-    missing = [w for w in _words(task.task_desc) - stop
-               if len(w) >= 4 and w not in traj_text]
-    # 抽词是启发式：为避免误杀，只在缺失词>=2 时才拒（单词缺失常是描述措辞差异）
-    if len(missing) >= 2:
+            "look", "use", "some", "it", "into", "from", "pick", "up", "move",
+            "wash", "slice", "turn", "off", "on", "interesting", "reproducible",
+            "task", "object", "item", "thing", "something", "state", "there", "this"}
+    # Match known ALFWorld object types regardless of singular/plural, then catch
+    # unsupported direct objects after verbs while skipping determiners, quantities,
+    # and adjectives. Preserve text order so "hot apple" never depends on set order.
+    candidates = set()
+    for word in words:
+        singular = word[:-1] if word.endswith("s") and word[:-1] in _ALFWORLD_TYPES else word
+        if singular in _ALFWORLD_TYPES:
+            candidates.add(singular)
+    adjectives = {"hot", "cold", "warm", "clean", "dirty", "red", "small", "large",
+                  "ripe", "cool", "uncooked", "cooked", "sliced", "whole"}
+    quantities = {"two", "three", "four", "five", "all", "both", "each", "some",
+                  "any", "one", "another", "several", "many"}
+    verbs = {"put", "place", "take", "heat", "clean", "cool", "open", "close",
+             "wash", "slice", "move", "pick", "find", "get"}
+    for i, word in enumerate(words):
+        if word not in verbs:
+            continue
+        for noun in words[i + 1:i + 7]:
+            if noun in stop or noun in quantities or noun in adjectives:
+                continue
+            if noun.endswith("s") and noun[:-1] in _ALFWORLD_TYPES:
+                noun = noun[:-1]
+            if noun.endswith(("ly", "ous", "ful", "ive", "able")):
+                continue
+            candidates.add(noun)
+            break
+    missing = sorted(w for w in candidates if not re.search(rf"\b{re.escape(w)}(?:s)?\b", evidence))
+    if missing:
         return False, f"unsupported_objects:{missing}"
     return True, "ok"
 
@@ -161,8 +208,9 @@ def verify_solver_rollout(task: ProposedTask,
     """
     s0 = task.s0
     sT = solver_snapshots[-1] if solver_snapshots else s0
-    final_match = match_final_state(s0, task.ref_final, sT)
-    hits = [match_reference(s0, st.ref_snapshot, solver_snapshots) for st in task.subtasks]
+    final_match = match_final_state(s0, task.ref_final, sT, task.task_desc)
+    hits = [match_reference(s0, st.ref_snapshot, solver_snapshots, st.description)
+            for st in task.subtasks]
     if final_match:
         reward = 1.0
     else:

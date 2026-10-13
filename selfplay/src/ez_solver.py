@@ -20,7 +20,7 @@ from ez_proposer import _slot_snapshot, parse_tool_call, sanitize_explore_action
 from ez_prompts import append_tool_result, build_solver_messages
 from ez_state import StateSnapshot, assert_facts_mode
 from ez_verify import ProposedTask, SolverRolloutResult, verify_solver_rollout
-from rollout import (RolloutConfig, Trajectory, build_token_sequence, _align_slot_tasks)
+from rollout import (RolloutConfig, Trajectory, _align_slot_tasks)
 from reward import TrajectoryStats
 
 
@@ -63,18 +63,36 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
     for s in range(n):
         _s0 = _slot_snapshot(facts0[s], obs_list[s])
         assert_facts_mode(_s0, f"solver reset slot {s}")
+        from collections import Counter
+        expected = tasks[slot_task[s]].s0
+        if _s0.mode != expected.mode or Counter(_s0.facts) != Counter(expected.facts):
+            raise RuntimeError("solver reset state differs from ProposedTask.s0; refusing mismatched rollout")
         snap_hist.append([_s0])
 
     messages: List[List[Dict[str, str]]] = []
+    token_buffers: List[List[int]] = []
+    token_masks: List[List[int]] = []
     stats: List[TrajectoryStats] = []
     gen_ids_log: List[List[List[int]]] = [[] for _ in range(n)]
     for s in range(n):
         t = tasks[slot_task[s]]
         # ★ EZ：附录 G Fig.14 solver prompt；观测里塞 proposer 任务 x
         v = views[s]
-        messages.append(build_solver_messages(v.env_desc or v.raw, t.task_desc))
+        msg = build_solver_messages(v.env_desc or v.raw, t.task_desc)
+        messages.append(msg)
+        # Solve-rate estimation and training must sample from identical token-native
+        # histories. `tokenize` controls only whether the final trajectory is retained.
+        token_buffers.append(policy.initial_prompt_ids(msg, cfg))
+        token_masks.append([0] * len(token_buffers[-1]))
         stats.append(TrajectoryStats(task_type="ez_generated",
                                      task_id=t.meta.get("uid", str(slot_task[s]))))
+
+    def append_feedback(slot: int, content: str) -> None:
+        tail = policy.assistant_end_ids()
+        user = policy.append_feedback_ids(content)
+        prefix = policy.next_generation_prefix_ids(content)
+        token_buffers[slot].extend(tail + user + prefix)
+        token_masks[slot].extend([0] * (len(tail) + len(user) + len(prefix)))
 
     active = [True] * n
     last_action = [""] * n
@@ -85,20 +103,28 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
         if not any(active):
             break
         idxs = [s for s in range(n) if active[s]]
-        texts, gen_ids, _ = policy.generate([messages[s] for s in idxs], cfg)
+        texts, gen_ids, _ = policy.generate_from_token_ids([token_buffers[s] for s in idxs], cfg)
 
         step_actions = ["look"] * n
         parsed_by_slot: Dict[int, Any] = {}
         for k, s in enumerate(idxs):
             parsed = parse_tool_call(texts[k])
             if parsed.kind == "action":
-                executed, exact = sanitize_explore_action(parsed.action, admissible[s])
+                # EZ's default policy is raw: preserve invalid commands as generated.
+                executed, exact = parsed.action.strip(), parsed.action.strip().lower() in {
+                    a.strip().lower() for a in admissible[s]}
             elif parsed.kind == "malformed":
                 executed, exact = "look", False     # 格式违例：空转 + 计数
             else:
                 executed, exact = "look", True      # sub_finish/finish 对 solver 无意义：空转
             step_actions[s] = executed
             parsed_by_slot[s] = (parsed, executed, exact, texts[k], gen_ids[k])
+            # Every generated response is part of the policy trajectory, even if malformed
+            # or a control action. Keep its real ids so subsequent feedback has context.
+            messages[s].append({"role": "assistant", "content": texts[k].strip()})
+            gen_ids_log[s].append(list(gen_ids[k]))
+            token_buffers[s].extend(gen_ids[k])
+            token_masks[s].extend([1] * len(gen_ids[k]))
 
         bs = env.step(step_actions)
         cur_facts = list(bs.facts) if bs.facts else [None] * n
@@ -116,12 +142,18 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
                 messages[s].append({"role": "user", "content":
                     "Your last response was not a valid tool call. Emit exactly one "
                     "<tool_call>{...}</tool_call> block."})
+                append_feedback(s, messages[s][-1]["content"])
+                if bool(bs.dones[s]):
+                    active[s] = False
                 continue
             if parsed.kind in ("sub_finish", "finish"):
                 # solver 协议里没有这两个声明：当作普通空转，只轻微计数
                 st.n_invalid += 0
                 messages[s].append({"role": "user", "content":
                     "Only environment actions are valid for you. Keep working on the task."})
+                append_feedback(s, messages[s][-1]["content"])
+                if bool(bs.dones[s]):
+                    active[s] = False
                 continue
             if exact:
                 st.n_valid_steps += 1
@@ -130,12 +162,11 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             if executed and executed.lower() == last_action[s].lower():
                 st.n_repeat += 1
             last_action[s] = executed
-            messages[s].append({"role": "assistant", "content": text.strip()})
-            gen_ids_log[s].append(list(gid))
             if bool(bs.dones[s]):
                 active[s] = False
             else:
                 append_tool_result(messages[s], executed, bs.obs[s])
+                append_feedback(s, messages[s][-1]["content"])
         for s in idxs:
             if active[s]:
                 admissible[s] = bs.admissible[s]
@@ -149,10 +180,7 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
         verify = verify_solver_rollout(t, snap_hist[s])
         st.won = verify.final_match
         if tokenize:
-            tr_msgs = policy.truncate_messages(messages[s], cfg)
-            n_asst_kept = sum(1 for m in tr_msgs if m["role"] == "assistant")
-            gen_kept = gen_ids_log[s][len(gen_ids_log[s]) - n_asst_kept:] if n_asst_kept else []
-            ids, mask, _ = build_token_sequence(tr_msgs, gen_kept, policy)
+            ids, mask = token_buffers[s], token_masks[s]
         else:
             ids, mask = [], []
         traj = Trajectory(task_id=st.task_id, task_type=st.task_type, game_file=used[s],

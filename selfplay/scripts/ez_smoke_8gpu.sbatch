@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# Explorer-Zero **8 卡 DDP** 冒烟 —— P0 验收（EZ_DDP_PLAN.md §7/§8）
+# Explorer-Zero 8 卡显式 LoRA 同步冒烟。旧 DDP/TPS 注释仅作历史记录；
+# 当前默认 global TPS=1, G=16, local G=2，每个rank同初始game的全局GRPO组分片。
 #
 # 单卡冒烟（ez_smoke_1gpu.sbatch）过的是"链路通不通"；这一发过的是
 # **"DDP 接线对不对"**，两者查的问题几乎不重叠：
@@ -81,16 +82,17 @@ set -euo pipefail
 if [[ -d /data/user/xyu608 ]]; then
   CLUSTER="hpc3"; PROJ=/data/user/xyu608/ztwang/selfplay
   ALFWORLD_DATA="${ALFWORLD_DATA:-$PROJ/data/alfworld}"
-  MODEL_PATH="${ZTWANG_MODEL_PATH:-$PROJ/data/models/qwen3_4b_inst_2507}"
+  MODEL_PATH="${ZTWANG_MODEL_PATH:-}"
   CONDA_ENV="${ZTWANG_ENV:-vllm017}"; DEPS="third_party/py311deps"
   source /share/anaconda3/etc/profile.d/conda.sh
 else
   CLUSTER="hpc2"; PROJ=$HOME/ztwang/selfplay
   ALFWORLD_DATA="${ALFWORLD_DATA:-$HOME/.cache/alfworld}"
-  MODEL_PATH="${ZTWANG_MODEL_PATH:-$HOME/thinktool/models/qwen3_4b_inst_2507}"
+  MODEL_PATH="${ZTWANG_MODEL_PATH:-}"
   CONDA_ENV="${ZTWANG_ENV:-thinktool}"; DEPS="third_party/py310deps"
   source "$HOME/miniconda3/etc/profile.d/conda.sh"
 fi
+: "${MODEL_PATH:?Set ZTWANG_MODEL_PATH explicitly to the intended Qwen3-4B base checkpoint}"
 cd "$PROJ"
 conda activate "$CONDA_ENV"
 
@@ -112,10 +114,15 @@ export NCCL_ASYNC_ERROR_HANDLING=1   # 兼容老版本 NCCL，留着无害
 
 CFG=${CFG:-configs/ez_qwen3_4b.yaml}
 NPROC=${NPROC:-8}
-export EZ_SMOKE_G=${EZ_SMOKE_G:-2}
+export EZ_SMOKE_G=${EZ_SMOKE_G:-16}
 export EZ_SMOKE_G_P=${EZ_SMOKE_G_P:-2}
-export EZ_SMOKE_TURNS=${EZ_SMOKE_TURNS:-12}
-export EZ_SMOKE_TPS=${EZ_SMOKE_TPS:-$NPROC}
+export EZ_SMOKE_TURNS=${EZ_SMOKE_TURNS:-16}
+export EZ_SMOKE_TPS=${EZ_SMOKE_TPS:-1}
+if [[ "$CLUSTER" == "hpc3" ]]; then
+  export EZ_RUN_OUTPUT_DIR="${EZ_RUN_OUTPUT_DIR:-$PROJ/runs/ez}"
+else
+  export EZ_RUN_OUTPUT_DIR="${EZ_RUN_OUTPUT_DIR:-$HOME/jhspoolers/ez_runs}"
+fi
 
 # ---------- SwanLab 指标上报（2026-10-13）----------
 # API key 不写在脚本里：登录过一次后 swanlab 会把凭据留在 `~/.swanlab/.netrc`（0600），
@@ -137,6 +144,7 @@ export EZ_SWANLAB_WORKSPACE=${EZ_SWANLAB_WORKSPACE:-ZitongWang}
 echo "=== job=$SLURM_JOB_ID cluster=$CLUSTER node=$(hostname) date=$(date) ==="
 echo "PROJ=$PROJ CFG=$CFG conda=$CONDA_ENV NPROC=$NPROC"
 echo "model=$ZTWANG_MODEL_PATH"
+echo "output=$EZ_RUN_OUTPUT_DIR (checkpoint and logs)"
 echo "alfworld_data=$ALFWORLD_DATA"
 nvidia-smi -L
 nvidia-smi --query-gpu=name,memory.total --format=csv
@@ -168,7 +176,7 @@ nvidia-smi --query-gpu=index,memory.peak --format=csv 2>/dev/null || true
 
 # ---------- [3/3] 产物自检（含 8 卡专有关4）----------
 echo "--- [3/3] 产物自检 ---"
-D=$(ls -dt runs/*/ | head -1)
+D=$(ls -dt "$EZ_RUN_OUTPUT_DIR"/*/ | head -1)
 echo "run_dir=$D"
 ls -la "$D" || true
 for f in "$D"train_log.rank*.jsonl; do
@@ -180,4 +188,4 @@ if ! python scripts/ez_check_smoke_ok.py --config "$CFG" --run-dir "$D"; then
   exit 1
 fi
 
-echo "=== done: $(date) → 8 卡 P0 验收通过 ==="
+echo "=== done: $(date) → global-G adapter-sync smoke checks complete; reward signal is evaluated separately ==="

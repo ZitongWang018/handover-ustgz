@@ -41,6 +41,9 @@ class ProposerConfig:
     max_context_tokens: int = 40960  # Table 3 context length
     keep_recent_turns: int = 40     # 补全: 40960 token 大约能留 40 轮
     give_admissible: bool = False   # U3 决策点：默认不给 admissible_commands
+    invalid_action_mode: str = "raw" # EZ 默认执行模型原始动作，不做模糊纠正
+    finish_nudge: bool = True
+    generation_max_batch_size: int = 2
     seed: Optional[int] = None
 
 
@@ -71,7 +74,9 @@ class ProposerRollout:
 _ACTION_TYPE_COMMANDS = {
     "go_to": "go to {receptacle_name}",
     "take": "take {object_name} from {receptacle_name}",
-    "put": "put {object_name} in {receptacle_name}",
+    # ALFWorld 0.3.3 grammar uses put-in/on. This is an explicit protocol mapping,
+    # not instance-specific admissible-command correction.
+    "put": "put {object_name} in/on {receptacle_name}",
     "open": "open {receptacle_name}",
     "close": "close {receptacle_name}",
     "look": "look",
@@ -82,13 +87,15 @@ _ACTION_TYPE_COMMANDS = {
     "clean": "clean {object_name} with {receptacle_name}",
     "cool": "cool {object_name} with {receptacle_name}",
     "slice": "slice {object_name} with {receptacle_name}",
-    "move": "move {object_name} to {receptacle_name}",
+    # Older prompts and current tool schema may call this placement "move";
+    # ALFWorld 0.3.3's canonical command grammar is the same put-in/on command.
+    "move": "put {object_name} in/on {receptacle_name}",
 }
 
 
 @dataclass
 class ParsedToolCall:
-    kind: str                                    # "action" | "sub_finish" | "finish" | "malformed"
+    kind: str                                    # "action" | "declare" | "sub_finish" | "finish" | "malformed"
     action: str = ""                             # kind=action 时的环境命令
     task_description: str = ""                   # kind=sub_finish/finish 时的描述
     raw: str = ""
@@ -126,10 +133,13 @@ def parse_tool_call(text: str) -> ParsedToolCall:
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     at = str(args.get("action_type", "")).strip().lower()
     desc = str(args.get("task_description", "")).strip()
-    if at == "sub_finish":
+    if at in ("declare", "declare_task"):
+        return ParsedToolCall(kind="declare", task_description=desc, raw=obj_text,
+                              end_idx=end_idx)
+    if at in ("sub_finish", "subtask"):
         return ParsedToolCall(kind="sub_finish", task_description=desc, raw=obj_text,
                               end_idx=end_idx)
-    if at == "finish":
+    if at in ("finish", "finish_task"):
         return ParsedToolCall(kind="finish", task_description=desc, raw=obj_text, end_idx=end_idx)
     tpl = _ACTION_TYPE_COMMANDS.get(at)
     if tpl is None:
@@ -191,18 +201,35 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                   repetition_penalty=cfg.repetition_penalty,
                   max_context_tokens=cfg.max_context_tokens,
                   keep_recent_turns=cfg.keep_recent_turns,
-                  stop_mode="tool_call")   # 写完 </tool_call> 即停，别白烧 token
+                  stop_mode="tool_call", max_batch_size=cfg.generation_max_batch_size)
 
     obs_list, views, admissible, used, _ = env.reset([game_file] * g)
     s0_facts = list(getattr(env, "last_reset_facts", [None] * g))
     s0_snaps = [_slot_snapshot(s0_facts[s], obs_list[s]) for s in range(g)]
     for s in range(g):
         assert_facts_mode(s0_snaps[s], f"proposer reset slot {s}")
+    # Every local shard must begin from the same benchmark game state; otherwise
+    # cross-rank reward normalization would compare different initial conditions.
+    from collections import Counter
+    fingerprints = [tuple(sorted(Counter(s.facts).items())) for s in s0_snaps]
+    local_same = all(f == fingerprints[0] for f in fingerprints)
+    try:
+        import torch.distributed as _dist
+    except ImportError:
+        _dist = None
+    if _dist is not None and _dist.is_available() and _dist.is_initialized():
+        all_fingerprints = [None] * _dist.get_world_size()
+        _dist.all_gather_object(all_fingerprints, fingerprints[0])
+        local_same = local_same and all(x == all_fingerprints[0] for x in all_fingerprints)
+    if not local_same:
+        raise RuntimeError("global proposer group reset to different initial facts across slots/ranks")
     # 每个 slot 的"当前状态"沿轨迹更新（sub_finish/finish 快照取当前值）
     cur_snaps = list(s0_snaps)
     cur_facts = list(s0_facts)
 
     messages: List[List[Dict[str, str]]] = []
+    token_buffers: List[List[int]] = []
+    token_masks: List[List[int]] = []
     gen_ids_log: List[List[List[int]]] = [[] for _ in range(g)]
     subtask_bufs: List[List[SubtaskRef]] = [[] for _ in range(g)]
     action_bufs: List[List[str]] = [[] for _ in range(g)]
@@ -212,7 +239,17 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
     for s in range(g):
         v = views[s]
         adm = admissible[s] if cfg.give_admissible else ()
-        messages.append(build_proposer_messages(v.env_desc or v.raw, cfg.max_turns, adm))
+        msg = build_proposer_messages(v.env_desc or v.raw, cfg.max_turns, adm)
+        messages.append(msg)
+        token_buffers.append(policy.initial_prompt_ids(msg, gen_cfg))
+        token_masks.append([0] * len(token_buffers[-1]))
+
+    def add_feedback_tokens(slot: int, content: str) -> None:
+        tail = policy.assistant_end_ids()
+        user = policy.append_feedback_ids(content)
+        prefix = policy.next_generation_prefix_ids(content)
+        token_buffers[slot].extend(tail + user + prefix)
+        token_masks[slot].extend([0] * (len(tail) + len(user) + len(prefix)))
 
     t0 = time.time()
     for turn in range(cfg.max_turns):
@@ -222,13 +259,14 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
         # ★ 临近回合上限时注入一次收尾提醒。没有它，模型会把回合跑满也不 finish
         #   （实测 mean_turns == max_turns、accept=0，整轮 proposer 白跑）。
         _left = cfg.max_turns - turn
-        if _left <= NUDGE_WHEN_LEFT:
+        if cfg.finish_nudge and _left <= NUDGE_WHEN_LEFT:
             for s in idxs:
                 if not stats[s].get("nudged"):
-                    messages[s].append({"role": "user", "content": FINISH_NUDGE.format(
-                        remaining=_left, total=cfg.max_turns)})
+                    nudge = FINISH_NUDGE.format(remaining=_left, total=cfg.max_turns)
+                    messages[s].append({"role": "user", "content": nudge})
+                    add_feedback_tokens(s, nudge)
                     stats[s]["nudged"] = 1
-        texts, gen_ids, _ = policy.generate([messages[s] for s in idxs], gen_cfg)
+        texts, gen_ids, _ = policy.generate_from_token_ids([token_buffers[s] for s in idxs], gen_cfg)
 
         # ---- 解析 + 分类 ----
         env_actions = ["look"] * g
@@ -237,6 +275,8 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
             parsed = parse_tool_call(texts[k])
             messages[s].append({"role": "assistant", "content": texts[k].strip()})
             gen_ids_log[s].append(list(gen_ids[k]))
+            token_buffers[s].extend(gen_ids[k])
+            token_masks[s].extend([1] * len(gen_ids[k]))
             stats[s]["turns"] += 1
             # ★ 工具调用之后还有多余内容？说明"一轮一动作"没被停止条件拦住。
             #   这里**只统计不裁剪**：build_token_sequence 要求 assistant 段用模型真实
@@ -249,10 +289,11 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
             if parsed.kind == "malformed":
                 stats[s]["fmt"] += 1
                 todo.append((s, parsed, ""))
-            elif parsed.kind in ("sub_finish", "finish"):
+            elif parsed.kind in ("declare", "sub_finish", "finish"):
                 todo.append((s, parsed, ""))
             else:
-                executed, exact = sanitize_explore_action(parsed.action, admissible[s])
+                executed, exact = sanitize_explore_action(parsed.action, admissible[s],
+                                                          mode=cfg.invalid_action_mode)
                 if not exact:
                     stats[s]["inv"] += 1
                 action_bufs[s].append(executed)
@@ -284,10 +325,11 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                 messages[s].append({"role": "user", "content":
                     "Your last response was not a valid tool call. Emit exactly one "
                     "<tool_call>{...}</tool_call> block."})
+                add_feedback_tokens(s, messages[s][-1]["content"])
                 continue
             if parsed.kind == "sub_finish":
                 # 快照当前状态（子任务由**上一步动作**完成，此刻状态即参考状态）
-                delta = state_delta(s0_snaps[s], cur_snaps[s])
+                delta = state_delta(s0_snaps[s], cur_snaps[s], parsed.task_description)
                 if not delta.is_empty():
                     subtask_bufs[s].append(SubtaskRef(
                         description=parsed.task_description,
@@ -296,11 +338,21 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                     append_tool_result(messages[s], "sub_finish",
                                        f"Recorded subtask: {parsed.task_description}",
                                        admissible[s] if cfg.give_admissible else ())
+                    add_feedback_tokens(s, messages[s][-1]["content"])
                 else:
                     stats[s]["dropped_sub"] = stats[s].get("dropped_sub", 0) + 1
                     messages[s].append({"role": "user", "content":
                         "sub_finish ignored: the world state did not change. Declare a "
                         "subtask only right after a state-changing action."})
+                    add_feedback_tokens(s, messages[s][-1]["content"])
+                continue
+            if parsed.kind == "declare":
+                # Phase metadata only: a declaration has no achieved state and cannot
+                # count as a subtask or reward component.
+                stats[s]["declared_task"] = parsed.task_description
+                messages[s].append({"role": "user", "content":
+                    f"Task intent recorded: {parsed.task_description}. Continue with actions."})
+                add_feedback_tokens(s, messages[s][-1]["content"])
                 continue
             if parsed.kind == "finish":
                 final_snap = cur_snaps[s]
@@ -308,12 +360,13 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                     task_desc=parsed.task_description,
                     s0=s0_snaps[s],
                     ref_final=final_snap,
-                    ref_final_delta=state_delta(s0_snaps[s], final_snap),
+                    ref_final_delta=state_delta(s0_snaps[s], final_snap, parsed.task_description),
                     subtasks=subtask_bufs[s],
                     game_file=used[s] if s < len(used) else game_file,
                     proposer_actions=action_bufs[s],
                     proposer_action_types=[action_type(a) for a in action_bufs[s]],
-                    meta={"proposer_turns": stats[s]["turns"]},
+                    meta={"proposer_turns": stats[s]["turns"],
+                          "declared_intent": stats[s].get("declared_task", "")},
                 )
                 ok, reason = validity_filter(task)
                 stats[s]["_task"] = task
@@ -328,6 +381,7 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
                 if parsed.kind == "action" and active[s]:
                     adm = bs.admissible[s] if cfg.give_admissible else ()
                     append_tool_result(messages[s], executed, bs.obs[s], adm)
+                    add_feedback_tokens(s, messages[s][-1]["content"])
                     admissible[s] = list(bs.admissible[s])
 
     # ---- 收尾：没 finish 的轨迹 = 无效提案（论文：无 finish 任务描述直接拒）----
@@ -343,6 +397,8 @@ def run_proposer_exploration(env, policy, game_file: str, cfg: ProposerConfig,
             n_turns=stats[s]["turns"], n_format_violation=stats[s]["fmt"],
             n_invalid_action=stats[s]["inv"],
         ))
+        rollouts[-1].training_ids = token_buffers[s]
+        rollouts[-1].training_mask = token_masks[s]
 
     if log_fn:
         acc = sum(1 for r in rollouts if r.accepted)

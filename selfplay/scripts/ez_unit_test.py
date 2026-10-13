@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -19,6 +20,7 @@ from ez_verify import (ProposedTask, SubtaskRef, action_type,  # noqa: E402
                        proposer_reward, redundant_pair, validity_filter,
                        verify_solver_rollout)
 from rollout import _ToolCallStopCriteria, scan_bare_json_call  # noqa: E402
+from ez_dist import choose_pool_indices, local_group_size, shard_group  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -35,7 +37,7 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 
 
 def snap(facts) -> StateSnapshot:
-    return StateSnapshot(facts=frozenset(normalize_fact(f) for f in facts), mode="facts")
+    return StateSnapshot(facts=tuple(normalize_fact(f) for f in facts), mode="facts")
 
 
 print("== 实例归一化 ==")
@@ -52,8 +54,8 @@ S3 = snap(["at(agent, kitchen)", "open(fridge 1)", "held(apple 1)",
            "sliced(apple 1)"])                                                  # 多切了一刀
 
 d_open = state_delta(S0, S1)
-check("开冰箱 delta=removed closed", d_open.removed == frozenset({"closed(fridge)"}))
-check("开冰箱 delta=added open", d_open.added == frozenset({"open(fridge)"}))
+check("开冰箱 delta=removed closed", Counter(d_open.removed) == Counter({"closed(fridge)": 1}))
+check("开冰箱 delta=added open", Counter(d_open.added) == Counter({"open(fridge)": 1}))
 check("覆盖：S2 包含 open 变化", delta_covers(d_open, state_delta(S0, S2)))
 check("不覆盖：S1 不含 take 变化",
       not delta_covers(state_delta(S0, S2), d_open))
@@ -281,51 +283,22 @@ check("fallback 相同观测无变化", state_delta(fa, fb).is_empty())
 check("fallback 不同观测有变化", not state_delta(fa, fc).is_empty())
 check("fallback 匹配", match_reference(fa, fc, [fa, fc]))
 
-print("== 多卡采样：跨 rank 不得重复（job 12989532 实测踩到的真 bug）==")
-# ★ 背景：solver 相位旧写法是 `rng.sample(outer_pool, k)`，
-#   而 rng 是 `random.Random(seed)` —— 各 rank 的 seed 完全相同
-#   （`set_seed(seed, rank)` 里的 `seed + rank` 只是局部变量，改不到这里），
-#   池子又经 all_gather 后完全一致 ⇒ 所有 rank 采到同一批任务。
-#   实测 8 卡 k=1：rank1..rank7 全部采到同一个任务，全局只用到 2 个不同任务，
-#   有效 batch 缩水到 25%。
-#   修法两条：① rng 加 rank 偏移 ② 采样改成按 rank 分片（本例验证的是 ②）。
-POOL = list(range(24))
-for _world in (2, 4, 8):
-    _k = max(1, 8 // _world)
-    _picked = [tuple(POOL[(r + i * _world) % len(POOL)] for i in range(_k))
-               for r in range(_world)]
-    _all = [t for p in _picked for t in p]
-    _uniq = len(set(_all))
-    check(f"world={_world} 分片采样：{_uniq}/{len(_all)} 个不同任务（应==总数）",
-          _uniq == len(_all), f"采到 {_picked}")
-    check(f"world={_world} 各 rank 条数一致（红线 B）",
-          len({len(p) for p in _picked}) == 1, f"{[len(p) for p in _picked]}")
-
-# 对照：旧写法（rng 不带 rank 偏移）确实会采重 —— 把这个退化行为也钉住，
-# 免得有人"优化"回 rng.sample 而没加 rank 偏移。
-import random as _random                                     # noqa: E402
-
-# ① 纯 rng（无人额外消耗）：8 个 rank 采到**完全相同**的一批
-_old = []
-for _r in range(8):
-    _rng = _random.Random(42)
-    _old.append(tuple(_rng.sample(POOL, k=1)))
-check("旧写法(random.Random(42) 不分片)：8 个 rank 采到同一批（bug 复现）",
-      len(set(_old)) == 1, f"{_old}")
-
-# ② 真实情形：rank0 在 proposer 相位调过 rng.choice，所以只有它不同
-_old2 = []
-for _r in range(8):
-    _rng = _random.Random(42)
-    if _r == 0:
-        for _ in range(8):                    # 复现行 558 的 `rng.choice(game_files)`
-            _rng.choice(range(3553))
-    _old2.append(tuple(_rng.sample(POOL, k=1)))
-check("旧写法(rank0 消耗过 rng)：全局只有 2 个不同任务，有效 batch 25%",
-      len(set(_old2)) == 2, f"{set(_old2)}")
-check("旧写法退化了：rank1..7 全部撞车",
-      len(set(_old2[1:])) == 1, f"{_old2[1:]}")
-
+print("== 全局 GRPO 组分片与跨 step 任务覆盖 ==")
+_POOL = list(range(24))
+_WORLD, _G = 8, 16
+_LOCAL_G = local_group_size(_G, _WORLD)
+_shards = [shard_group(list(range(_G)), r, _WORLD) for r in range(_WORLD)]
+check("global G=16 在 8 rank 上每 rank 采 2 条", _LOCAL_G == 2 and all(len(x) == 2 for x in _shards))
+check("同一全局组的 rank 分片可无损重建", [x for i in range(_LOCAL_G) for x in [s[i] for s in _shards]] == list(range(_G)))
+try:
+    local_group_size(15, 8)
+    _divisible = False
+except ValueError:
+    _divisible = True
+check("global G 不能整除 world 时明确失败", _divisible)
+_batches = [choose_pool_indices(len(_POOL), 5, step, seed=42) for step in range(6)]
+check("每步任务 uid 不重复", all(len(b) == len(set(b)) == 5 for b in _batches))
+check("跨 step 轮转覆盖完整任务池", set(i for b in _batches for i in b) == set(_POOL))
 # ===========================================================================
 # grpo_loss 的归约口径：token 级 vs 序列级（2026-10-12 交叉 review 抓到的真 bug）
 #

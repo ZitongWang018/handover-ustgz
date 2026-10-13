@@ -207,6 +207,40 @@ def _facts_or_none(infos: Dict[str, Any], n: int) -> List[Any]:
     return out[:n]
 
 
+class _IgnoreDoneCoreWrapper:
+    """Pickle-safe TextWorld core wrapper preserving won while suppressing only done."""
+    def __init__(self, env):
+        self._wrapped_env = env
+
+    def __getattr__(self, name):
+        wrapped = self.__dict__.get("_wrapped_env")
+        if wrapped is None:
+            raise AttributeError(name)
+        return getattr(wrapped, name)
+
+    def reset(self):
+        return self._wrapped_env.reset()
+
+    def step(self, command):
+        state, score, done = self._wrapped_env.step(command)  # TextWorld core API is 3-tuple
+        lost = bool(getattr(state, "lost", False))
+        try:
+            lost = bool(state["lost"])
+            state["done"] = lost
+        except (TypeError, KeyError, AttributeError):
+            try:
+                state.done = lost
+            except (AttributeError, TypeError):
+                pass
+        return state, score, lost
+
+
+class IgnoreBenchmarkDone:
+    """TextWorld wrapper factory, safe to pickle into AsyncBatchEnv workers."""
+    def __call__(self, env):
+        return _IgnoreDoneCoreWrapper(env)
+
+
 class ALFWorldBatchEnv:
     """`textworld.gym` 批量环境的一层薄封装。
 
@@ -224,6 +258,7 @@ class ALFWorldBatchEnv:
         game_files: Optional[Sequence[str]] = None,
         with_expert: bool = False,
         with_facts: bool = False,   # EZ：请求 textworld facts（状态快照验证用）
+        ignore_benchmark_done: bool = False,
     ) -> None:
         if split not in SPLITS:
             raise ValueError(f"split 必须是 {list(SPLITS)} 之一，收到 {split!r}")
@@ -240,6 +275,7 @@ class ALFWorldBatchEnv:
         self.seed_value = seed
         self.with_expert = with_expert
         self.with_facts = with_facts
+        self.ignore_benchmark_done = ignore_benchmark_done
 
         self._alfred = AlfredTWEnv(config, train_eval=split)
         if game_files is not None:
@@ -304,12 +340,21 @@ class ALFWorldBatchEnv:
             wrappers.append(AlfredExpert(expert_type))
             request_infos.extras.append("expert_plan")
 
+        if self.ignore_benchmark_done:
+            # TextWorld's benchmark goal can finish before the generated EZ task.
+            # Keep its state/won info but suppress only the won-driven done signal;
+            # retain episode limits by adding Limit as the outermost user wrapper.
+            from functools import partial
+            from textworld.envs.wrappers.limit import Limit
+            wrappers.append(IgnoreBenchmarkDone())
+            wrappers.append(partial(Limit, max_episode_steps=max_nb_steps_per_episode))
+
         env_id = textworld.gym.register_games(
             self._alfred.game_files,
             request_infos,
             batch_size=batch_size,
             asynchronous=True,
-            max_episode_steps=max_nb_steps_per_episode,
+            max_episode_steps=None if self.ignore_benchmark_done else max_nb_steps_per_episode,
             wrappers=wrappers,
         )
         return textworld.gym.make(env_id)

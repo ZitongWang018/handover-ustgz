@@ -77,3 +77,9 @@ squeue -u xyu608                                  # 看队列
 3. **8 卡作业**：二期只能提交到 `i64m1tga800u8ka` / `i64m1tga40u8ka`；三期用 `acd_u`。
 
 详见 `docs/CLUSTER_GUIDE.md`。
+
+## Self-play: mainline and Explorer-Zero
+
+The ordinary self-play trainer remains the mainline path (`selfplay/src/train_grpo.py`) and keeps its existing DDP/evaluation protocol. Explorer-Zero is a separate alternating proposer/solver implementation (`selfplay/src/ez_train.py`) with global GRPO group sharding and explicit LoRA gradient synchronization. Its base model path must be supplied as `ZTWANG_MODEL_PATH`; do not substitute an instruct checkpoint implicitly.
+
+Read [`docs/EZ_REPAIR_PLAN.md`](docs/EZ_REPAIR_PLAN.md) for the current implementation boundary and acceptance checklist. The hpc2 eight-A800 smoke and formal launch templates are [`selfplay/scripts/ez_smoke_8gpu.sbatch`](selfplay/scripts/ez_smoke_8gpu.sbatch) and [`selfplay/scripts/ez_train_a800x8.sbatch`](selfplay/scripts/ez_train_a800x8.sbatch). EZ valid-unseen adapter and base-control evaluation uses [`selfplay/src/eval_ez.py`](selfplay/src/eval_ez.py); the existing `eval_alfworld.py` remains the mainline evaluator.

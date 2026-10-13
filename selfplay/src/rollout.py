@@ -49,6 +49,7 @@ class RolloutConfig:
     stop_mode: str = "action_line"
     seed: Optional[int] = None
     log_every: int = 0
+    max_batch_size: int = 0             # 0 keeps mainline legacy batching
 
 
 # --------------------------------------------------------------------------- 数据结构
@@ -103,9 +104,7 @@ class HFPolicy:
 
     # ---- chat 模板 ----
     def render(self, messages: Sequence[Dict[str, str]], add_generation_prompt: bool = False) -> str:
-        kwargs = {}
-        if self.enable_thinking:
-            kwargs["enable_thinking"] = True
+        kwargs = {"enable_thinking": bool(self.enable_thinking)}
         try:
             return self.tokenizer.apply_chat_template(
                 list(messages), tokenize=False, add_generation_prompt=add_generation_prompt, **kwargs
@@ -118,41 +117,96 @@ class HFPolicy:
     def tokenize_text(self, text: str) -> List[int]:
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
+    def initial_prompt_ids(self, messages: Sequence[Dict[str, str]], cfg: RolloutConfig) -> List[int]:
+        truncated = self.truncate_messages(list(messages), cfg)
+        return self.tokenize_text(self.render(truncated, add_generation_prompt=True))
+
+    def append_feedback_ids(self, content: str) -> List[int]:
+        return self.tokenize_text(self.render([{"role": "user", "content": content}]))
+
+    def assistant_end_ids(self) -> List[int]:
+        # TextWorld/Qwen3 template's completed assistant boundary.
+        return self.tokenize_text("<|im_end|>\n")
+
+    def next_generation_prefix_ids(self, feedback: str) -> List[int]:
+        msgs = [{"role": "user", "content": feedback}]
+        complete = self.tokenize_text(self.render(msgs))
+        prompt = self.tokenize_text(self.render(msgs, add_generation_prompt=True))
+        if prompt[:len(complete)] != complete:
+            raise RuntimeError("chat template generation prefix is not a stable suffix after user feedback")
+        return prompt[len(complete):]
+
     def truncate_messages(self, messages: List[Dict[str, str]], cfg: RolloutConfig) -> List[Dict[str, str]]:
-        """prompt 太长时丢掉中间最老的若干轮，保留 system + 第一轮(含任务) + 最近若干轮。"""
-        text = self.render(messages, add_generation_prompt=True)
-        if len(self.tokenize_text(text)) <= cfg.max_context_tokens:
-            return messages
-        n_keep = max(2, 2 * cfg.keep_recent_turns)
-        if len(messages) <= n_keep:
-            return messages
-        # ⚠️ 尾部窗口的起点必须跳过前 2 条（system + 首个 user），否则会**重复拼一遍**。
-        #    原写法 `head[:-1] + [head[-1]] + tail`（等价于 `head + tail`）在消息数不足时
-        #    会让 system 和首个 user 各出现两次 —— 短轨迹（3~4 轮）正好命中。
-        tail_start = max(2, len(messages) - n_keep)
-        tail = messages[tail_start:]
-        # 保证是 user 开头，避免出现 assistant/user 角色错乱
-        while tail and tail[0]["role"] == "assistant":
-            tail = tail[1:]
-        return messages[:2] + tail
+        """Fit the prompt and reserved generation budget, dropping whole old turns."""
+        budget = max(2, cfg.max_context_tokens - cfg.max_new_tokens)
+        kept = list(messages)
+        if len(kept) < 2:
+            return kept
+        while len(self.tokenize_text(self.render(kept, add_generation_prompt=True))) > budget:
+            if len(kept) <= 2:
+                raise ValueError("system/task prompt alone exceeds context budget")
+            # Remove one complete old exchange: an assistant response plus all
+            # following user feedback/nudges up to the next assistant response.
+            assistant_boundaries = [i for i in range(2, len(kept))
+                                    if kept[i]["role"] == "assistant"]
+            end = assistant_boundaries[1] if len(assistant_boundaries) > 1 else len(kept)
+            del kept[2:end]
+        return kept
 
     # ---- 生成 ----
     def generate(self, messages_list: Sequence[Sequence[Dict[str, str]]], cfg: RolloutConfig) -> Tuple[List[str], List[List[int]], List[int]]:
+        """Length-sort and split prompt batches to bound transient KV cache."""
+        if not messages_list:
+            return [], [], []
+        chunk = len(messages_list) if int(cfg.max_batch_size) <= 0 else int(cfg.max_batch_size)
+        rendered = [self.truncate_messages(list(m), cfg) for m in messages_list]
+        lengths = [len(self.tokenize_text(self.render(m, add_generation_prompt=True))) for m in rendered]
+        order = sorted(range(len(rendered)), key=lambda i: lengths[i])
+        texts, ids, stops = [None] * len(order), [None] * len(order), [None] * len(order)
+        for start in range(0, len(order), chunk):
+            idx = order[start:start + chunk]
+            out = self._generate_batch([rendered[i] for i in idx], cfg)
+            for j, original in enumerate(idx):
+                texts[original], ids[original], stops[original] = out[0][j], out[1][j], out[2][j]
+        return texts, ids, stops
+
+    def generate_from_token_ids(self, prompt_ids_list: Sequence[Sequence[int]],
+                                cfg: RolloutConfig) -> Tuple[List[str], List[List[int]], List[int]]:
+        """Generate from exact token-native histories, preserving sampled prefixes."""
+        if not prompt_ids_list:
+            return [], [], []
+        budget = int(cfg.max_context_tokens)
+        if any(len(ids) + cfg.max_new_tokens > budget for ids in prompt_ids_list):
+            raise ValueError("EZ conversation exceeded hard context budget; refusing off-policy truncation")
+        chunk = len(prompt_ids_list) if int(cfg.max_batch_size) <= 0 else int(cfg.max_batch_size)
+        order = sorted(range(len(prompt_ids_list)), key=lambda i: len(prompt_ids_list[i]))
+        texts, ids, stops = [None] * len(order), [None] * len(order), [None] * len(order)
+        for start in range(0, len(order), chunk):
+            idx = order[start:start + chunk]
+            out = self._generate_batch([], cfg, prompt_ids_list=[prompt_ids_list[i] for i in idx])
+            for j, original in enumerate(idx):
+                texts[original], ids[original], stops[original] = out[0][j], out[1][j], out[2][j]
+        return texts, ids, stops
+
+    def _generate_batch(self, messages_list: Sequence[Sequence[Dict[str, str]]], cfg: RolloutConfig,
+                        prompt_ids_list: Optional[Sequence[Sequence[int]]] = None) -> Tuple[List[str], List[List[int]], List[int]]:
         """返回 (texts, gen_ids, stop_len)。
 
         `stop_len[i]` 是"该行已经可以停下"的生成长度（含触发停止的那个换行）。
         """
         torch = self.torch
-        prompts = [
-            self.render(self.truncate_messages(list(m), cfg), add_generation_prompt=True)
-            for m in messages_list
-        ]
         # 生成必须用左 padding，否则右侧 pad 会被当成上下文
         prev_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         try:
-            enc = self.tokenizer(list(prompts), return_tensors="pt", padding=True,
-                                 add_special_tokens=False).to(self.device)
+            if prompt_ids_list is None:
+                prompts = [self.render(self.truncate_messages(list(m), cfg), add_generation_prompt=True)
+                           for m in messages_list]
+                enc = self.tokenizer(list(prompts), return_tensors="pt", padding=True,
+                                     add_special_tokens=False).to(self.device)
+            else:
+                enc = self.tokenizer.pad({"input_ids": [list(x) for x in prompt_ids_list]},
+                                         padding=True, return_tensors="pt").to(self.device)
         finally:
             self.tokenizer.padding_side = prev_side
         # ⚠️⚠️ 左 padding 时"生成段起点"是**含 padding 的初始总长度**，
@@ -179,6 +233,7 @@ class HFPolicy:
             do_sample=cfg.temperature > 0,
             temperature=max(cfg.temperature, 1e-5),
             top_p=cfg.top_p,
+            top_k=max(0, int(cfg.top_k)),
             repetition_penalty=cfg.repetition_penalty,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
@@ -189,6 +244,15 @@ class HFPolicy:
             gen_kwargs["top_k"] = cfg.top_k
         if cfg.min_p and cfg.min_p > 0:
             gen_kwargs["min_p"] = cfg.min_p
+        # This is safe for Qwen3's selective lm_head path. Other model families
+        # fall back to their ordinary generation path.
+        import inspect
+        lm = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        try:
+            if "logits_to_keep" in inspect.signature(lm.forward).parameters:
+                gen_kwargs["logits_to_keep"] = 1
+        except (TypeError, ValueError):
+            pass
 
         # ⚠️⚠️ gradient_checkpointing + generate() 会让 Qwen3 输出**变乱码**。
         #
@@ -281,6 +345,7 @@ class _ActionStopCriteria:
         self.check_every = check_every
         self._stop: Dict[int, int] = {}
         self._step = 0
+        self.torch = __import__("torch")
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
         from prompts import stop_text_finished
@@ -298,7 +363,15 @@ class _ActionStopCriteria:
             text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:], skip_special_tokens=True)
             if stop_text_finished(text):
                 self._stop[i] = generated_len
-        return len(self._stop) >= rows if rows else True
+        return self._finished(input_ids, rows)
+
+    def _finished(self, input_ids, rows):
+        if len(self._stop) == rows:
+            return True
+        if isinstance(input_ids, self.torch.Tensor):
+            return self.torch.tensor([i in self._stop for i in range(rows)],
+                                     dtype=self.torch.bool, device=input_ids.device)
+        return False
 
     def stop_len(self, row: int, fallback: int) -> int:
         """返回该行的生成长度（相对 prompt 的偏移）。"""
@@ -330,6 +403,7 @@ class _ToolCallStopCriteria:
         self.check_every = check_every
         self._stop: Dict[int, int] = {}
         self._step = 0
+        self.torch = __import__("torch")
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
         self._step += 1
@@ -345,7 +419,22 @@ class _ToolCallStopCriteria:
             text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:], skip_special_tokens=True)
             if self.CLOSE in text or scan_bare_json_call(text) is not None:
                 self._stop[i] = generated_len
-        return len(self._stop) >= rows if rows else True
+        return self._finished(input_ids, rows)
+
+    def _finished(self, input_ids, rows):
+        if rows == 0:
+            return True
+        # Transformers accepts a per-row bool tensor and suppresses finished rows.
+        # Older fakes/tests may pass ordinary lists and expect a scalar bool.
+        if hasattr(input_ids, "new_zeros"):
+            mask = input_ids.new_zeros((rows,), dtype=self.torch.bool) if hasattr(self, "torch") else None
+            if mask is None:
+                import torch
+                mask = torch.zeros((rows,), dtype=torch.bool, device=input_ids.device)
+            for i in self._stop:
+                mask[i] = True
+            return mask
+        return len(self._stop) >= rows
 
     def stop_len(self, row: int, fallback: int) -> int:
         return self._stop.get(row, fallback)
@@ -492,7 +581,7 @@ def build_token_sequence(
 
     * **assistant 段**：模型**真实生成**的 token id（mask=1）——不是把生成文本重新 tokenize
       （那会引入 "解码→再编码" 的偏差，实测会多出 1 个 token 混进训练目标）；
-    * **模板收尾**：assistant 内容之后的 `<|im_end|>` 等，也留 mask=1（模型本来就该学它）；
+    * **模板收尾**：assistant 内容之后的 `<|im_end|>` 等，mask=0；只有采样器返回的真实 token 可训练；
     * **其余段**（chat 模板骨架 + 环境观测）：模板重新渲染出来的 token，mask=0。
 
     实现要点：维护两个游标 —— `ids` 是我们真正输出的序列，`rlen` 是**纯模板渲染序列**上的游标。
@@ -534,7 +623,7 @@ def build_token_sequence(
                 ids.extend(gen)
                 mask.extend([1] * len(gen))
                 ids.extend(tail)
-                mask.extend([1] * len(tail))
+                mask.extend([0] * len(tail))
                 boundaries.append(len(ids))
             else:
                 # 没有生成任何 token：整段按 mask=0 处理（不该训练空输出）
@@ -545,13 +634,21 @@ def build_token_sequence(
             rlen = len(full_r)          # 渲染游标推进到该 assistant 消息在**纯模板**下的完整长度
         else:
             cur = _render_ids(messages[:i + 1], gen_prompt=False)
+            if prev_render and cur[:len(prev_render)] != prev_render:
+                raise RuntimeError(
+                    "chat template is not prefix-stable; legacy transcript builder cannot "
+                    "preserve the sampled token history. Use token-native EZ rollout or a "
+                    "prefix-stable template."
+                )
             new = cur[rlen:]
-            if len(new) < 0:
-                raise RuntimeError("chat 模板不是前缀稳定的，无法增量拼接 token —— 请检查 tokenizer 配置")
+            if len(cur) < rlen:
+                raise RuntimeError("chat template render length regressed; refusing lossy sequence")
             ids.extend(new)
             mask.extend([0] * len(new))
             prev_render = cur
             rlen = len(cur)
+    if assistant_idx != len(gen_ids_per_assistant):
+        raise RuntimeError("gen_ids count does not match assistant messages")
     return ids, mask, boundaries
 
 

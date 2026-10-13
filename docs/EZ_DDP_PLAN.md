@@ -1,5 +1,8 @@
 # Explorer-Zero 8 卡 DDP 方案
 
+> **状态：本计划已被 [`EZ_REPAIR_PLAN.md`](EZ_REPAIR_PLAN.md) 取代。**
+> 下文保留为历史设计记录，其中“整组按 game 分片、TPS 随 world 增长、DDP hook 同步 LoRA”等描述不代表当前实现。当前 EZ 使用全局 G 组分片与显式 LoRA 梯度 all-reduce；请以新文档和源码为准。
+
 > 📌 **本文档只管"8 卡能不能跑起来"（DDP 接线）。**
 > **"算法语义对不对"另见 [`EZ_ALGO_REVIEW.md`](EZ_ALGO_REVIEW.md)** ——
 > 那边记的是 2026-10-12 用两个不同模型交叉 review、再逐条回源码核实的结果，

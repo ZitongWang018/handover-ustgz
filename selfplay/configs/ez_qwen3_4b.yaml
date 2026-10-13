@@ -41,7 +41,6 @@ solver:
   max_new_tokens: 96
   temperature: 1.0
   max_context_tokens: 40960           # Table 3
-  keep_recent_turns: 12               # 偏差：40960 理论上能留更多轮；先按主线保守值，smoke 后调
 
 train:
   outer_loops: 4                      # N（Table 3）
@@ -49,7 +48,7 @@ train:
   solver_steps: 25                    # M_S（Table 3）
   group_size: 16                      # G（Table 3）
   solve_rate_rollouts: 8              # G_P（Appendix C）
-  tasks_per_step: 2                   # 偏差 U5：论文 batch/rollouts 编排未写死，取务实值
+  tasks_per_step: 1                   # global task groups/step; eight-card default stays 1
   lr: 1.0e-4                          # Table 3
   weight_decay: 0.0
   clip_eps: 0.3                       # Table 3: ε1=ε2=0.3
@@ -66,4 +65,8 @@ train:
   max_grad_norm: 1.0
   w_sub: 0.3                          # Table 3
   w_div: 0.3                          # Table 3
-  # TODO(复现偏差): Table 3 的 KL penalty β=0.001 暂未实现（主线 GRPO 内核无参考模型）
+  micro_batch_size: 1                 # accumulate all local samples before one update
+  kl_beta: 0.001                      # frozen base reference via PEFT disable_adapter()
+  sync_bucket_mb: 25
+  check_adapter_sync_every: 5             # plus first update of every phase
+  generation_max_batch_size: 2

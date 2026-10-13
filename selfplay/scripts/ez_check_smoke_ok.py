@@ -79,6 +79,8 @@ GRADCHAIN_RE = re.compile(r"\[selfcheck\]\s*梯度链\s*proposer grad_norm=(?P<p
 #   S 相位： [outer 2][S0] 诊断 真实 backward grad_norm=0.0000e+00 (0 个张量有 grad；A=.. B=..)
 GN_RE = re.compile(r"\[outer (?P<outer>\d+)\]\[(?P<phase>[PS])(?P<step>\d+)\]\s*诊断"
                    r".*?真实 backward grad_norm=(?P<gn>[0-9.eE+-]+)")
+SYNC_RE = re.compile(r"\[adapter-sync\] phase=(?P<phase>proposer|solver) step=\d+ "
+                     r"status=PASS max_abs=(?P<max>[0-9.eE+-]+)")
 
 
 def _gn_key(m) -> str:
@@ -162,6 +164,7 @@ def main() -> int:
     per_rank: dict[int, list[float]] = {}
     per_rank_gn: dict[int, list[float]] = {}
     per_rank_acc: dict[int, list[tuple[int, int]]] = {}
+    per_rank_sync: dict[int, set[str]] = {}
     worlds: set[int] = set()
     empty: list[str] = []
     for rf in rank_files:
@@ -169,6 +172,7 @@ def main() -> int:
         vals: list[float] = []
         gns: list[float] = []
         accs_r: list[tuple[int, int]] = []
+        syncs_r: set[str] = set()
         n_lines = 0
         with open(rf) as fh:
             for line in fh:
@@ -188,11 +192,14 @@ def main() -> int:
                     gns.append(_fnum(mg.group("gn")))
                 if (mp := PPLINE_RE.search(m_)):
                     accs_r.append((int(mp.group("acc")), int(mp.group("tot"))))
+                if (ms := SYNC_RE.search(m_)):
+                    syncs_r.add(ms.group("phase"))
         if n_lines == 0:
             empty.append(rf.name)
         per_rank[rk] = vals
         per_rank_gn[rk] = gns
         per_rank_acc[rk] = accs_r
+        per_rank_sync[rk] = syncs_r
 
     # ---- 关0：梯度链自检（最权威的一条）----
     gc = None
@@ -364,6 +371,12 @@ def main() -> int:
             if len(rank_files) < 2 and args.strict:
                 findings.append((WARN, f"关4 只找到 {len(rank_files)} 个 rank 日志 —— "
                                        f"以为在跑 8 卡？检查 torchrun --nproc_per_node"))
+            missing_sync = [r for r in range(max(worlds or {0}))
+                            if not {"proposer", "solver"}.issubset(per_rank_sync.get(r, set()))]
+            if missing_sync:
+                findings.append((FATAL, f"关4 各 rank 缺少真实参数跨 rank 一致性 PASS 日志（P/S）：{missing_sync}"))
+            else:
+                findings.append((OK, f"关4 每个 rank 都记录 proposer/solver adapter 参数同步 PASS"))
             peaks = {r: max(v) for r, v in per_rank.items() if v}
             gn_pk = {r: max(v) for r, v in per_rank_gn.items() if v}
             if len(peaks) >= 2:
@@ -410,9 +423,9 @@ def main() -> int:
         return 1
     _gn_any = max(gn_map.values()) if gn_map else None
     if _gn_any == 0.0:
-        print("\n结论：条件通过 —— 链路通、无致命项，且各相位**真实 backward grad_norm 全为 0**"
+        print("\n结论：结构/通信条件通过，学习信号未验证 —— 链路通、无致命项，且各相位**真实 backward grad_norm 全为 0**"
               "\n      （奖励全同分 ⇒ 组内优势全 0 ⇒ 梯度精确为 0 ⇒ 参数不动是正确的）。"
-              "\n      即：DDP/梯度链路已验证，但本发没有任何学习信号。"
+              "\n      本发不构成学习有效性证据；显式 adapter 参数同步 PASS 仅证明 rank 一致。"
               "\n      → 要拿到「参数真的动了」的硬证据，加大规模再跑一次："
               "\n        sbatch --export=ALL,EZ_SMOKE_G=4,EZ_SMOKE_TURNS=16 ... ez_smoke_1gpu.sbatch")
         return 0

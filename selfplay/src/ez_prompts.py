@@ -27,7 +27,7 @@ always emit it wrapped as `{"name":"alfworld_tool","arguments":{...}}` inside
 - Slice: Slice an object. `{"action_type": "slice", "object_name": "apple 1", "receptacle_name": "knife 1"}`"""
 
 PROPOSER_SYSTEM = """You are an AI agent exploring ALFWorld, a text-based household environment.
-You are NOT given a task.
+You are NOT given a task. First declare the task you intend to pursue with `declare_task`.
 Your job is to EXPLORE this scene by interacting with it, and DISCOVER an interesting task
 that could be done here.
 Take a sequence of actions that changes the state of the world ... Aim for about 10 to 20
@@ -95,6 +95,7 @@ Your goal is to complete household tasks by interacting with objects.
 IMPORTANT: You MUST respond in the following format:
 1. The <think></think> tags stay empty; write your brief plain-text plan AFTER them
 2. Then, output your action in <tool_call></tool_call> tags
+3. You are given the task; do not emit proposer declarations.
 *** ONE ACTION PER RESPONSE -- THEN STOP IMMEDIATELY. ***
 Emit EXACTLY ONE <tool_call></tool_call> block per response and end your response right after
 its closing tag. Do not write a second tool call, do not keep planning further steps.

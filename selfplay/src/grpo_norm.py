@@ -43,7 +43,8 @@ TOKEN_LEVEL = "token"
 
 def grpo_reduce(per_tok: torch.Tensor,
                 mask: torch.Tensor,
-                loss_norm: str = SEQUENCE_LEVEL) -> torch.Tensor:
+                loss_norm: str = SEQUENCE_LEVEL,
+                sequence_reduction: str = "mean") -> torch.Tensor:
     """把 per-token surrogate 张量归约成标量 loss。
 
     参数：
@@ -54,9 +55,14 @@ def grpo_reduce(per_tok: torch.Tensor,
     返回：标量 loss。**保证挂在计算图上**（见下面 mask 全 0 的兜底分支）。
     """
     denom = mask.sum().clamp(min=1.0)
+    if sequence_reduction not in ("mean", "sum"):
+        raise ValueError("sequence_reduction must be 'mean' or 'sum'")
 
     if loss_norm == TOKEN_LEVEL:
-        return (per_tok * mask).sum() / denom
+        if sequence_reduction == "sum":
+            raise ValueError("sequence_reduction='sum' is defined only for seq normalization")
+        value = (per_tok * mask).sum() / denom
+        return value
 
     if loss_norm != SEQUENCE_LEVEL:
         raise ValueError(
@@ -67,7 +73,8 @@ def grpo_reduce(per_tok: torch.Tensor,
     seq_sum = (per_tok * mask).sum(dim=1)       # (n,)
     ok = n_tok > 0                              # mask 全 0 的行不能进平均，否则会稀释
     if bool(ok.any()):
-        return (seq_sum[ok] / n_tok[ok].clamp(min=1.0)).mean()
+        seq_values = seq_sum[ok] / n_tok[ok].clamp(min=1.0)
+        return seq_values.sum() if sequence_reduction == "sum" else seq_values.mean()
 
     # 整批 mask 全 0：不能 `return torch.zeros(())` —— 那样 loss 没有 grad_fn，
     # 外层 `(loss / len(groups)).backward()` 会直接抛错，本 rank 就少一次

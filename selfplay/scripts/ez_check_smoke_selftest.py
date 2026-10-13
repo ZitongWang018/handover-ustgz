@@ -107,6 +107,8 @@ def _rank_msgs(rel_by_rank, world=8, n_files=None, gradchain=GRADCHAIN, facts=FA
         _acc = accept if accept_by_rank is None else accept_by_rank.get(r, accept)
         _acc = 1 if _acc is None else _acc
         out[r] = [_dist_line(r, world), facts, gradchain,
+                  "[adapter-sync] phase=proposer step=0 status=PASS max_abs=0.000e+00",
+                  "[adapter-sync] phase=solver step=0 status=PASS max_abs=0.000e+00",
                   _p_line(rank=r, acc=_acc, tot=2,
                           rews=("[0.3, 0.0]" if (spread is None or spread > 0) else "[0.3, 0.3]"),
                           spread=("0.300" if spread is None else f"{spread:.3f}")),

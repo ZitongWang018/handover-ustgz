@@ -11,16 +11,17 @@
             任务池采样 → G=16 rollout（Eq.7 奖励）→ 组归一化 GRPO 更新 solver
 
 ⚠️ 与论文的**已知偏差**（复现计划 U5 + 工程取舍，全部可配置）：
-* 论文 "batch 16 / rollouts per step 16" 的精确编排没写死；本实现用
-  `tasks_per_step` 个任务 × G 条 rollout，默认 2×16=32（单节点 HF generate
-  吞吐下的务实值），8 卡 DDP 分片留 TODO。
-* KL penalty（β=0.001 对参考策略）：我们的 GRPO 内核是 β=0 无参考模型版，
-  KL 项暂以 TODO 标注（LoRA 低 lr 下影响小）。
+* `tasks_per_step` 是全局 task-group 数，`group_size` 是每个全局 GRPO 组的大小；
+  8 卡默认 TPS=1、G=16、每 rank 两条轨迹。
+* EZ 使用 raw PEFT model 和显式 bucketed LoRA gradient all-reduce，不依赖 DDP
+  对动态 adapter `requires_grad` 的注册；主线 DDP 训练路径保持独立。
+* KL β 默认为 0.001，通过 `disable_adapter()` 的冻结 base reference 计算。
 """
 from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 import random
@@ -36,8 +37,6 @@ if str(SRC_DIR) not in sys.path:
 
 from alfworld_compat import install as install_alfworld_compat  # noqa: E402
 
-install_alfworld_compat()
-
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
@@ -49,7 +48,10 @@ from ez_solver import EzSolverTrajectory, run_ez_solver_rollouts  # noqa: E402
 from ez_swanlab import EzSwanLab  # noqa: E402
 from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
-from rollout import HFPolicy, RolloutConfig, build_token_sequence  # noqa: E402
+from ez_dist import (broadcast_pool_indices, check_adapter_sync, gather_group_values,
+                     broadcast_adapter_parameters, global_group_advantages, local_group_size, select_adapter,
+                     sync_active_adapter_gradients)  # noqa: E402
+from rollout import HFPolicy, RolloutConfig  # noqa: E402
 from train_grpo import (build_model_and_tokenizer, grpo_loss, group_advantages,  # noqa: E402
                         is_main, load_cfg, log0, make_batch, per_token_logps,
                         set_seed, setup_dist)
@@ -77,10 +79,34 @@ def log(msg: str) -> None:
             fh.flush()
 
 
+def _cuda_sync_and_reset_peak() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _cuda_peak_gib():
+    if not torch.cuda.is_available():
+        return 0.0, 0.0
+    return (torch.cuda.max_memory_allocated() / (1024 ** 3),
+            torch.cuda.max_memory_reserved() / (1024 ** 3))
+
+
+def _attention_backend(model, cfg):
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return getattr(getattr(base, "config", None), "_attn_implementation",
+                   cfg["model"].get("attn_implementation", "default")) or "default"
+
+
 # --------------------------------------------------------------------------- LoRA
 
 
-def build_dual_lora(model, cfg: dict):
+def build_dual_lora(model, cfg: dict, resume_checkpoint: Optional[Path] = None):
     """proposer 和 solver 是**两个独立策略**（论文 §3：同一基座初始化、各自训练）。
 
     实现：共享基座 + peft 两个 LoRA adapter（"proposer" / "solver"），
@@ -88,15 +114,24 @@ def build_dual_lora(model, cfg: dict):
     4B fp32 显存放不下 —— 这正是论文用 LoRA 的原因之一。
     """
     try:
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, PeftModel, get_peft_model
     except ImportError as exc:
         raise SystemExit("Explorer-Zero 需要双策略 LoRA：pip install peft") from exc
     lc = LoraConfig(r=cfg["model"].get("lora_r", 32),
                     lora_alpha=cfg["model"].get("lora_alpha", 32),
                     lora_dropout=0.0,
                     target_modules=cfg["model"].get("lora_targets", "all-linear"))
-    model = get_peft_model(model, lc, adapter_name="proposer")
-    model.add_adapter("solver", lc)
+    if resume_checkpoint is None:
+        model = get_peft_model(model, lc, adapter_name="proposer")
+        model.add_adapter("solver", lc)
+    else:
+        proposer_path = resume_checkpoint / "proposer"
+        solver_path = resume_checkpoint / "solver"
+        if not (proposer_path / "adapter_config.json").is_file() or not (solver_path / "adapter_config.json").is_file():
+            raise ValueError(f"checkpoint {resume_checkpoint} is missing proposer/solver adapter files")
+        model = PeftModel.from_pretrained(model, proposer_path, adapter_name="proposer",
+                                          is_trainable=True)
+        model.load_adapter(solver_path, adapter_name="solver", is_trainable=True)
     model.set_adapter("proposer")
     # ★ adapter 参数必须 fp32：基座可以是 bf16（冻结，不参与更新，无舍入问题），
     #   但被更新的 adapter 要是 bf16，lr=1e-4 的更新同样会被 bf16 ulp 抹掉。
@@ -107,19 +142,15 @@ def build_dual_lora(model, cfg: dict):
             n_cast += 1
     if n_cast:
         print(f"[ez] cast {n_cast} 个 LoRA 张量到 fp32")
-    # ★ 8 卡 DDP 红线 C：DDP 在**构造那一刻**按"哪些参数 requires_grad"固定注册
-    #   all-reduce hook（决定 bucket 成员）。之后即使某参数再变成 requires_grad=True，
-    #   它的梯度也**永远不会被同步** —— 而且是静默错，loss 照跑、只有多卡不一致。
-    #   所以两个 adapter 必须在 wrap 之前就都是 trainable。
-    #   相位隔离不再靠 requires_grad，而靠"没参与前向 → unused → 跳过"
-    #   （配 DDP 的 find_unused_parameters=True）。
+    # 两个 adapter 都先可训练，随后 select_adapter 在每个 phase 明确切换；EZ
+    # 不包 DDP，而由 ez_dist 做固定顺序的手动梯度 all-reduce。
     n_tr = 0
     for _n, p in model.named_parameters():
         if "lora_" in _n and not p.requires_grad:
             p.requires_grad_(True)
             n_tr += 1
     if n_tr:
-        print(f"[ez] 打开 {n_tr} 个 LoRA 张量的 requires_grad（DDP wrap 前必须，红线 C）")
+        print(f"[ez] 启用 {n_tr} 个 LoRA 张量（由 select_adapter 管理 phase trainability）")
     model.print_trainable_parameters()
     return model
 
@@ -128,16 +159,14 @@ def build_dual_lora(model, cfg: dict):
 
 
 def tokenize_proposer_rollout(ro: ProposerRollout, policy, gen_cfg) -> ProposerRollout:
-    """把探索消息历史裁成训练序列（与主线 run_rollouts 同一套 truncate 逻辑）。
-
-    `gen_cfg` 必须用 proposer 专用的裁剪配置（p_tok_cfg）：生成端按同样的窗口截断，
-    训练/采样上下文才一致（review P1-1）。
-    """
-    tr_msgs = policy.truncate_messages(ro.messages, gen_cfg)
-    n_asst = sum(1 for m in tr_msgs if m["role"] == "assistant")
-    gen_kept = ro.gen_ids[len(ro.gen_ids) - n_asst:] if n_asst else []
-    ids, mask, _ = build_token_sequence(tr_msgs, gen_kept, policy)
-    ro.__dict__["input_ids"] = ids       # 动态挂字段，避免改 dataclass 影响面
+    """Use the exact token-native history on which each action was sampled."""
+    ids = list(getattr(ro, "training_ids", ()))
+    mask = list(getattr(ro, "training_mask", ()))
+    if not ids or len(ids) != len(mask):
+        raise ValueError("proposer rollout is missing a well-formed token-native training history")
+    if not any(mask):
+        raise ValueError("proposer rollout has no generated tokens to train")
+    ro.__dict__["input_ids"] = ids
     ro.__dict__["loss_mask"] = mask
     return ro
 
@@ -188,22 +217,131 @@ def update_probe(model, opt_params, optimizer, tag: str) -> float:
     return rel
 
 
-def ez_save(model, tokenizer, run_dir: Path, tag: str, cfg: dict, extra: dict) -> None:
-    """EZ 存档：peft 模型走自己的 save_pretrained（保存基座引用 + 两个 adapter），
-    替代主线 _save_model_manual（那条路是为裸 HF 模型写的）。仍遵守铁律二：只留一个。"""
+def _resume_signature(cfg: dict, world: int) -> dict:
+    semantic = json.loads(json.dumps(cfg, sort_keys=True, default=str))
+    run = semantic.get("run", {})
+    run.pop("output_dir", None)
+    run.pop("name", None)
+    # These are operational checks/storage knobs, not training trajectory semantics.
+    train = semantic.get("train", {})
+    train.pop("check_adapter_sync_every", None)
+    train.pop("checkpoint_every", None)
+    model = semantic.get("model", {})
+    if "path" in model:
+        model["path"] = os.path.expandvars(str(model["path"]))
+    env_cfg = semantic.get("env", {}).get("config_path")
+    if env_cfg:
+        path = Path(os.path.expandvars(str(env_cfg))).expanduser()
+        if not path.is_absolute():
+            path = SRC_DIR.parent / path
+        if path.is_file():
+            semantic["env"]["config_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    canonical = json.dumps(semantic, sort_keys=True, separators=(",", ":"), default=str)
+    return {"world_size": int(world), "semantic_config_sha256": hashlib.sha256(
+        canonical.encode("utf-8")).hexdigest(), "semantic_config": semantic}
+
+
+def ez_save(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
+            extra: dict, task_pool: list, rank: int, world: int,
+            uid_counter: int = 0, dry_run: bool = False) -> None:
+    """Write complete resume state, then atomically promote it while retaining old ckpt."""
     import shutil
-    ckpt_dir = run_dir / "ckpt"
-    tmp_dir = run_dir / "ckpt.tmp"
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(tmp_dir)          # peft：adapter 权重 + 配置
-    tokenizer.save_pretrained(tmp_dir)
-    with open(tmp_dir / "train_state.json", "w") as fh:
-        json.dump({"tag": tag, "config": cfg, **extra}, fh, indent=2, default=str)
-    if ckpt_dir.exists():
-        shutil.rmtree(ckpt_dir, ignore_errors=True)
-    tmp_dir.rename(ckpt_dir)
+    ckpt_dir, tmp_dir, backup_dir = (run_dir / "ckpt", run_dir / "ckpt.tmp",
+                                     run_dir / "ckpt.previous")
+    if rank == 0:
+        if not ckpt_dir.exists() and backup_dir.exists():
+            os.replace(backup_dir, ckpt_dir)  # recover interruption between renames
+        elif ckpt_dir.exists() and backup_dir.exists():
+            ckpt_complete = (ckpt_dir / "train_state.json").is_file()
+            backup_complete = (backup_dir / "train_state.json").is_file()
+            if not ckpt_complete and backup_complete:
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
+                os.replace(backup_dir, ckpt_dir)
+            else:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(tmp_dir)
+        tokenizer.save_pretrained(tmp_dir)
+        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+        with open(tmp_dir / "task_pool.jsonl", "w", encoding="utf-8") as fh:
+            for task in task_pool:
+                fh.write(json.dumps(task.to_json(), ensure_ascii=False) + "\n")
+        state = {"checkpoint_schema_version": 2, "tag": tag, "config": cfg,
+                 "resume_signature": _resume_signature(cfg, world),
+                 "world_size": world, "dry_run": bool(dry_run), **extra}
+        with open(tmp_dir / "train_state.json", "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, default=str)
+        (tmp_dir / "rank_state").mkdir(parents=True, exist_ok=True)
+    if world > 1:
+        dist.barrier()
+    rng_state = {"python": random.getstate(), "numpy": np.random.get_state(),
+                 "torch_cpu": torch.get_rng_state(),
+                 "torch_cuda": (torch.cuda.get_rng_state(torch.cuda.current_device())
+                                if torch.cuda.is_available() else None),
+                 "uid_counter": int(uid_counter)}
+    torch.save(rng_state, tmp_dir / "rank_state" / f"rank{rank}.pt")
+    if world > 1:
+        dist.barrier()
+    if rank == 0:
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        if ckpt_dir.exists():
+            os.replace(ckpt_dir, backup_dir)
+        try:
+            os.replace(tmp_dir, ckpt_dir)
+        except Exception:
+            if backup_dir.exists() and not ckpt_dir.exists():
+                os.replace(backup_dir, ckpt_dir)
+            raise
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+    if world > 1:
+        dist.barrier()
+
+
+def load_ez_resume(ckpt_dir: Path, cfg: dict, world: int, rank: int):
+    with open(ckpt_dir / "train_state.json", encoding="utf-8") as fh:
+        state = json.load(fh)
+    if int(state.get("checkpoint_schema_version", 0)) < 2:
+        raise ValueError("legacy checkpoint lacks complete optimizer/RNG/task-pool state; resume refused")
+    if state.get("dry_run", False):
+        raise ValueError("smoke/dry-run checkpoints cannot be resumed as formal training")
+    expected = _resume_signature(cfg, world)
+    if state.get("resume_signature") != expected:
+        raise ValueError(f"resume config/world mismatch: saved={state.get('resume_signature')} current={expected}")
+    pool_path = ckpt_dir / "task_pool.jsonl"
+    if not pool_path.is_file():
+        raise ValueError("resume checkpoint is missing task_pool.jsonl")
+    pool = []
+    with open(pool_path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                row = json.loads(line)
+                if int(row.get("schema_version", 1)) < 2:
+                    raise ValueError("legacy task pool lost raw fact multiplicity/identity; formal resume refused")
+                task = ProposedTask.from_json(row)
+                for snap in (task.s0, task.ref_final, *(s.ref_snapshot for s in task.subtasks)):
+                    if snap.mode == "facts" and snap.facts and not snap.raw_facts:
+                        raise ValueError("schema-2 task is missing raw facts; refusing unsafe resume")
+                pool.append(task)
+    rng_path = ckpt_dir / "rank_state" / f"rank{rank}.pt"
+    if not rng_path.is_file():
+        raise ValueError(f"resume checkpoint is missing rank-specific RNG state: {rng_path}")
+    return state, pool, rng_path
+
+
+def resolve_resume_directory(path: Path, rank: int) -> Path:
+    """Use the last complete directory if a crash interrupted checkpoint promotion."""
+    candidates = [path, path.parent / "ckpt.previous"]
+    for candidate in candidates:
+        required = [candidate / "train_state.json", candidate / "optimizer.pt",
+                    candidate / "task_pool.jsonl", candidate / "proposer",
+                    candidate / "solver", candidate / "rank_state" / f"rank{rank}.pt"]
+        if all(p.exists() for p in required):
+            return candidate
+    raise ValueError(f"neither {path} nor its previous checkpoint is complete")
 
 
 def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
@@ -215,7 +353,7 @@ def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
         前向 -> 该 adapter 的 LoRA 参数 -> loss -> 反向 -> p.grad 非空 ？
 
     为什么必须单独测：双 adapter + `set_adapter` 的隔离语义、peft 的包装、
-    gradient_checkpointing、以及（将来到 8 卡时）DDP 注册 hook 的时机，
+    gradient_checkpointing、以及 adapter 切换后的 requires_grad 状态，
     都可能让**某一个 adapter 静默收不到梯度** —— 现象就是日志里 update_rel=0，
     但你无法区分"梯度链断了"和"这组奖励恰好全相同"。
     有了这条自检，两者就能一刀切开。
@@ -227,7 +365,7 @@ def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
     attn = torch.ones_like(ids)
     for name in ("proposer", "solver"):
         try:
-            model.set_adapter(name)
+            select_adapter(model, name)
         except Exception as exc:  # noqa: BLE001
             log(f"[selfcheck] 切到 adapter {name!r} 失败：{exc}")
             out[f"{name}_grad_norm"] = float("nan")
@@ -243,21 +381,45 @@ def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
         out[f"{name}_grad_norm"] = tot
         out[f"{name}_params_with_grad"] = float(n_grad)
     model.zero_grad(set_to_none=True)
-    model.set_adapter("proposer")
+    select_adapter(model, "proposer")
     return out
 
 
-def _borrow_batch(all_roll, pad_id: int, device):
-    """从已有的 rollout 里借一条造"占位 batch"，用来保持各 rank 的 backward 次数一致。
-
-    DDP 的 all-reduce 是集合通信：某个 rank 少做一次 backward，其它 rank 就会
-    永久卡在 NCCL barrier（红线 B）。空组本身不该出现，但**出现了也绝不能 continue** ——
-    这里用"零 loss 但保留计算图"的 backward 顶上，次数对齐、梯度为 0、结果不受影响。
-    """
-    for r in all_roll:
-        if getattr(r.traj, "input_ids", None):
-            return make_batch([r.traj], pad_id, device)
-    return None
+def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
+                          adapter: str, clip_eps: float, micro_batch_size: int,
+                          world: int, loss_norm: str, beta: float, dist_obj=None,
+                          group_weight: float = 1.0):
+    """Accumulate exact seq-mean gradients over all global task groups in one step."""
+    from train_grpo import per_token_logps
+    if loss_norm != "seq":
+        raise ValueError("EZ microbatch accumulation currently requires train.loss_norm='seq'")
+    mb = max(1, int(micro_batch_size))
+    local_valid = sum(1 for t in trajectories if any(t.loss_mask[1:]))
+    global_valid = torch.tensor([local_valid], dtype=torch.float64, device=device)
+    if world > 1:
+        dist_obj.all_reduce(global_valid, op=dist_obj.ReduceOp.SUM)
+    denom = max(float(global_valid.item()), 1.0)
+    loss_sum = 0.0
+    stats = []
+    for start in range(0, len(trajectories), mb):
+        bt = make_batch(trajectories[start:start + mb], pad_id, device)
+        with torch.no_grad():
+            old = per_token_logps(optimizer_model, bt.input_ids, bt.attention_mask,
+                                  loss_mask=bt.loss_mask)
+            ref = None
+            if beta:
+                with raw.disable_adapter():
+                    ref = per_token_logps(raw, bt.input_ids, bt.attention_mask,
+                                          loss_mask=bt.loss_mask)
+        loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
+                               ref_logps=ref, beta=beta, sequence_reduction="sum")
+        (loss * (world / denom) * group_weight).backward()
+        loss_sum += float(loss.detach().item()) * group_weight
+        stats.append(stat)
+        del old, ref, bt, loss
+    if not trajectories:
+        raise RuntimeError("optimizer step requires at least one local trajectory")
+    return loss_sum / denom, stats, int(global_valid.item())
 
 
 # --------------------------------------------------------------------------- 主循环
@@ -268,9 +430,15 @@ def main() -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--dry-run", action="store_true", help="只跑 1 步 proposer + 1 步 solver 冒烟")
     ap.add_argument("--max-outer", type=int, default=None)
+    ap.add_argument("--resume", default=None, help="resume from a complete EZ ckpt directory")
     args = ap.parse_args()
+    if args.resume and args.dry_run:
+        ap.error("--resume cannot be combined with --dry-run; resume a formal run without changing its schedule")
 
+    install_alfworld_compat()
     cfg = load_cfg(args.config)
+    if os.environ.get("EZ_RUN_OUTPUT_DIR"):
+        cfg.setdefault("run", {})["output_dir"] = os.environ["EZ_RUN_OUTPUT_DIR"]
     seed = cfg["run"].get("seed", 42)
     # ★ 必须用 setup_dist()（会 init_process_group），不能用 dist_info()：
     #   dist_info() 只读环境变量，从不建进程组 —— 8 进程照跑，但 all_reduce /
@@ -280,7 +448,11 @@ def main() -> int:
     _RANK = rank
     set_seed(seed, rank)
 
-    if is_main(rank):
+    resume_ckpt = Path(args.resume).expanduser().resolve() if args.resume else None
+    if resume_ckpt is not None:
+        resume_ckpt = resolve_resume_directory(resume_ckpt, rank)
+        run_dir = resume_ckpt.parent
+    elif is_main(rank):
         run_dir = Path(cfg["run"]["output_dir"]) / \
             f"{cfg['run']['name']}-{time.strftime('%m%d-%H%M')}"
     else:
@@ -293,14 +465,22 @@ def main() -> int:
         run_dir = Path(_rd[0])
     run_dir.mkdir(parents=True, exist_ok=True)
     task_pool_path = run_dir / "task_pool.jsonl"
+    resume_info = None
+    resume_pool: List[ProposedTask] = []
+    resume_rng_path = None
+    if resume_ckpt is not None:
+        resume_info, resume_pool, resume_rng_path = load_ez_resume(resume_ckpt, cfg, world, rank)
+        log(f"[resume] checkpoint={resume_ckpt} next={resume_info.get('next_outer')} "
+            f"{resume_info.get('next_phase')}:{resume_info.get('next_step')} pool={len(resume_pool)}")
     # ★ SwanLab 上报在这里起：放后面是因为 `run_dir` 必须已经由 rank0 广播出去了，
     #   否则 8 个 rank 会各自开出 8 个不同名的 run。
     #   ⚠️ 上报失败不影响训练（ez_swanlab 全吞异常），所以直接挂着不管也行。
     global _REPORTER
     _REPORTER = EzSwanLab(cfg, run_dir=run_dir, rank=rank)
     global _LOG_FH, _LOG_FH0
-    _LOG_FH = open(run_dir / f"train_log.rank{rank}.jsonl", "w")
-    _LOG_FH0 = open(run_dir / "train_log.jsonl", "w") if is_main(rank) else None
+    _log_mode = "a" if resume_ckpt is not None else "w"
+    _LOG_FH = open(run_dir / f"train_log.rank{rank}.jsonl", _log_mode)
+    _LOG_FH0 = open(run_dir / "train_log.jsonl", _log_mode) if is_main(rank) else None
     log(f"[dist] rank={rank}/{world} local_rank={local} "
         f"device=cuda:{torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'} "
         f"| run_dir={run_dir}")
@@ -315,7 +495,8 @@ def main() -> int:
     M_P, M_S = tcfg.get("proposer_steps", 25), tcfg.get("solver_steps", 25)
     G = tcfg.get("group_size", 16)           # GRPO 组
     G_P = tcfg.get("solve_rate_rollouts", 8)  # 估 p̂(x) 用
-    TPS = tcfg.get("tasks_per_step", 2)       # U5 偏差：每步任务数
+    TPS = int(tcfg.get("tasks_per_step", 1))  # global task groups per step
+    G_local = local_group_size(int(G), world)
     w_sub = tcfg.get("w_sub", 0.3)
     w_div = tcfg.get("w_div", 0.3)
 
@@ -329,9 +510,11 @@ def main() -> int:
     #   实测证据（job 12989069）：fmt_bad=0（解析已修好）但 accept=0/2、mean_turns=3.0。
     #   12 轮足够让 Qwen3-4B 走到 finish，同时 2 slot × 12 轮在 A40 上约 40s。
     if args.dry_run:
-        G = int(os.environ.get("EZ_SMOKE_G", "2"))
-        G_P = int(os.environ.get("EZ_SMOKE_G_P", "2"))
-        TPS = int(os.environ.get("EZ_SMOKE_TPS", "1"))
+        _smoke_default_g = int(tcfg.get("group_size", 16))
+        G = int(os.environ.get("EZ_SMOKE_G", str(_smoke_default_g)))
+        G_P = int(os.environ.get("EZ_SMOKE_G_P", str(max(2, world))))
+        TPS = int(os.environ.get("EZ_SMOKE_TPS", str(TPS)))
+        G_local = local_group_size(int(G), world)
         M_P = M_S = 1
         _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "12"))
         p_max_turns = s_max_turns = _smoke_turns
@@ -340,19 +523,10 @@ def main() -> int:
         p_max_turns = cfg["proposer"].get("max_turns", 30)
         s_max_turns = cfg["solver"].get("max_turns", 30)
 
-    # ---- ★ 8 卡 DDP 红线 B：每个 rank 的 backward 次数必须**完全相同** ----
-    #   DDP 的 all-reduce 是集合通信：rank0 做了 3 次 backward 而 rank7 做了 0 次，
-    #   就会永久卡在 NCCL barrier 上（直到 30 分钟 timeout 才 abort，等于白排一次队）。
-    #   分片后每 rank 处理 TPS/world 个 game，所以 TPS 必须是 world 的正整数倍。
-    #   配置默认 TPS=2 是**单卡**的务实值；8 卡时直接断言会死在起跑线，因此这里
-    #   向上取整到 world 的倍数并**大声抱怨** —— 组语义不变，只是全局 batch 变大。
-    if world > 1 and (TPS % world or TPS < world):
-        TPS_new = max(world, ((TPS + world - 1) // world) * world)
-        log(f"[dist] ⚠️ tasks_per_step={TPS} 不能被 world={world} 整除（或小于 world）。"
-            f"每 rank 的 backward 次数必须一致，否则 DDP 直接死锁（红线 B）。"
-            f"已自动上调为 TPS={TPS_new}（每 rank {TPS_new // world} 个 game）。"
-            f"想固定请设 train.tasks_per_step 或 EZ_SMOKE_TPS 为 {world} 的倍数")
-        TPS = TPS_new
+    if TPS < 1:
+        raise ValueError("train.tasks_per_step must be positive")
+    log(f"[dist] global task groups/step={TPS}; global G={G}; rank-local G={G_local}; "
+        f"world={world}; adapter gradients use explicit all_reduce")
 
     # ---- 环境（facts 通道是 EZ 的命根子，必须开）----
     alf_cfg = load_alfworld_config(
@@ -362,17 +536,21 @@ def main() -> int:
     log(f"[data] {len(game_files)} train games")
 
     p_cfg = ProposerConfig(
-        group_size=G, max_turns=p_max_turns,
+        group_size=G_local, max_turns=p_max_turns,
         max_new_tokens=cfg["proposer"].get("max_new_tokens", 160),
         temperature=cfg["proposer"].get("temperature", 1.0),
-        give_admissible=cfg["proposer"].get("give_admissible", False))
+        give_admissible=cfg["proposer"].get("give_admissible", False),
+        invalid_action_mode=cfg["proposer"].get("invalid_action_mode", "raw"),
+        finish_nudge=cfg["proposer"].get("finish_nudge", True),
+        generation_max_batch_size=cfg["train"].get("generation_max_batch_size", 2))
     s_cfg = RolloutConfig(
         group_size=1, max_steps=s_max_turns,
         max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
         temperature=cfg["solver"].get("temperature", 1.0),
         max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
         keep_recent_turns=cfg["solver"].get("keep_recent_turns", 12),
-        stop_mode="tool_call")
+        stop_mode="tool_call",
+        max_batch_size=cfg["train"].get("generation_max_batch_size", 2))
     # proposer 训练序列裁剪专用 cfg：必须与生成端 p_cfg 一致，否则训练上下文≠采样上下文
     p_tok_cfg = RolloutConfig(
         group_size=1, max_steps=p_cfg.max_turns,
@@ -381,11 +559,11 @@ def main() -> int:
         keep_recent_turns=p_cfg.keep_recent_turns, stop_mode="tool_call")
 
     env_p = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                             batch_size=G, max_episode_steps=p_cfg.max_turns,
-                             with_facts=True)
+                             batch_size=G_local, max_episode_steps=p_cfg.max_turns,
+                             with_facts=True, ignore_benchmark_done=True)
     env_s = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
-                             batch_size=G, max_episode_steps=s_cfg.max_steps,
-                             with_facts=True)
+                             batch_size=G_local, max_episode_steps=s_cfg.max_steps,
+                             with_facts=True, ignore_benchmark_done=True)
     # ★ 估 solve rate 用独立 env（batch=G_P）：run_ez_solver_rollouts 要求 batch==len(tasks)，
     #   G_P(8) ≠ G(16) 时复用 env_s 会在第一个被接受提案处 ValueError（review P0-2）
     # ★ env_sr 懒建：只在 proposer 相位里 accepted 非空、真正要估 solve rate 时才创建，
@@ -403,7 +581,7 @@ def main() -> int:
         if env_sr is None:
             env_sr = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
                                       batch_size=G_P, max_episode_steps=s_cfg.max_steps,
-                                      with_facts=True)
+                                      with_facts=True, ignore_benchmark_done=True)
             atexit.register(env_sr.close)
         return env_sr
 
@@ -422,9 +600,10 @@ def main() -> int:
     atexit.register(env_s.close)
 
     # ---- 模型（共享基座 + 双 LoRA adapter：proposer / solver）----
-    # ★ wrap_ddp=False：DDP 必须等**双 adapter 都 trainable 之后**才包（红线 C）。
+    # EZ explicitly synchronizes LoRA gradients and never wraps its raw PEFT model in DDP.
     raw, tokenizer = build_model_and_tokenizer(cfg, local, world, wrap_ddp=False)
-    raw = build_dual_lora(raw, cfg)
+    raw = build_dual_lora(raw, cfg, resume_checkpoint=resume_ckpt)
+    broadcast_adapter_parameters(raw, world, dist)
 
     # ---- 启动自检：dtype / adapter / GC / facts（跑几小时前先炸掉所有致命项）----
     _p0 = next(raw.parameters())
@@ -442,7 +621,7 @@ def main() -> int:
     # 预检临时建一个 env，验完即关；真正训练时再由懒建路径重建
     _pre_env = ALFWorldBatchEnv(alf_cfg, split=cfg["env"].get("split", "train"),
                                 batch_size=G_P, max_episode_steps=s_cfg.max_steps,
-                                with_facts=True)
+                                with_facts=True, ignore_benchmark_done=True)
     try:
         _obs, _views, _adm, _used, _ = _pre_env.reset(_pre_games)
         _pre = _snp(getattr(_pre_env, "last_reset_facts", [None] * G_P)[0], _obs[0])
@@ -469,7 +648,7 @@ def main() -> int:
         f"{world} rank 全局 {_slot_global}{_slot_warn}")
 
     # ---- 梯度链自检：两个 adapter 是否各自都能接到梯度（不依赖环境/奖励）----
-    #   在 wrap **之前**跑：DDP 包装后会插 forward hook，自检的裸 forward/backward
+    #   在 phase 切换前跑：自检直接验证两个 adapter 的 forward/backward 梯度链
     #   会额外触发 reducer，日志更乱且没有诊断价值。device 见下一行。
     _gc = grad_chain_selfcheck(raw, tokenizer, next(raw.parameters()).device)
     log(f"[selfcheck] 梯度链 proposer grad_norm={_gc['proposer_grad_norm']:.4e} "
@@ -485,49 +664,33 @@ def main() -> int:
 
     device = next(raw.parameters()).device
 
-    # ---- ★ DDP（在双 adapter 都可训练之后才包）----
-    #   find_unused_parameters=True 是**必须**的：proposer 相位里 solver adapter
-    #   不参与前向，它的 bucket 拿不到梯度；不设 True 会直接报
-    #   "Expected to have finished reduction in the prior iteration" 或静默卡住。
-    if world > 1:
-        from torch.nn.parallel import DistributedDataParallel as _DDP
-        model = _DDP(raw, device_ids=[local], output_device=local,
-                     find_unused_parameters=True)
-        log(f"[dist] DDP 已包装：world_size={world} find_unused_parameters=True；"
-            f"两个 adapter 合计 {sum(p.numel() for p in _lora_all)/1e6:.1f}M 参数，"
-            f"每步 all-reduce 的是 **fp32 梯度** ≈{sum(p.numel() for p in _lora_all)*4/1e9:.2f} GB"
-            f"（LoRA 让 DDP 在这里非常划算，不需要 ZeRO/FSDP）")
-        # ★ 探针：DDP 到底转不转发 peft/HF 的方法？不同 torch 版本行为不同，
-        #   实测（torch 2.x, job 12989565）是**不转发** —— 直接调就 AttributeError。
-        #   把它写进日志，以后升级 torch 时一眼能看出行为有没有变。
-        log(f"[dist] 属性转发探针：hasattr(DDP,'set_adapter')={hasattr(model, 'set_adapter')} "
-            f"hasattr(DDP,'generate')={hasattr(model, 'generate')} "
-            f"（False 表示必须用内层 raw 调这些方法；loss 的 forward 仍要用包装后的 model）")
-    else:
-        model = raw
-    # ★★ DDP 的分工（实测踩过一次，见 job 12989565）：
-    #   `DistributedDataParallel` **不转发** unknown 属性 —— `model.set_adapter(...)`
-    #   会直接抛 `AttributeError: 'DistributedDataParallel' object has no attribute
-    #   'set_adapter'`；`generate` 同理。所以：
-    #     · **peft / HF 自己的方法**（set_adapter / generate / save_pretrained /
-    #       print_trainable_parameters）→ 一律用内层 `raw`
-    #     · **只有"要算梯度的那次 forward"** → 必须用包装后的 `model`，
-    #       否则绕过 DDP 的 forward hook，梯度永远不会 all-reduce（且不报错）
-    #     · `train()/eval()/zero_grad()` 是 nn.Module 自己的方法，用 `model`（包装后）
-    #       才对 —— DDP 要靠 train() 重置 require_backward_grad_sync
-    #   由于 HFPolicy 内部走 `generate`，它必须持有 `raw`；而 loss 的 forward
-    #   由 ez_train 显式把 `model` 传进 `per_token_logps/grpo_loss`，两条路各走各的。
+    # EZ deliberately uses the raw PEFT model: adapter trainability changes by phase,
+    # and gradients are synchronized explicitly in a fixed parameter order.
+    model = raw
     policy = HFPolicy(raw, tokenizer)
 
     # ⚠️ 双 adapter 隔离由 peft 的 set_adapter 负责；optimizer 必须覆盖**两个**
     #    adapter 的全部参数（按名字里的 "lora_" 选），否则切到 solver 相位时新参数不在优化器里。
-    #    注意这里用 raw.named_parameters()：名字干净（没有 DDP 的 module. 前缀），
-    #    而且是**同一批 Parameter 对象**，DDP 的 hook 会把同步后的 grad 写回它们。
+    #    raw.named_parameters() gives a stable fixed-order parameter set for manual sync.
     opt_params = [p for n, p in raw.named_parameters() if "lora_" in n]
     if not opt_params:
         raise SystemExit("没有找到任何 LoRA 参数，检查 peft 适配是否正常")
     optimizer = torch.optim.AdamW(opt_params, lr=tcfg.get("lr", 1e-4),
                                   weight_decay=tcfg.get("weight_decay", 0.0))
+    if resume_ckpt is not None:
+        optimizer_path = resume_ckpt / "optimizer.pt"
+        if not optimizer_path.is_file():
+            raise ValueError("resume checkpoint is missing optimizer.pt")
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
+        rng_state = torch.load(resume_rng_path, map_location="cpu", weights_only=False)
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch_cpu"])
+        if torch.cuda.is_available() and rng_state.get("torch_cuda") is not None:
+            torch.cuda.set_rng_state(rng_state["torch_cuda"], torch.cuda.current_device())
+        resume_uid_counter = int(rng_state.get("uid_counter", 0))
+    else:
+        resume_uid_counter = 0
     clip_eps = tcfg.get("clip_eps", 0.3)
     max_grad_norm = tcfg.get("max_grad_norm", 1.0)
     pad_id = tokenizer.pad_token_id
@@ -536,8 +699,8 @@ def main() -> int:
     #   "token" = 旧行为（把组里所有 token 混在一起平均 = 按长度加权，有 length bias）
     # 详见 src/grpo_norm.py 的模块 docstring，以及 scripts/ez_repro_lossnorm.py 的实测。
     loss_norm = tcfg.get("loss_norm", "seq")
-    if loss_norm not in ("seq", "token"):
-        raise ValueError(f"train.loss_norm 必须是 'seq' 或 'token'，收到 {loss_norm!r}")
+    if loss_norm != "seq":
+        raise ValueError("EZ global microbatch accumulation requires train.loss_norm='seq'")
     if loss_norm == "token" and is_main(rank):
         log("[warn] train.loss_norm='token'：组内按长度加权，会有 length bias "
             "（论文语义是 'seq'）。确认这是有意为之。")
@@ -554,9 +717,15 @@ def main() -> int:
     # ★ rng 必须按 rank 偏移：`set_seed(seed, rank)` 里的 `seed + rank` 只是**局部**
     #   变量，改不到这里，直接用 `seed` 会让所有 rank 的 rng 状态完全一致
     #   （多卡采样重复的根因）。加上 rank 偏移，各 rank 的随机流才真正分开。
-    rng = random.Random(seed + rank)
-    task_pool: List[ProposedTask] = []
-    uid_counter = 0
+    micro_batch_size = int(tcfg.get("micro_batch_size", 1))
+    kl_beta = float(tcfg.get("kl_beta", 0.001))
+    sync_bucket_mb = int(tcfg.get("sync_bucket_mb", 25))
+    check_sync_every = int(tcfg.get("check_adapter_sync_every", 5))
+    task_pool: List[ProposedTask] = list(resume_pool)
+    uid_counter = resume_uid_counter
+    start_outer = int(resume_info.get("next_outer", 0)) if resume_info else 0
+    resume_phase = str(resume_info.get("next_phase", "proposer")) if resume_info else "proposer"
+    resume_step = int(resume_info.get("next_step", 0)) if resume_info else 0
 
     def persist_pool() -> None:
         """任务池落盘。★ 只 rank0 写：8 个 rank 同时 open(...,"w") 同一文件会互相截断。
@@ -568,7 +737,7 @@ def main() -> int:
                 fh.write(json.dumps(t.to_json(), ensure_ascii=False) + "\n")
 
     t_start = time.time()
-    for outer in range(N):
+    for outer in range(start_outer, N):
         # ⚠️ 冒烟只跑 1 个 outer 的判据必须放在**循环开头**。
         #    之前写在循环结尾（ez_save 之后），但 solver 空池那条路径会 `continue`
         #    直接跳到下一轮，把 break 绕过去 —— 实测日志里出现了 outer 0/1/2/3 各跑一遍。
@@ -576,23 +745,23 @@ def main() -> int:
             break
         # ================= proposer 相位 =================
         model.eval()
-        for step in range(M_P if not args.dry_run else 1):
+        p_steps = M_P if not args.dry_run else 1
+        p_start = resume_step if outer == start_outer and resume_phase == "proposer" else 0
+        p_range = range(p_start, p_steps) if not (outer == start_outer and resume_phase == "solver") else range(0)
+        for step in p_range:
             st0 = time.time()
-            raw.set_adapter("proposer")
-            # ---- ★ 分片采样（红线 B）：全局 TPS 个 game 由 rank0 抽一次后广播 ----
-            #   各 rank 抽各自的会"不重不漏"变成"重且漏"；而 rank0 抽完再切
-            #   `games[rank::world]` 才是严格不重不漏。组语义不变 ——
-            #   每个 game 的 G 条 rollout 仍在**同一个 rank** 上跑完。
+            _cuda_sync_and_reset_peak()
+            model.eval()
+            select_adapter(raw, "proposer")
+            # All ranks process the same global task groups. Each group is sharded
+            # rank-strided inside run_proposer_exploration.
             games: List[str] = []
-            if is_main(rank):
-                games = [rng.choice(game_files) for _ in range(TPS)]
-            if world > 1:
-                _go = [games]
-                dist.broadcast_object_list(_go, src=0)
-                games = _go[0]
-            if len(games) % world:
-                raise SystemExit(f"[dist] 全局 games={len(games)} 不能被 world={world} 整除")
-            local_games = games[rank::world]      # 每 rank 恰好 TPS/world 个
+            n_groups = min(TPS, len(game_files))
+            selected_games = broadcast_pool_indices(
+                len(game_files), n_groups, outer * max(M_P, 1) + step,
+                seed + 13007, rank, world, dist)
+            games = [game_files[i] for i in selected_games]
+            local_games = games
             # 1) 探索 + 提案
             # ★ 组按 game **逐个**收集（而不是事后按 G 切片）：切片一旦错位，
             #   组里会混进不同 game 的 rollout（红线 A：组是算法不可分单元）。
@@ -625,10 +794,10 @@ def main() -> int:
                 #   撞了之后 solver 相位的 `task_id == uid` 分组会把不同任务混成一组。
                 t.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
-                raw.set_adapter("solver")
+                select_adapter(raw, "solver")
                 rollouts = run_ez_solver_rollouts(_ensure_env_sr(), policy, [t] * G_P, s_cfg,
                                                   tokenize=False, log_fn=log)
-                raw.set_adapter("proposer")
+                select_adapter(raw, "proposer")
                 p_hat = sum(r.verify.final_match for r in rollouts) / G_P
                 r_total, parts = proposer_reward(t, p_hat, w_sub=w_sub, w_div=w_div)
                 c.reward = r_total
@@ -645,40 +814,47 @@ def main() -> int:
                 del _g
             task_pool.extend(new_tasks)
             persist_pool()
-            # 3) proposer GRPO 更新（组 = 同一 game 的 G 条探索轨迹；上面已按 game 分好）
-            #   ★ `len(groups)` 是**本 rank 的组数**（=TPS/world）。DDP 会对梯度取平均，
-            #     全局等价于 1/TPS —— 正确，**不要**再手动乘 world（乘了就变成 1/(TPS/world)）。
+            _rollout_s = time.time() - st0
+            # 3) proposer GRPO update: each global game group is sharded across ranks;
+            #    advantages are gathered/normalized globally before this local backward.
             model.train()
             optimizer.zero_grad(set_to_none=True)
             _diag = []
-            _p_loss_sum = 0.0          # 供 SwanLab 上报的本步平均 loss
-            for groll in groups:
+            _p_loss_sum = 0.0
+            _tokens_local = 0
+            _backward_t0 = time.time()
+            for group_idx, groll in enumerate(groups):
                 for c in groll:
                     tokenize_proposer_rollout(c, policy, p_tok_cfg)
-                advs = group_advantages([c.reward for c in groll],
-                                        [0] * len(groll), use_std=True,
-                                        ddof=adv_ddof)
+                    _tokens_local += int(sum(c.__dict__["loss_mask"][1:]))
+                full_rewards = gather_group_values([c.reward for c in groll], rank, world, dist)
+                full_advs = global_group_advantages(full_rewards, ddof=adv_ddof)
+                advs = full_advs[rank::world]
                 trajs_like = []
                 from rollout import Trajectory as _T
                 for c, a in zip(groll, advs):
-                    trajs_like.append(_T(task_id="ez_proposer", task_type="proposer",
+                    trajs_like.append(_T(task_id=f"ez_proposer_{group_idx}", task_type="proposer",
                                          game_file="", messages=c.messages,
                                          input_ids=c.__dict__["input_ids"],
                                          loss_mask=c.__dict__["loss_mask"],
                                          stats=None, advantage=a))
-                bt = make_batch(trajs_like, pad_id, device)
-                _diag.append((round(max(advs) - min(advs), 3), int(bt.n_active),
+                _diag.append((round(max(full_advs) - min(full_advs), 3),
                               [len(c.__dict__["input_ids"]) for c in groll],
-                              [int(sum(c.__dict__["loss_mask"])) for c in groll]))
-                # ★ old logps 必须脱离计算图：不包 no_grad 的话 new-old 对参数梯度
-                #   精确抵消，loss 非零但参数一步不动（review P0-1，与主线 train_grpo 一致）
-                with torch.no_grad():
-                    old = per_token_logps(model, bt.input_ids, bt.attention_mask)
-                loss, _st = grpo_loss(model, bt, old, clip_eps, loss_norm=loss_norm)
-                (loss / len(groups)).backward()
-                # 上报用：这里 detached 取标量，不影响计算图
-                _p_loss_sum += float(loss.detach().item())
+                              [int(sum(c.__dict__["loss_mask"][1:])) for c in groll]))
+                _g_loss, _g_stats, _g_valid = backward_microbatches(
+                    raw, model, trajs_like, pad_id, device, adapter="proposer",
+                    clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
+                    loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
+                    group_weight=1.0 / max(len(groups), 1))
+                _p_loss_sum += _g_loss
+            _cuda_sync()
+            _backward_s = time.time() - _backward_t0
             _nof = {id(p): n for n, p in raw.named_parameters()}
+            _sync_t0 = time.time()
+            _cuda_sync()
+            sync_active_adapter_gradients(raw, "proposer", world, sync_bucket_mb, dist)
+            _cuda_sync()
+            _sync_s = time.time() - _sync_t0
             _act = [p for p in opt_params if p.grad is not None and p.requires_grad]
             _gn = float(sum(p.grad.detach().float().norm() for p in _act)) if _act else 0.0
             # ★ A/B 分开报：peft 把 lora_B 初始化成全 0 ⇒ ∂L/∂A = Bᵀ(...) ≡ 0
@@ -689,8 +865,15 @@ def main() -> int:
                              if ".lora_A." in _nof.get(id(p), "")))
             _gnB = float(sum(p.grad.detach().float().norm() for p in _act
                              if ".lora_B." in _nof.get(id(p), "")))
+            _step_t0 = time.time()
             torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
             update_probe(raw, opt_params, optimizer, f"outer {outer} P{step}")
+            if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
+                _sync_max = check_adapter_sync(raw, "proposer", world, dist)
+                log(f"[adapter-sync] phase=proposer step={step} status=PASS max_abs={_sync_max:.3e}")
+            optimizer.zero_grad(set_to_none=True)
+            _cuda_sync()
+            _optimizer_s = time.time() - _step_t0
             # ★ 组奖励必须进日志：只有这样，"update_rel=0" 才能被判成
             #   「奖励同分（=没信号，正常）」还是「奖励有区分度却不动（=梯度链断，必修）」。
             #   实测教训（job 12989143 outer 2）：accept=1/2 却 update_rel=0，
@@ -703,7 +886,7 @@ def main() -> int:
             #   还是该做 base 模型的格式冷启动（U7）。
             _rej = Counter(getattr(c, "reject_reason", "unknown") or "accepted"
                            for c in cand)
-            log(f"[outer {outer}][P{step}] rank={rank} 本地 games={len(local_games)}/{TPS} "
+            log(f"[outer {outer}][P{step}] rank={rank} global_games={len(games)} local_G={G_local} "
                 f"| pool={len(task_pool)} (+{len(new_tasks)}) "
                 f"| accept={len(accepted)}/{len(cand)} | rew={_rw} "
                 f"| rew_spread={max(_rw) - min(_rw) if _rw else 0:.3f} "
@@ -714,11 +897,28 @@ def main() -> int:
                 f"{_diag} | 真实 backward grad_norm={_gn:.4e} "
                 f"({len(_act)} 个张量有 grad；A={_gnA:.4e} B={_gnB:.4e})"
                 f"{'  ← A=0 是正常的（B 初始全 0）' if _gnA == 0.0 and _gnB > 0 else ''}")
+            _mem_alloc, _mem_reserved = _cuda_peak_gib()
+            _token_metric = torch.tensor([_tokens_local], dtype=torch.int64, device=device)
+            if world > 1:
+                dist.all_reduce(_token_metric, op=dist.ReduceOp.SUM)
+            _tokens_global = int(_token_metric.item())
+            del _token_metric
+            log(f"[telemetry] phase=proposer outer={outer} step={step} rollout_s={_rollout_s:.3f} "
+                f"backward_s={_backward_s:.3f} sync_s={_sync_s:.3f} optimizer_s={_optimizer_s:.3f} "
+                f"generated_tokens_global={_tokens_global} generated_tokens_local={_tokens_local} "
+                f"effective_global_batch={len(games) * G} "
+                f"cuda_peak_allocated_gib={_mem_alloc:.3f} cuda_peak_reserved_gib={_mem_reserved:.3f} "
+                f"attention={_attention_backend(raw, cfg)}")
+            _p_metric = torch.tensor([_p_loss_sum], device=device, dtype=torch.float64)
+            if world > 1:
+                dist.all_reduce(_p_metric, op=dist.ReduceOp.SUM)
+            _p_loss_sum_global = float(_p_metric.item())
+            del _p_metric
             # ---- SwanLab 上报：proposer 相位 ----
             # step 必须是**全局单调递增**的，否则 P/S 两条曲线会叠在同一 x 上。
             # 只有 rank0 真的会发（其它 rank 的 _REPORTER 是 no-op 对象）。
             _REPORTER.log({
-                "train/loss": _p_loss_sum / max(len(groups), 1),
+                "train/loss": _p_loss_sum_global,
                 "train/grad_norm": _gn,
                 "train/grad_norm_lora_A": _gnA,
                 "train/grad_norm_lora_B": _gnB,
@@ -728,12 +928,20 @@ def main() -> int:
                 "proposer/pool_size": len(task_pool),
                 "proposer/sec_per_step": time.time() - st0,
             }, step=outer * (M_P + M_S) + step)
+            p_done = step + 1 == p_steps
+            if p_done or (step + 1) % 5 == 0:
+                next_outer, next_phase, next_step = ((outer, "solver", 0) if p_done
+                                                     else (outer, "proposer", step + 1))
+                ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-P{step}", cfg,
+                        {"next_outer": next_outer, "next_phase": next_phase,
+                         "next_step": next_step}, task_pool, rank, world,
+                        uid_counter=uid_counter, dry_run=args.dry_run)
             if args.dry_run:
                 break
 
         # ================= solver 相位 =================
         model.eval()
-        raw.set_adapter("solver")
+        select_adapter(raw, "solver")
         # 任务来源对齐论文 Appendix C：solver 只练**本 outer proposer 相位产出的任务**
         # （论文是每迭代用冻结 proposer 重新采样；跨 outer 抽旧题会让任务分布与
         #   当前 proposer 脱节 —— review #2）。池子仍全量持久化供分析。
@@ -752,9 +960,15 @@ def main() -> int:
         if _nglob == 0:
             log(f"[solver] 本 outer 任务池为空（rank{rank} 本地 {_nlocal} 条，全局最少 {_nglob} 条），"
                 f"所有 rank 一起跳过 solver 相位")
+            ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-empty-S", cfg,
+                    {"next_outer": outer + 1, "next_phase": "proposer", "next_step": 0},
+                    task_pool, rank, world, uid_counter=uid_counter, dry_run=args.dry_run)
             continue
-        for step in range(M_S if not args.dry_run else 1):
+        s_steps = M_S if not args.dry_run else 1
+        s_start = resume_step if outer == start_outer and resume_phase == "solver" else 0
+        for step in range(s_start, s_steps):
             st0 = time.time()
+            _cuda_sync_and_reset_peak()
             model.eval()
             # ★★ 采样改为**按 rank 分片**，不用 `rng.sample`（多卡下是真 bug，见下）
             #   旧写法 `rng.sample(outer_pool, k)`：rng 是 `random.Random(seed)`，
@@ -767,85 +981,93 @@ def main() -> int:
             # 无放回：有放回会让同 uid 的组被合并、loss 双计（review P1-2）
             # ★ k 必须**各 rank 相同**（=min(TPS//world, 池子大小)）：条数不同则
             #   backward 次数不同，DDP 死锁。池子已跨 rank 一致，所以这个 k 天然一致。
-            k_local = max(1, min(TPS // max(world, 1), len(outer_pool)))
-            # ★ `k_local` 直接决定 backward 次数，次数不同 = NCCL 永久卡死（红线 B）。
-            #   上面那句只依赖"池子已跨 rank 一致"这个**注释里的假设** —— 假设破了
-            #   就是 30 分钟 timeout 才炸。显式 all_reduce MIN 同步一次，顺带在
-            #   假设真破了的时候把不一致打到日志里，而不是让人去猜死锁原因。
-            if world > 1:
-                _kt = torch.tensor([k_local], device=device)
-                dist.all_reduce(_kt, op=dist.ReduceOp.MIN)
-                _kmin = int(_kt.item())
-                del _kt
-                if _kmin != k_local:
-                    log(f"[warn] solver k 跨 rank 不一致（rank{rank} 本地 {k_local}，"
-                        f"全局最小 {_kmin}）→ 统一取 {_kmin}。"
-                        f"这说明 outer_pool 并非真的跨 rank 一致，去查 all_gather")
-                k_local = _kmin
-            batch = [outer_pool[(rank + i * world) % len(outer_pool)]
-                     for i in range(k_local)]
-            all_roll: List[EzSolverTrajectory] = []
+            n_tasks = min(TPS, len(outer_pool))
+            chosen = broadcast_pool_indices(len(outer_pool), n_tasks,
+                                            outer * max(M_S, 1) + step,
+                                            seed + 104729, rank, world, dist)
+            batch = [outer_pool[i] for i in chosen]
+            solver_groups: List[List[EzSolverTrajectory]] = []
             for t in batch:
-                all_roll.extend(run_ez_solver_rollouts(env_s, policy, [t] * G, s_cfg,
-                                                       tokenize=True, log_fn=log))
+                solver_groups.append(run_ez_solver_rollouts(
+                    env_s, policy, [t] * G_local, s_cfg, tokenize=True, log_fn=log))
+            _rollout_s = time.time() - st0
             model.train()
             optimizer.zero_grad(set_to_none=True)
             # ★ backward 次数必须**恒等于 len(batch)**（红线 B）。原来那句
             #   `if not grp: continue` 会让某个 rank 少一次 backward，其它 rank
             #   就永久卡在 NCCL barrier 上。空组用"零 loss 但带计算图"的 backward 占位。
-            _n_bwd = 0
-            _s_loss_sum = 0.0          # 供 SwanLab 上报的本步平均 loss
-            for t in batch:
-                grp = [r for r in all_roll if r.traj.task_id == t.meta["uid"]]
-                if not grp:
-                    _zbt = _borrow_batch(all_roll, pad_id, device)
-                    if _zbt is None:
-                        raise SystemExit(
-                            "[solver][红线B] 整批 rollout 全空，无法保持各 rank 的 "
-                            "backward 次数一致。检查 run_ez_solver_rollouts 是否静默丢样本")
-                    _z = per_token_logps(model, _zbt.input_ids, _zbt.attention_mask).sum() * 0.0
-                    (_z / len(batch)).backward()
-                    _n_bwd += 1
-                    continue
-                advs = group_advantages([r.traj.reward for r in grp], [0] * len(grp),
-                                        use_std=True, ddof=adv_ddof)
-                for r, a in zip(grp, advs):
+            _s_loss_sum = 0.0
+            all_roll: List[EzSolverTrajectory] = []
+            _tokens_local = 0
+            _backward_t0 = time.time()
+            for grp in solver_groups:
+                full_rewards = gather_group_values([r.traj.reward for r in grp], rank, world, dist)
+                full_advs = global_group_advantages(full_rewards, ddof=adv_ddof)
+                for r, a in zip(grp, full_advs[rank::world]):
                     r.traj.advantage = a
-                bt = make_batch([r.traj for r in grp], pad_id, device)
-                with torch.no_grad():
-                    old = per_token_logps(model, bt.input_ids, bt.attention_mask)
-                loss, stt = grpo_loss(model, bt, old, clip_eps, loss_norm=loss_norm)
-                #   ★ 分母是**本 rank 的 batch 条数**（=TPS/world）：DDP 取平均后
-                #     全局正好是 1/TPS。不要手动乘 world。
-                (loss / len(batch)).backward()
-                _s_loss_sum += float(loss.detach().item())
-                _n_bwd += 1
-            if _n_bwd != len(batch):
-                raise SystemExit(f"[solver][红线B] backward 次数 {_n_bwd} != len(batch) {len(batch)}")
+                _g_loss, _g_stats, _g_valid = backward_microbatches(
+                    raw, model, [r.traj for r in grp], pad_id, device, adapter="solver",
+                    clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
+                    loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
+                    group_weight=1.0 / max(len(solver_groups), 1))
+                _s_loss_sum += _g_loss
+                all_roll.extend(grp)
+                _tokens_local += sum(int(sum(r.traj.loss_mask[1:])) for r in grp)
+            _cuda_sync()
+            _backward_s = time.time() - _backward_t0
             # ★ S 相位也打一行同款诊断：判读脚本要靠「真实 backward grad_norm」把
             #   「有梯度却没位移」（真断链，FATAL）和「本来就没梯度」（奖励全同分，
             #   正确不动）分开。只有 P 相位有诊断行时，S 相位的 0/504 无法判定。
             _nofS = {id(p): n for n, p in raw.named_parameters()}
+            _sync_t0 = time.time()
+            _cuda_sync()
+            sync_active_adapter_gradients(raw, "solver", world, sync_bucket_mb, dist)
+            _cuda_sync()
+            _sync_s = time.time() - _sync_t0
             _actS = [p for p in opt_params if p.grad is not None and p.requires_grad]
             _gnS = float(sum(p.grad.detach().float().norm() for p in _actS)) if _actS else 0.0
             _gnSA = float(sum(p.grad.detach().float().norm() for p in _actS
                               if ".lora_A." in _nofS.get(id(p), "")))
             _gnSB = float(sum(p.grad.detach().float().norm() for p in _actS
                               if ".lora_B." in _nofS.get(id(p), "")))
+            _step_t0 = time.time()
             torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
             update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}")
+            if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
+                _sync_max = check_adapter_sync(raw, "solver", world, dist)
+                log(f"[adapter-sync] phase=solver step={step} status=PASS max_abs={_sync_max:.3e}")
+            optimizer.zero_grad(set_to_none=True)
+            _cuda_sync()
+            _optimizer_s = time.time() - _step_t0
             rw = [r.traj.reward for r in all_roll]
-            log(f"[outer {outer}][S{step}] rank={rank} batch={len(batch)}/{TPS} "
+            _s_metric = torch.tensor([_s_loss_sum], device=device, dtype=torch.float64)
+            if world > 1:
+                dist.all_reduce(_s_metric, op=dist.ReduceOp.SUM)
+            _s_loss_sum_global = float(_s_metric.item())
+            del _s_metric
+            log(f"[outer {outer}][S{step}] rank={rank} global_tasks={len(batch)} local_G={G_local} "
                 f"| reward mean={np.mean(rw):.3f} "
                 f"| final_match={sum(r.verify.final_match for r in all_roll)}/{len(all_roll)} "
                 f"| pool={len(outer_pool)} | {time.time()-st0:.0f}s")
             log(f"[outer {outer}][S{step}] 诊断 真实 backward grad_norm={_gnS:.4e} "
                 f"({len(_actS)} 个张量有 grad；A={_gnSA:.4e} B={_gnSB:.4e})"
                 f"{'  ← 奖励全同分 ⇒ 优势全 0 ⇒ 梯度精确为 0，参数不动是正确的' if _gnS == 0.0 else ''}")
+            _mem_alloc, _mem_reserved = _cuda_peak_gib()
+            _token_metric = torch.tensor([_tokens_local], dtype=torch.int64, device=device)
+            if world > 1:
+                dist.all_reduce(_token_metric, op=dist.ReduceOp.SUM)
+            _tokens_global = int(_token_metric.item())
+            del _token_metric
+            log(f"[telemetry] phase=solver outer={outer} step={step} rollout_s={_rollout_s:.3f} "
+                f"backward_s={_backward_s:.3f} sync_s={_sync_s:.3f} optimizer_s={_optimizer_s:.3f} "
+                f"generated_tokens_global={_tokens_global} generated_tokens_local={_tokens_local} "
+                f"effective_global_batch={len(batch) * G} "
+                f"cuda_peak_allocated_gib={_mem_alloc:.3f} cuda_peak_reserved_gib={_mem_reserved:.3f} "
+                f"attention={_attention_backend(raw, cfg)}")
             # ---- SwanLab 上报：solver 相位 ----
             # step 要排在同 outer 的 P 相位**之后**（+M_P），否则两条曲线会撞车。
             _sanity = {
-                "train/loss": _s_loss_sum / max(len(batch), 1),
+                "train/loss": _s_loss_sum_global,
                 "train/grad_norm": _gnS,
                 "train/grad_norm_lora_A": _gnSA,
                 "train/grad_norm_lora_B": _gnSB,
@@ -862,15 +1084,20 @@ def main() -> int:
                     title="solver 奖励全 0",
                     text=f"outer {outer} S{step}：{len(all_roll)} 条 rollout 奖励全为 0，"
                          f"本轮可能发生了 reward collapse，去看 train_log.rank0.jsonl")
+            s_done = step + 1 == s_steps
+            if s_done or (step + 1) % 5 == 0:
+                next_outer, next_phase, next_step = ((outer + 1, "proposer", 0) if s_done
+                                                     else (outer, "solver", step + 1))
+                ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-S{step}", cfg,
+                        {"next_outer": next_outer, "next_phase": next_phase,
+                         "next_step": next_step}, task_pool, rank, world,
+                        uid_counter=uid_counter, dry_run=args.dry_run)
             if args.dry_run:
                 break
 
         # ★ 只在 rank0 存档：peft 保存的是 adapter（几百 MB），8 个 rank 各存一份
         #   既浪费又会在同一路径上互相踩。（deepspeed 靠不同的 zero stage 存分片，
         #   我们不走那条路。）
-        if is_main(rank):
-            ez_save(raw, tokenizer, run_dir, f"outer{outer+1}", cfg, {"outer": outer + 1})
-
     close_all()
     persist_pool()
     # ★ dry-run 只跑 outer 0，但 N 仍是配置里的 4 —— 直接打 N 会让人以为跑了 4 轮

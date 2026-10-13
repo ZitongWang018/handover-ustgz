@@ -216,3 +216,6 @@ E0 (accept 诊断, ~10min×2)
 
 **结论**：想今天就能看到结果 → **立刻提 E1**，同时并行写 E0 那 5 行日志。
 E1 跑完再决定是进 E0 还是先补 KV cache。
+# **已被 [`EZ_REPAIR_PLAN.md`](EZ_REPAIR_PLAN.md) 取代。**
+
+> 下文记录的旧 smoke 参数、TPS/world 约定、计划状态和历史 job 结果不作为当前 EZ 代码的验收说明。请按 [`EZ_REPAIR_PLAN.md`](EZ_REPAIR_PLAN.md) 的全局 G 分片、显式 adapter-sync 验收及未验证边界操作。
