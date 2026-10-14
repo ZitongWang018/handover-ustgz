@@ -89,6 +89,37 @@ def _load_policy(args):
     return HFPolicy(model, tok, enable_thinking=False)
 
 
+def stratified_games(games, n: int):
+    """按 `task_type` **轮转**取样，保证取到的 n 个任务覆盖所有类型。
+
+    为什么必须有这个（2026-10-14 实测发现，比 top_k 那个崩溃更隐蔽）：
+        valid_unseen 的 134 个任务在 `sorted()` 之后是**按类型聚簇**的
+        （目录名以类型开头），而 `look_at_obj_in_light` 因为 `l < p ` 排在最前。
+        实测：**前 16 个任务 100% 是 look_at_obj_in_light**。
+        训练中 `mid_eval_solver` 用的正是 `eval_game_files[:16]` ——
+        于是"中间评测"测的是 6 类任务里的 1 类（18/134），曲线严重失真。
+        n>=len(games) 时直接返回全量（等价于全量评测）。
+    """
+    from collections import defaultdict
+    if n <= 0 or n >= len(games):
+        return list(games)
+    buckets = defaultdict(list)
+    for g in games:
+        buckets[task_type_of(g)].append(g)
+    order = sorted(buckets)
+    out = []
+    depth = 0
+    deepest = max(len(v) for v in buckets.values())
+    while len(out) < n and depth <= deepest:
+        for k in order:
+            if len(out) >= n:
+                break
+            if depth < len(buckets[k]):
+                out.append(buckets[k][depth])
+        depth += 1
+    return out
+
+
 def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     observations, views, _admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
@@ -161,7 +192,12 @@ def main():
     #   "head"    = 取排序后的前 n 个 —— **与训练中 mid_eval_solver 完全同一批任务**
     #               （ez_train 里就是 `eval_game_files[:_n]`，无 shuffle）。
     #               想补训练期间漏掉的某个 outer 的评测点，必须用 head 才可比。
-    ap.add_argument("--select", choices=["shuffle", "head"], default="shuffle")
+    # ★ 任务子集怎么选，决定这个数字能不能和别的评测点比：
+    #   "stratify" = 按 task_type 轮转，**覆盖全部 6 类**（默认，强烈推荐）
+    #   "head"     = 排序后取前 n 个 —— ⚠️ 实测前 16 个全是 look_at_obj_in_light，
+    #                只有 1 类任务！保留它只为"分片跑全量"（配合 --offset 可以无缝拼回全集）
+    #   "shuffle"  = 固定 seed 随机抽 n 个（本脚本最老的行为）
+    ap.add_argument("--select", choices=["stratify", "shuffle", "head"], default="stratify")
     # ★ 分片用：`--offset k --n m` 取 [k, k+m)。配合每卡一个 shard 就能把全量
     #   valid_unseen（134 任务 × 4 采样 = 536 条轨迹）压到一次作业里跑完。
     ap.add_argument("--offset", type=int, default=0,
@@ -212,6 +248,9 @@ def main():
     games = sorted(collect_game_files(env_cfg, "eval_out_of_distribution"))
     if args.select == "shuffle":
         random.Random(args.seed).shuffle(games)
+    elif args.select == "stratify":
+        # 先重排成"按类型轮转"的全序，再切 offset/n —— 这样分片也照样覆盖所有类型
+        games = stratified_games(games, 0)
     if args.offset:
         games = games[args.offset:]
     if args.n > 0:

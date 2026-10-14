@@ -378,11 +378,14 @@ def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
     `sync_fn` = 采样后端权重刷新回调（vLLM 后端才需要；HF 后端传 None）。
     """
     from alfworld_env import task_instance_id, task_type_of
-    from eval_ez import _rollout_batch
+    from eval_ez import _rollout_batch, stratified_games
     select_adapter(raw, "solver")
     if sync_fn:
         sync_fn("solver")
     raw.eval()
+    # ★ 调用方传进来的 games 可能已经是子集；这里再按类型轮转重排一次，
+    #   保证"取前 k 个做评测"永远覆盖全部任务类型（见 eval_game_files 处的注释）。
+    games = stratified_games(list(games), 0)
     eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
                              max_new_tokens=max_new_tokens, temperature=temperature,
                              top_p=0.95, top_k=-1, repetition_penalty=1.05,
@@ -631,6 +634,12 @@ def main() -> int:
     game_files = collect_game_files(alf_cfg, split=cfg["env"].get("split", "train"))
     log(f"[data] {len(game_files)} train games")
     # 中间评测用 valid_unseen（官方口径）。排序保证各次评测/各 rank 一致可比。
+    #
+    # ★★ 但**不能**用 `sorted(...)[:n]` 取子集：valid_unseen 的 134 个任务在 sorted()
+    #    之后是按类型聚簇的（目录名以类型开头），而 look_at_obj_in_light 因为
+    #    `l < p` 排在最前 —— 实测**前 16 个 100% 是 look_at_obj_in_light**。
+    #    旧写法等于 6 类任务只测 1 类（18/134），"中间评测"的曲线会严重失真。
+    #    统一改成按类型轮转取样（`eval_ez.stratified_games`），与独立评测脚本同一份逻辑。
     eval_game_files = sorted(collect_game_files(alf_cfg, "eval_out_of_distribution"))
 
     p_cfg = ProposerConfig(
@@ -914,7 +923,7 @@ def main() -> int:
             _pt0 = time.time()
             _pt_n = max(1, min(eval_n_tasks, 4))
             _sr0, _won0 = mid_eval_solver(
-                raw, policy, alf_cfg, eval_game_files[:_pt_n],
+                raw, policy, alf_cfg, stratified_games(eval_game_files, _pt_n),
                 max_steps=eval_max_steps,
                 temperature=cfg["solver"].get("temperature", 1.0),
                 max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
@@ -1322,7 +1331,9 @@ def main() -> int:
                         dist.barrier()
                     if is_main(rank):
                         _n = min(eval_n_tasks, 4) if args.dry_run else eval_n_tasks
-                        _eg = eval_game_files[:_n] if _n > 0 else eval_game_files
+                        # ★ 必须按类型轮转取子集：`eval_game_files[:_n]` 会全落在一个类型上
+                        _eg = (stratified_games(eval_game_files, _n) if _n > 0
+                               else eval_game_files)
                         _t0 = time.time()
                         # ★★ 评测必须**被包住**：评测是"只读旁路"，它挂了不该拖垮训练。
                         #   实测教训（job 13026569）：评测里一个 `top_k=0` 让 rank0 抛异常，
