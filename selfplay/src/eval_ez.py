@@ -32,9 +32,51 @@ def _pkg_version(name):
 
 def _load_policy(args):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     base = os.path.expandvars(os.path.expanduser(args.base))
     tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+
+    if args.backend == "vllm":
+        # vLLM 只认 PEFT 目录，所以先用 CPU 上的 PEFT 模型把 solver adapter 导出来。
+        # ★ 走这里而不是 HF，是因为本脚本要支持"全量 valid_unseen（134 任务 × 4 采样
+        #   = 536 条轨迹 × 30 回合）"这种规模 —— HF 逐 token 循环要跑好几小时，
+        #   vLLM 连续批处理快一个数量级。两条路径的采样参数语义由
+        #   `ez_vllm_policy.normalize_sampling` 统一，不会出现"评测脚本和训练脚本
+        #   对同一个 top_k 理解不同"的情况。
+        import gc
+        import tempfile
+
+        from ez_vllm_policy import VLLMPolicy, build_vllm_engine, export_lora_adapter
+
+        adapter_dir = None
+        if not args.base_only:
+            from peft import PeftModel
+            from transformers import AutoModelForCausalLM
+
+            cpu = AutoModelForCausalLM.from_pretrained(
+                base, dtype=torch.bfloat16, trust_remote_code=True)
+            cpu = PeftModel.from_pretrained(cpu, str(Path(args.ckpt) / "solver"),
+                                            adapter_name="solver")
+            adapter_dir = export_lora_adapter(cpu, "solver",
+                                              tempfile.mkdtemp(prefix="eval_lora_"))
+            print(f"[eval-ez] exported solver adapter -> {adapter_dir}", flush=True)
+            del cpu
+            gc.collect()
+
+        eng = build_vllm_engine(
+            base,
+            gpu_memory_utilization=float(os.environ.get("ZTWANG_VLLM_GMEM", "0.85")),
+            max_model_len=int(args.max_context_tokens),
+            max_num_seqs=int(os.environ.get("ZTWANG_VLLM_MAX_SEQS", "64")),
+        )
+        policy = VLLMPolicy(eng, tok, log_fn=lambda m: print(m, flush=True))
+        if adapter_dir:
+            policy.set_lora("solver", adapter_dir)
+        return policy
+
+    from transformers import AutoModelForCausalLM
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         base, torch_dtype=dtype, trust_remote_code=True,
@@ -105,11 +147,25 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--base", required=True, help="explicit HF base model path")
+    ap.add_argument("--base", default=os.environ.get("ZTWANG_MODEL_PATH", ""),
+                    help="explicit HF base model path（默认取 $ZTWANG_MODEL_PATH）")
     ap.add_argument("--ckpt", default=None, help="EZ checkpoint directory containing solver/")
     ap.add_argument("--base-only", action="store_true", help="evaluate explicit base without adapter")
+    # ★★ 采样后端：hf 与训练默认一致；vllm 快一个数量级，做全量 valid_unseen 评测时建议开。
+    #   两条路径的采样参数由 `ez_vllm_policy.normalize_sampling` 归一，语义一致。
+    ap.add_argument("--backend", choices=["hf", "vllm"], default="hf")
     ap.add_argument("--config", default=str(SRC.parent / "configs" / "base_config.yaml"))
     ap.add_argument("--n", type=int, default=0, help="valid_unseen games; 0 evaluates the full split")
+    # ★ 任务子集怎么选，决定这个数字能不能和别的评测点比：
+    #   "shuffle" = 固定 seed 随机抽 n 个（本脚本的历史行为，适合独立评测）
+    #   "head"    = 取排序后的前 n 个 —— **与训练中 mid_eval_solver 完全同一批任务**
+    #               （ez_train 里就是 `eval_game_files[:_n]`，无 shuffle）。
+    #               想补训练期间漏掉的某个 outer 的评测点，必须用 head 才可比。
+    ap.add_argument("--select", choices=["shuffle", "head"], default="shuffle")
+    # ★ 分片用：`--offset k --n m` 取 [k, k+m)。配合每卡一个 shard 就能把全量
+    #   valid_unseen（134 任务 × 4 采样 = 536 条轨迹）压到一次作业里跑完。
+    ap.add_argument("--offset", type=int, default=0,
+                    help="从排序后的第 offset 个任务开始取（与 --select head 配合做分片）")
     ap.add_argument("--samples", type=int, default=4)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--max-steps", type=int, default=30)
@@ -117,19 +173,30 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=96)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--top-k", type=int, default=0)
+    # ★★ 默认值必须是 -1（禁用），不能是 0。历史上这里是 0：HF 的
+    #   `if cfg.top_k and cfg.top_k > 0` 让 0 = "不启用" 所以无害，但 vLLM 把 0 当
+    #   非法值直接抛 `ValueError: top_k must be -1 (disable), or at least 1, got 0.`
+    #   —— 同一个坑在训练里已经炸过一次（job 13026569 整个作业报废）。
+    #   现在两条后端都由 `normalize_sampling` 兜底，但默认值本身也要给对。
+    ap.add_argument("--top-k", type=int, default=-1)
     ap.add_argument("--repetition-penalty", type=float, default=1.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     ap.add_argument("--attn", choices=["flash_attention_2", "sdpa", "eager"], default="flash_attention_2")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if not args.base:
+        ap.error("--base 未给且 $ZTWANG_MODEL_PATH 为空")
     if not args.base_only and not args.ckpt:
         ap.error("--ckpt is required unless --base-only is set")
     if args.samples <= 0 or args.batch <= 0 or args.max_steps <= 0:
         ap.error("samples, batch, and max-steps must be positive")
-    if args.max_context_tokens <= args.max_new_tokens or args.top_k < 0:
-        ap.error("max-context-tokens must exceed max-new-tokens and top-k must be nonnegative")
+    # 只拒绝**真正非法**的 top-k：-1 = 禁用（vLLM 口径），>=1 = 启用。
+    # 0 按"禁用"处理（HF 的历史语义），不再像旧版那样把它当合法默认值、
+    # 反而把 -1 当非法（那正好写反了）。
+    if args.max_context_tokens <= args.max_new_tokens or args.top_k < -1:
+        ap.error("max-context-tokens must exceed max-new-tokens, "
+                 "and top-k must be -1 (disable) or >= 1")
 
     from alfworld_compat import install as install_alfworld_compat
     install_alfworld_compat(verbose=True)
@@ -143,7 +210,10 @@ def main():
         pass
     env_cfg = load_alfworld_config(args.config)
     games = sorted(collect_game_files(env_cfg, "eval_out_of_distribution"))
-    random.Random(args.seed).shuffle(games)
+    if args.select == "shuffle":
+        random.Random(args.seed).shuffle(games)
+    if args.offset:
+        games = games[args.offset:]
     if args.n > 0:
         games = games[:args.n]
     if not games:
@@ -156,6 +226,9 @@ def main():
         stop_mode="tool_call", max_batch_size=2)
     samples = []
     started = time.time()
+    if args.backend == "vllm":
+        from ez_vllm_policy import normalize_sampling
+        print(f"[eval-ez] backend=vllm 实际采样参数={normalize_sampling(rollout_cfg)}", flush=True)
     eval_rows = [(g, sample) for g in games for sample in range(args.samples)]
     for start in range(0, len(eval_rows), args.batch):
         rows = eval_rows[start:start + args.batch]
@@ -186,6 +259,7 @@ def main():
         "checkpoint": None if args.base_only else str(Path(args.ckpt).resolve()),
         "base_only": args.base_only,
         "split": "eval_out_of_distribution", "n_tasks": len(games),
+        "select": args.select, "offset": args.offset,
         "samples_per_task": args.samples, "sample_count": len(samples),
         "sample_level_success_mean": statistics.mean([r["won"] for r in samples]) if samples else 0.0,
         "sample_level_success_std": statistics.pstdev([r["won"] for r in samples]) if samples else 0.0,
@@ -194,11 +268,15 @@ def main():
         "per_task_sample_success": {k: {"mean": statistics.mean(v),
                                         "std": statistics.pstdev(v), "n": len(v)}
                                     for k, v in by_task.items()},
-        "seed": args.seed,
+        "seed": args.seed, "backend": args.backend,
         "decode": {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k,
                    "repetition_penalty": args.repetition_penalty,
                    "max_new_tokens": args.max_new_tokens, "max_steps": args.max_steps,
                    "max_context_tokens": args.max_context_tokens},
+        # ★ 把**后端实际收到**的参数也记下来（归一化之后），否则事后看 JSON 无法判断
+        #   `top_k=0` 到底被当成了"禁用"还是"报错"。
+        "decode_effective": (normalize_sampling(rollout_cfg)
+                             if args.backend == "vllm" else None),
         "metadata": {"alfworld": _pkg_version("alfworld"), "textworld": _pkg_version("textworld"),
                      "torch": _pkg_version("torch"), "transformers": _pkg_version("transformers"),
                      "peft": _pkg_version("peft"), "elapsed_seconds": time.time() - started},
