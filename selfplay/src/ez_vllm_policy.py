@@ -139,6 +139,52 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
     )
 
 
+def normalize_sampling(cfg: RolloutConfig) -> Dict[str, Any]:
+    """把 `RolloutConfig` 的采样参数翻译成 **vLLM 能接受的**取值。
+
+    ⚠️ 为什么必须显式归一（实测踩坑，job 13026569，作业直接报废）：
+        HF 侧的写法是"**只在参数 > 0 时才生效**"——见 `rollout._generate_batch`：
+            if cfg.top_k and cfg.top_k > 0: gen_kwargs["top_k"] = cfg.top_k
+        所以 `top_k=0` 在 HF 路径里等价于"不启用"，**完全无害**；
+        于是 `ez_train.mid_eval_solver` 里那句 `top_k=0` 一直没人发现。
+        但 vLLM 把 0 当**非法值**直接抛：
+            ValueError: top_k must be -1 (disable), or at least 1, got 0.
+        而它发生在 **rank0 的评测**里 ⇒ rank0 死 ⇒ 其余 7 个 rank 卡在 NCCL
+        集合通信上等到超时 ⇒ **1.4 小时的训练全部报废**。
+
+    所以这里统一做一次"HF 无害写法 → vLLM 合法写法"的翻译，一处封死；
+    返回的字典直接喂 `SamplingParams`。翻译规则与 HF 的语义一一对应：
+        top_k <= 0   → -1（禁用）      （HF: 只有 > 0 才加）
+        top_p         → clamp 到 (0,1] （HF: 只有 < 1.0 才加；1.0 等价于不加）
+        min_p <= 0    → 0.0（禁用）    （HF: 只有 > 0 才加）
+        temperature   → > 0            （vLLM 不接受 0）
+        rep. penalty  → > 0
+    """
+    top_k = int(cfg.top_k)
+    top_k = top_k if top_k >= 1 else -1
+    top_p = float(cfg.top_p)
+    top_p = 1.0 if top_p >= 1.0 else max(top_p, 1e-6)
+    min_p = float(cfg.min_p)
+    min_p = min(max(min_p, 0.0), 1.0)
+    temp = max(float(cfg.temperature), 1e-5)
+    rep = max(float(cfg.repetition_penalty), 1e-5)
+
+    # 兜底断言：任何一处超界都在**采样之前**报错并指出是哪个参数，
+    # 而不是让 vLLM 在引擎深处抛异常把 EngineCore 打死（那样整个作业一起完）。
+    if top_k != -1 and top_k < 1:
+        raise ValueError(f"top_k 归一化失败：{top_k}")
+    if not (0.0 < temp):
+        raise ValueError(f"temperature 必须 > 0，得到 {temp}")
+    if not (0.0 < rep):
+        raise ValueError(f"repetition_penalty 必须 > 0，得到 {rep}")
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p 必须落在 (0,1]，得到 {top_p}")
+    if not (0.0 <= min_p <= 1.0):
+        raise ValueError(f"min_p 必须落在 [0,1]，得到 {min_p}")
+    return {"temperature": temp, "top_p": top_p, "top_k": top_k,
+            "min_p": min_p, "repetition_penalty": rep}
+
+
 class VLLMPolicy(HFPolicy):
     """`HFPolicy` 的 vLLM 版：分词面全复用，只有生成走连续批处理。"""
 
@@ -186,11 +232,6 @@ class VLLMPolicy(HFPolicy):
 
         sp = SamplingParams(
             n=1,
-            temperature=max(float(cfg.temperature), 1e-5),
-            top_p=float(cfg.top_p),
-            top_k=int(cfg.top_k),
-            min_p=float(cfg.min_p),
-            repetition_penalty=float(cfg.repetition_penalty),
             max_tokens=int(cfg.max_new_tokens),
             stop_token_ids=eos_ids or None,
             ignore_eos=False,
@@ -198,6 +239,7 @@ class VLLMPolicy(HFPolicy):
             # 让 vLLM 再解一遍纯属白烧 CPU。
             detokenize=False,
             logprobs=None,
+            **normalize_sampling(cfg),
         )
         prompts = [{"prompt_token_ids": [int(t) for t in ids]} for ids in prompt_ids_list]
         outs = self.llm.generate(prompts, sampling_params=sp,

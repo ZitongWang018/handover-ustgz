@@ -385,7 +385,7 @@ def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
     raw.eval()
     eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
                              max_new_tokens=max_new_tokens, temperature=temperature,
-                             top_p=0.95, top_k=0, repetition_penalty=1.05,
+                             top_p=0.95, top_k=-1, repetition_penalty=1.05,
                              max_context_tokens=max_context_tokens,
                              stop_mode="tool_call", max_batch_size=batch_size)
     won = []
@@ -1324,22 +1324,40 @@ def main() -> int:
                         _n = min(eval_n_tasks, 4) if args.dry_run else eval_n_tasks
                         _eg = eval_game_files[:_n] if _n > 0 else eval_game_files
                         _t0 = time.time()
-                        _sr, _won = mid_eval_solver(
-                            raw, policy, alf_cfg, _eg,
-                            max_steps=eval_max_steps,
-                            temperature=cfg["solver"].get("temperature", 1.0),
-                            max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
-                            max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
-                            batch_size=eval_batch, seed=seed + outer + 1,
-                            log_fn=log, sync_fn=sync_rollout_adapter)
-                        log(f"[eval] outer {outer} 完成 valid_unseen SR={_sr:.4f} "
-                            f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
-                            f"{(time.time() - _t0) / 60:.1f}min)")
-                        _REPORTER.log({
-                            "eval/valid_unseen_sr": _sr,
-                            "eval/n_won": int(sum(_won)),
-                            "eval/n_tasks": len(_eg),
-                        }, step=(outer + 1) * (M_P + M_S))
+                        # ★★ 评测必须**被包住**：评测是"只读旁路"，它挂了不该拖垮训练。
+                        #   实测教训（job 13026569）：评测里一个 `top_k=0` 让 rank0 抛异常，
+                        #   rank0 直接退出 ⇒ 其余 7 个 rank 卡在 dist.barrier() 上等 NCCL
+                        #   超时 ⇒ **1.4 小时的训练（outer 0 全 50 步）整个报废**。
+                        #   而且 rank0 之外的人只看到"卡住"，看不到真正的报错。
+                        #   注意 `mid_eval_solver` 内部会切 adapter，异常时必须切回来，
+                        #   否则后续采样会用错 adapter（静默的 on-policy 破坏）。
+                        try:
+                            _sr, _won = mid_eval_solver(
+                                raw, policy, alf_cfg, _eg,
+                                max_steps=eval_max_steps,
+                                temperature=cfg["solver"].get("temperature", 1.0),
+                                max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
+                                max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
+                                batch_size=eval_batch, seed=seed + outer + 1,
+                                log_fn=log, sync_fn=sync_rollout_adapter)
+                        except Exception as _eev:  # noqa: BLE001
+                            log(f"[eval][FATAL-BUT-IGNORED] outer {outer} 评测失败，"
+                                f"**训练继续**（评测是只读旁路，不该拖垮训练）："
+                                f"{type(_eev).__name__}: {_eev}")
+                            import traceback as _tb
+                            log("[eval][FATAL-BUT-IGNORED] " +
+                                _tb.format_exc().replace("\n", " | ")[:1500])
+                            select_adapter(raw, "proposer")
+                            sync_rollout_adapter("proposer")
+                        else:
+                            log(f"[eval] outer {outer} 完成 valid_unseen SR={_sr:.4f} "
+                                f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
+                                f"{(time.time() - _t0) / 60:.1f}min)")
+                            _REPORTER.log({
+                                "eval/valid_unseen_sr": _sr,
+                                "eval/n_won": int(sum(_won)),
+                                "eval/n_tasks": len(_eg),
+                            }, step=(outer + 1) * (M_P + M_S))
                     if world > 1:
                         dist.barrier()
             if args.dry_run:
