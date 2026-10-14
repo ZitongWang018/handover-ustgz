@@ -101,8 +101,17 @@ def stratified_games(games, n: int):
         n>=len(games) 时直接返回全量（等价于全量评测）。
     """
     from collections import defaultdict
-    if n <= 0 or n >= len(games):
-        return list(games)
+    if not games:
+        return []
+    if n <= 0:
+        # ★★ `n<=0` 必须表示"**全量，但按类型轮转重排**"，不能原样返回！
+        #    踩过的坑：旧写法 `if n <= 0 or n >= len(games): return list(games)`
+        #    让 `stratified_games(games, 0)` 变成恒等函数，调用方再 `[:n]` 切片时
+        #    拿到的还是**未重排**的头 n 个 —— 实测头 16 个全是 look_at_obj_in_light，
+        #    于是"分层评测"实际没分层（tag 写着 stratify，测的却是单一类）。
+        n = len(games)
+    if n >= len(games):
+        n = len(games)
     buckets = defaultdict(list)
     for g in games:
         buckets[task_type_of(g)].append(g)
@@ -138,6 +147,11 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     won = [False] * len(used)
     steps = [0] * len(used)
     actions = [[] for _ in used]
+    # ★ 逐回合记录解析结果：`parse_tool_call` 判成 malformed 时，下面会**静默**
+    #   把动作换成 "look"。如果不统计，看到的就是"模型一直在 look"这种假象 ——
+    #   而真实情况可能是"模型想说别的、但输出没被解析成功"。这两种情况的修法完全不同。
+    kind_counts = [{"action_valid": 0, "action_invalid": 0, "malformed": 0,
+                    "control": 0} for _ in used]
     for _ in range(max_steps):
         if not any(active):
             break
@@ -148,6 +162,12 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
         for j, slot in enumerate(idxs):
             parsed = parse_tool_call(texts[j])
             command = parsed.action if parsed.kind == "action" else "look"
+            if parsed.kind == "malformed":
+                kind_counts[slot]["malformed"] += 1
+            elif parsed.kind == "action":
+                kind_counts[slot]["action_valid"] += 1
+            else:
+                kind_counts[slot]["control"] += 1
             parsed_by_slot[slot] = parsed
             commands[slot] = command
             actions[slot].append(command)
@@ -173,6 +193,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
              "game_file": used[i], "sample": records[i]["sample"],
              "won": won[i], "steps": steps[i], "actions": actions[i],
+             "kinds": kind_counts[i],
              "max_steps_reached": bool(active[i])} for i in range(len(used))]
 
 

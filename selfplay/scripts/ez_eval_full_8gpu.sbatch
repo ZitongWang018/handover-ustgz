@@ -46,6 +46,8 @@ NSHARD="${EZ_SHARDS:-8}"
 TOTAL=$(( ${EZ_TOTAL:-134} ))
 PER=$(( (TOTAL + NSHARD - 1) / NSHARD ))
 TAG="$(basename "$(dirname "$EZ_CKPT")")-$(basename "$EZ_CKPT")"
+# 基座对照：--base-only 时忽略 adapter；tag 加后缀避免与 adapter 结果互相覆盖
+EXTRA=""; [ "${EZ_BASE_ONLY:-0}" = "1" ] && { EXTRA="--base-only"; TAG="${TAG}-baseonly"; }
 
 echo "job=${SLURM_JOB_ID} ckpt=$EZ_CKPT backend=$BACKEND samples=$SAMPLES"
 echo "全量 $TOTAL 任务 切成 $NSHARD 片，每片 $PER 个"
@@ -55,7 +57,7 @@ for k in $(seq 0 $((NSHARD - 1))); do
   OFF=$((k * PER))
   OUT="eval_out/full_${TAG}_shard${k}.json"
   ( CUDA_VISIBLE_DEVICES=$k python src/eval_ez.py \
-        --backend "$BACKEND" --base "$ZTWANG_MODEL_PATH" --ckpt "$EZ_CKPT" \
+        --backend "$BACKEND" $EXTRA --base "$ZTWANG_MODEL_PATH" --ckpt "$EZ_CKPT" \
         --select head --offset "$OFF" --n "$PER" \
         --samples "$SAMPLES" --batch "$PER" --seed 42 --out "$OUT" \
         > "logs/evalshard_${TAG}_${k}.log" 2>&1 ; \

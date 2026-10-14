@@ -139,6 +139,29 @@ def extract_task_desc(raw: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+_TASK_PREFIXES = ("Your task is to:", "Your task is:")
+
+
+def strip_task_prefix(text: str) -> str:
+    """去掉 ALFWorld 观测里**自带**的 "Your task is to:" 前缀。
+
+    ⚠️ 实测踩坑（2026-10-14）：`parse_initial_obs` 是按空行切段取第 3 段，
+    取到的是**带前缀的原文** `"Your task is to: examine the alarmclock with the desklamp."`；
+    而 `ez_prompts.SOLVER_USER_TEMPLATE` 自己又会写一遍 `Your task is: {task_description}`，
+    于是渲染出来变成：
+
+        Your task is: Your task is to: examine the alarmclock with the desklamp.
+
+    更关键的是 **训练与评测不一致**：训练侧 solver 拿的是 proposer 生成的 task_desc
+    （不带这个前缀），评测侧拿的是官方原文（带前缀）—— 模型在训练里没见过这种写法。
+    """
+    t = (text or "").strip()
+    for pre in _TASK_PREFIXES:
+        if t.startswith(pre):
+            return t[len(pre):].strip()
+    return t
+
+
 def clean_step_obs(raw: str) -> str:
     """后续 step 的观测去掉 TextWorld 的欢迎头。"""
     if "=-" in raw.split("\n")[0]:
@@ -159,6 +182,8 @@ def parse_obs(raw: str) -> ObsView:
     env_desc, task_desc = parse_initial_obs(raw)
     if not task_desc:
         task_desc = extract_task_desc(raw)
+    # 统一去掉自带前缀，保证训练/评测两条路径与 prompt 模板不重复
+    task_desc = strip_task_prefix(task_desc)
     return ObsView(raw=raw, env_desc=env_desc, task_desc=task_desc)
 
 
