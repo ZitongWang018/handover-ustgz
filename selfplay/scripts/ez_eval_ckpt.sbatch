@@ -54,10 +54,11 @@ nvidia-smi -L
 
 GPU=0
 for B in $BACKENDS; do
-  OUT="eval_out/${TAG}-${B}-n${N}s${SAMPLES}.json"
+  OUT="eval_out/${TAG}-${B}-${SELECT}-n${N}s${SAMPLES}${EZ_BASE_ONLY:+-baseonly}.json"
   echo "########## backend=$B -> $OUT (gpu$GPU) ##########"
+  EXTRA=""; [ "${EZ_BASE_ONLY:-0}" = "1" ] && EXTRA="--base-only"
   CUDA_VISIBLE_DEVICES=$GPU python src/eval_ez.py \
-      --backend "$B" \
+      --backend "$B" $EXTRA \
       --base "$ZTWANG_MODEL_PATH" \
       --ckpt "$EZ_CKPT" \
       --n "$N" --samples "$SAMPLES" --select "$SELECT" --batch "$BATCH" \
