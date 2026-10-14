@@ -32,7 +32,11 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 MKL_NUM
 export OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export HF_HUB_OFFLINE=1
-export PYTHONPATH="$PROJ/selfplay/src:$PROJ/selfplay/third_party/py310deps:${PYTHONPATH:-}"
+# ★ 不要把 py310deps 放进 PYTHONPATH：它含 numpy 源码目录，会遮蔽 site-packages
+#   的 numpy 并抛 "should not try to import numpy from its source directory"。
+#   改由 skillrise/_deps/sitecustomize.py 在 site-packages 就位后 append 到 sys.path 末尾。
+export SKR_PY310DEPS="$PROJ/selfplay/third_party/py310deps"
+export PYTHONPATH="$PROJ/selfplay/src:$PROJ/skillrise/_deps:${PYTHONPATH:-}"
 
 # Respect a scheduler/container-assigned device mask. Each worker sees exactly
 # one entry from that mask, while rank-to-device ordering stays deterministic.
