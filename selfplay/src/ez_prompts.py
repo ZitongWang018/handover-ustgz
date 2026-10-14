@@ -164,6 +164,168 @@ def build_solver_messages(observation: str, task_desc: str) -> List[Dict[str, st
     ]
 
 
+_RICH_SYSTEM = """You are an agent acting in a text-based household environment (ALFWorld).
+
+How the environment works:
+- You can only interact with things at your current location. Use "go to X" to move.
+- Objects are inside or on receptacles (countertops, cabinets, drawers, shelves, fridge, ...). To find an object, visit likely receptacles; "open X" closed ones (cabinets, drawers, fridge, microwave, safe) to see inside.
+- You can carry only one object at a time. "take OBJ from RECEP" picks it up; "move OBJ to RECEP" puts it down.
+- To heat an object: take it, go to the microwave, then "heat OBJ with microwave".
+- To cool an object: take it, go to the fridge, then "cool OBJ with fridge".
+- To clean an object: take it, go to the sinkbasin, then "clean OBJ with sinkbasin".
+- To look at/examine an object under a lamp: take the object, go to where the desklamp is, then "use desklamp".
+- For "two" tasks, place the first object, then find and place the second one.
+- "Nothing happens." means the action had no effect: do not repeat it, try something else.
+- Do not keep revisiting the same places; explore receptacles you have not checked yet."""
+
+_RICH_USER = """Task:
+{task}
+
+Step {step} of {max_steps}.
+
+Recent history:
+{history}
+
+Actions that had no effect so far (avoid repeating them):
+{failed}
+
+Current observation:
+{observation}
+
+Available actions:
+{actions}
+
+Think about which sub-goal you are on (find the object, take it, transform it, place it) and choose the single best next action to complete the task.
+Return ONLY the exact action text from the available actions."""
+
+
+def solver_style() -> str:
+    """`EZ_SOLVER_STYLE=rich` 切到"主流 rich scaffold"；默认 `ours`（我们原来的骨架）。
+
+    为什么要加这一档（2026-10-14 调研实锤）：公开复现里**同一个 Qwen3-4B base**，
+    只把 prompt 从 "strict" 换成 "rich"，valid_unseen 就从 **3.5% 提到 10.4%**
+    （episode 加权；未加权的 6 类平均是 12.0%）。rich 相对 strict 只多了四样东西：
+      ① system 里 10 条环境规则（物体在哪、`open X`、一次只拿一件、
+         heat→微波炉 / cool→冰箱 / clean→水槽、`"Nothing happens."` 即无效别重复、别反复回同一地点）
+      ② 步数计数器 `Step i of N`
+      ③ 失败动作黑名单
+      ④ 子目标提示（找物体→拿起→变换→放置）
+    而且它**每步把合法动作表编号列出**，要模型 `Return ONLY the exact action text`
+    —— 让模型从菜单里**照抄**一条原文，而不是自己构造 JSON。
+    这正是我们缺的那 3 倍。
+    """
+    import os
+    return os.environ.get("EZ_SOLVER_STYLE", "ours").strip().lower()
+
+
+def build_solver_messages_rich(task: str, observation: str, history, admissible,
+                               step: int, max_steps: int, failed) -> List[Dict[str, str]]:
+    """rich scaffold 的每步重建式 prompt（与公开实现逐字对齐）。
+
+    注意它是**无状态重建**：每步用 (task, observation, history, failed, admissible)
+    重新拼整条消息，而不是在对话后面追加。所以调用方必须自己维护 history / failed。
+    """
+    h = "\n".join(f"> {a}\n{o}" for a, o in history) if history else "(none)"
+    acts = "\n".join(f"{i}. {c}" for i, c in enumerate(admissible))
+    return [
+        {"role": "system", "content": _RICH_SYSTEM},
+        {"role": "user", "content": _RICH_USER.format(
+            task=task, step=step + 1, max_steps=max_steps, history=h,
+            failed=", ".join(failed) if failed else "(none)",
+            observation=str(observation).strip(), actions=acts)},
+    ]
+
+
+def admissible_suffix(admissible: Sequence[str]) -> str:
+    """把**当前这步的全部合法动作**拼成一小段，附在每回合的 feedback 尾巴上。
+
+    ⚠️ 为什么（2026-10-14 实测诊断）：基座的评测动作分布是
+        `look` **60.7%**、`go to X` 33.7%、`take` 1.0%、`heat` 0.7%
+       —— 模型几乎不尝试完成任务。注意 `look` 和 `inventory` 是动作表里**唯二不需要
+       任何参数**的调用；基座模型 schema 遵循能力弱，就会往"最省事、不用拼实例名"
+       那条路上塌。而 ALFWorld 要求实例名**逐字精确**（`desk 1` vs `desk 2`），
+       自己拼几乎必错。
+
+    把合法动作表直接给出来，模型就能**照抄一条完整命令**，同时绕开两个坑：
+      * 不用猜实例编号；* 不用自己构造 JSON 参数。
+    论文没写明给不给（我们复现计划里记为风险 U3），所以用开关控制、默认关闭。
+    `EZ_SOLVER_ADMISSIBLE=1` 打开。
+    """
+    import os
+    if os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") != "1" or not admissible:
+        return ""
+    items = [str(a).strip() for a in admissible if str(a).strip()]
+    if not items:
+        return ""
+    return "\n" + ADMISSIBLE_HINT.format(admissible=", ".join(items))
+
+
+def resolve_action(text: str, admissible: Sequence[str]) -> tuple:
+    """把模型输出解析成一条合法动作，返回 `(command, how)`。**永不返回"无动作"**。
+
+    逐字移植自公开 rich-scaffold 复现（`Masoudjafaripour/VLM-VLA-Embodied-Agents`,
+    `baseline/ALFWorld/alfworld_eval/llm_agent.py::parse_action`）的六档链，
+    这是目前唯一被验证能把 Qwen3-4B base 拉到 valid_unseen 10.4% 的解析器：
+
+        exact → index → cleaned → substring → fuzzy → fallback(永不 no-action)
+
+    为什么必须这么宽（2026-10-14 落盘 4033 条真实样本后定论）：rich scaffold 每步把
+    合法动作表**编号列出**，Qwen3 base 的输出原样长这样：
+        '2. go to the desklamp. use desklamp.'
+        '2. go to the sinkbasin, then "clean OBJ from the sinkbasin".'
+    即 **接着编号往下写 + 散文式多从句**。我们原来的解析器只有 exact/子串两档，
+    于是 **89.8% 被判失败**（`action: 0`）、全塌成 `look`。缺的就是 index 与 fuzzy。
+
+    ★ 每一档都只在 admissible 白名单里取，**不可能**返回非法动作。
+    """
+    import os
+    import re as _re
+    if not admissible or os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1":
+        return "", "none"
+    adm = [str(a).strip() for a in admissible]
+
+    def _normalize(x: str) -> str:
+        x = _re.sub(r"[^a-zA-Z0-9 ]+", " ", str(x).lower())
+        return _re.sub(r"\s+", " ", x).strip()
+
+    raw = str(text).strip()
+    # 1) exact（未清洗前先试）
+    if raw in adm:
+        return raw, "exact"
+    # 去 <think>...</think>
+    raw = _re.sub(r"<think>.*?(</think>|$)", "", raw, flags=_re.S)
+    lines = [l for l in raw.strip().splitlines() if l.strip()]
+    text = lines[0].strip() if lines else ""
+    text = text.strip("`*\"' ")
+    text = __re.sub(r"^(?:action|next action|answer|command|output)\s*[:\-]\s*", "", text, flags=_re.I)
+    text = text.lstrip("> ").strip("`*\"' ").rstrip(".").strip()
+    # 2) index：整串就是个编号 → 直接取 admissible[i]
+    if text.isdigit() and int(text) < len(adm):
+        return adm[int(text)], "index"
+    # 3) cleaned：去掉 `N.` 前缀后再试
+    text = __re.sub(r"^\d+\s*[.):\-]\s*", "", text).strip("`*\"' ").rstrip(".").strip()
+    norm = {_normalize(c): c for c in adm}
+    if _normalize(text) in norm:
+        return norm[_normalize(text)], "cleaned"
+    # 4) substring：带词边界地在**整段原文**里找（去包含关系，避免 look 抢走更长的命令）
+    low = _normalize(raw)
+    hits = [c for c in adm if __re.search(r"(?<!\w)" + _re.escape(_normalize(c)) + r"(?!\w)", low)]
+    hits = [c for c in hits if not any(c != h and _normalize(c) in _normalize(h) for h in hits)]
+    if len(hits) == 1:
+        return hits[0], "substring"
+    # 5) fuzzy：忽略空格后完全相同
+    squashed = _normalize(text).replace(" ", "")
+    same = [c for k, c in norm.items() if k.replace(" ", "") == squashed]
+    if len(same) == 1:
+        return same[0], "fuzzy"
+    # 5b) fuzzy：唯一前缀补全（模型只写了前半条命令）
+    comp = [c for k, c in norm.items() if text and k.startswith(_normalize(text) + " ")]
+    if len(comp) == 1:
+        return comp[0], "fuzzy"
+    # 6) fallback：**永不无动作**（与参考实现一致）
+    return ("look" if "look" in adm else adm[0]), "fallback"
+
+
 def recover_bare_command(text: str, admissible: Sequence[str]) -> str:
     """从"被判 malformed"的输出里抢救出一条**确实可执行**的自然命令。
 

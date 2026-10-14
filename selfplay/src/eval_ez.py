@@ -19,8 +19,9 @@ sys.path.insert(0, str(SRC))
 from alfworld_env import (ALFWorldBatchEnv, collect_game_files, load_alfworld_config,
                           task_instance_id, task_type_of)
 from ez_proposer import parse_tool_call
-from ez_prompts import (build_solver_messages, dump_malformed,
-                        recover_bare_command)
+from ez_prompts import (admissible_suffix, build_solver_messages,
+                        build_solver_messages_rich, dump_malformed,
+                        recover_bare_command, resolve_action, solver_style)
 from rollout import HFPolicy, RolloutConfig
 
 
@@ -130,6 +131,82 @@ def stratified_games(games, n: int):
     return out
 
 
+def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps):
+    """`EZ_SOLVER_STYLE=rich` 的评测循环：每步**重建**整条 prompt（对齐公开 rich scaffold）。
+
+    与默认路径的区别：
+      * prompt 每步用 (task, 当前观测, 最近 5 条 (action,obs), 无效动作黑名单, admissible)
+        重新拼（无状态），而不是在对话后面追加 token；
+      * 合法动作表**编号列出**，要求模型 `Return ONLY the exact action text`；
+      * step0 的观测用**原始 reset obs**（含横幅+房间描述+`Your task is to:` 原句），
+        后续 step 用动作反馈 —— 与参考实现一致。
+    """
+    n = len(used)
+    tasks = [(views[i].task_desc or "").strip() for i in range(n)]
+    cur_obs = [(views[i].raw or "").strip() for i in range(n)]
+    adm = [list(adm0[i]) if adm0 else [] for i in range(n)]
+    hist = [[] for _ in range(n)]
+    failed = [[] for _ in range(n)]
+    active = [True] * n
+    won = [False] * n
+    steps = [0] * n
+    actions = [[] for _ in range(n)]
+    kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0,
+                    "invalid_action": 0} for _ in range(n)]
+    dump_path = os.environ.get("EZ_DUMP_MALFORMED", "")
+
+    for _step in range(max_steps):
+        if not any(active):
+            break
+        idxs = [i for i, yes in enumerate(active) if yes]
+        msgs = [build_solver_messages_rich(tasks[i], cur_obs[i], hist[i][-5:], adm[i],
+                                           _step, max_steps, failed[i][-10:])
+                for i in idxs]
+        buffers = [policy.initial_prompt_ids(m, cfg) for m in msgs]
+        texts, _gen, _ = policy.generate_from_token_ids(buffers, cfg)
+        commands = ["look"] * n
+        parsed_by_slot = [None] * n
+        for j, slot in enumerate(idxs):
+            parsed = parse_tool_call(texts[j])
+            command = parsed.action if parsed.kind == "action" else "look"
+            if parsed.kind == "malformed":
+                kind_counts[slot]["malformed"] += 1
+                _rec, _how = resolve_action(texts[j], adm[slot])
+                if _rec:
+                    command = _rec
+                    kind_counts[slot]["recovered"] += 1
+                    kind_counts[slot][_how.split('-')[0]] = kind_counts[slot].get(
+                        _how.split('-')[0], 0) + 1
+                dump_malformed(dump_path, used[slot], _step, texts[j])
+            elif parsed.kind == "action":
+                kind_counts[slot]["action"] += 1
+            else:
+                kind_counts[slot]["control"] += 1
+            if adm[slot] and command not in adm[slot]:
+                kind_counts[slot]["invalid_action"] += 1
+            parsed_by_slot[slot] = parsed
+            commands[slot] = command
+            actions[slot].append(command)
+            steps[slot] += 1
+        result = env.step(commands)
+        for slot in idxs:
+            won[slot] = bool(result.won[slot]) if result.won else False
+            if result.admissible:
+                adm[slot] = result.admissible[slot]
+            _o = result.obs[slot]
+            hist[slot].append((commands[slot], _o))
+            if "Nothing happens" in (_o or ""):
+                failed[slot].append(commands[slot])
+            cur_obs[slot] = _o
+            if result.dones[slot]:
+                active[slot] = False
+    return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
+             "game_file": used[i], "sample": records[i]["sample"],
+             "won": won[i], "steps": steps[i], "actions": actions[i],
+             "kinds": kind_counts[i],
+             "max_steps_reached": bool(active[i])} for i in range(n)]
+
+
 def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     observations, views, admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
@@ -141,6 +218,9 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
                 "sample": (task_records[0]["sample"] if task_records else 0)}
                for g in used]
+    if solver_style() == "rich":
+        return _rollout_batch_rich(env, policy, used, views, records, admissible,
+                                   cfg, max_steps)
     prompts = [build_solver_messages(views[i].env_desc or views[i].raw,
                                      views[i].task_desc or "") for i in range(len(used))]
     buffers = [policy.initial_prompt_ids(m, cfg) for m in prompts]
@@ -154,8 +234,8 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     adm = list(admissible) if admissible else [[] for _ in used]
     # ★ 逐回合记录解析结果：`parse_tool_call` 判成 malformed 时，下面会**静默**
     #   把动作换成 "look"。不统计就会把"输出没解析成功"误读成"模型一直在 look"。
-    kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0}
-                   for _ in used]
+    kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0,
+                    "invalid_action": 0} for _ in used]
     dump_path = os.environ.get("EZ_DUMP_MALFORMED", "")
     for _step in range(max_steps):
         if not any(active):
@@ -170,10 +250,12 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
             if parsed.kind == "malformed":
                 kind_counts[slot]["malformed"] += 1
                 # 抢救：模型很可能吐的是 ALFWorld 原生自然命令而不是我们的 JSON
-                _rec = recover_bare_command(texts[j], adm[slot])
+                _rec, _how = resolve_action(texts[j], adm[slot])
                 if _rec:
                     command = _rec
                     kind_counts[slot]["recovered"] += 1
+                    kind_counts[slot][_how.split('-')[0]] = kind_counts[slot].get(
+                        _how.split('-')[0], 0) + 1
                 dump_malformed(dump_path, used[slot], _step, texts[j])
             elif parsed.kind == "action":
                 kind_counts[slot]["action"] += 1
@@ -181,6 +263,14 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
                 kind_counts[slot]["control"] += 1
             parsed_by_slot[slot] = parsed
             commands[slot] = command
+            # ★ 无效动作率：ALFWorld 要求**实例名精确**（`desk 1` vs `desk 2`），
+            #   而 solver 走的是 `invalid_action_mode=raw`（不做模糊对齐就发给环境）。
+            #   如果模型吐的 `go to cabinet 5` 在场上根本不存在，环境只会回一句
+            #   "You can't see any cabinet 5"，这一步就纯浪费 —— 表现成"走多少步都不赢"。
+            #   这里用当步的 admissible 直接量出来，把"步数不够"和"动作全废"分开。
+            if adm[slot] and command not in adm[slot]:
+                kind_counts[slot]["invalid_action"] = kind_counts[slot].get(
+                    "invalid_action", 0) + 1
             actions[slot].append(command)
             steps[slot] += 1
             buffers[slot].extend(generated[j])
@@ -193,13 +283,18 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
                 active[slot] = False
                 continue
             parsed = parsed_by_slot[slot]
+            # ★ 开关 EZ_SOLVER_ADMISSIBLE=1 时把本步合法动作表附在 feedback 尾巴上
+            #   （默认返回空串，行为与改动前逐字节一致）。见 ez_prompts.admissible_suffix。
+            _hint = admissible_suffix(adm[slot])
             if parsed.kind == "malformed":
                 feedback = ("Your last response was not a valid tool call. Emit exactly one "
-                            "<tool_call>{...}</tool_call> block.")
+                            "<tool_call>{...}</tool_call> block." + _hint)
             elif parsed.kind in ("declare", "sub_finish", "finish"):
-                feedback = "Only environment actions are valid for you. Keep working on the task."
+                feedback = ("Only environment actions are valid for you. Keep working on the task."
+                            + _hint)
             else:
-                feedback = f"You did: {commands[slot]}\nThe environment responds:\n{result.obs[slot]}"
+                feedback = (f"You did: {commands[slot]}\nThe environment responds:\n"
+                            f"{result.obs[slot]}" + _hint)
             suffix = (policy.assistant_end_ids() + policy.append_feedback_ids(feedback) +
                       policy.next_generation_prefix_ids(feedback))
             buffers[slot].extend(suffix)

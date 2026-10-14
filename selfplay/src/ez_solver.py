@@ -18,6 +18,7 @@ import numpy as np
 
 from ez_proposer import _slot_snapshot, parse_tool_call, sanitize_explore_action
 from ez_prompts import append_tool_result, build_solver_messages
+from ez_prompts import admissible_suffix, recover_bare_command
 from ez_state import StateSnapshot, assert_facts_mode
 from ez_verify import ProposedTask, SolverRolloutResult, verify_solver_rollout
 from rollout import (RolloutConfig, Trajectory, _align_slot_tasks)
@@ -31,6 +32,21 @@ class EzSolverTrajectory:
     traj: Trajectory
     verify: SolverRolloutResult
     snapshots: List[StateSnapshot]
+
+
+def _adm_for(bs, s):
+    """`EZ_SOLVER_ADMISSIBLE=1` 时才把合法动作表交给 append_tool_result。
+
+    `append_tool_result` 本身**早就支持** inbound 这张表（非空就拼进去），
+    但调用点一直没传 —— 一个典型"能力悬空"。默认关，保证行为逐字节不变。
+    """
+    import os
+    if os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") != "1":
+        return ()
+    try:
+        return bs.admissible[s]
+    except Exception:  # noqa: BLE001
+        return ()
 
 
 def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: RolloutConfig,
@@ -114,7 +130,17 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
                 executed, exact = parsed.action.strip(), parsed.action.strip().lower() in {
                     a.strip().lower() for a in admissible[s]}
             elif parsed.kind == "malformed":
-                executed, exact = "look", False     # 格式违例：空转 + 计数
+                # ★ 先尝试"抢救自然命令"：ALFWorld 原生动作空间就是自然命令字符串
+                #   （`"go to desk 1"`），模型很可能压根不吐 JSON。实测基座 malformed
+                #   占比 53%，其中"非 JSON 开头"占 3%；这条只在能对上当前 admissible
+                #   白名单时才生效，所以**不可能**执行非法动作。默认关（EZ_SOLVER_BARE_FALLBACK=1 打开）。
+                _rec = recover_bare_command(texts[k], admissible[s])
+                if _rec:
+                    executed = _rec
+                    exact = _rec.strip().lower() in {
+                        a.strip().lower() for a in admissible[s]}
+                else:
+                    executed, exact = "look", False     # 格式违例：空转 + 计数
             else:
                 executed, exact = "look", True      # sub_finish/finish 对 solver 无意义：空转
             step_actions[s] = executed
@@ -137,11 +163,12 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             parsed, executed, exact, text, gid = parsed_by_slot[s]
             st = stats[s]
             st.n_steps += 1
-            if parsed.kind == "malformed":
+            if parsed.kind == "malformed" and executed == "look":
                 st.n_format_violation += 1
                 messages[s].append({"role": "user", "content":
                     "Your last response was not a valid tool call. Emit exactly one "
-                    "<tool_call>{...}</tool_call> block."})
+                    "<tool_call>{...}</tool_call> block."
+                    + admissible_suffix(adm[s])})
                 append_feedback(s, messages[s][-1]["content"])
                 if bool(bs.dones[s]):
                     active[s] = False
@@ -150,7 +177,8 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
                 # solver 协议里没有这两个声明：当作普通空转，只轻微计数
                 st.n_invalid += 0
                 messages[s].append({"role": "user", "content":
-                    "Only environment actions are valid for you. Keep working on the task."})
+                    "Only environment actions are valid for you. Keep working on the task."
+                    + admissible_suffix(adm[s])})
                 append_feedback(s, messages[s][-1]["content"])
                 if bool(bs.dones[s]):
                     active[s] = False
@@ -165,7 +193,8 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             if bool(bs.dones[s]):
                 active[s] = False
             else:
-                append_tool_result(messages[s], executed, bs.obs[s])
+                append_tool_result(messages[s], executed, bs.obs[s],
+                                   _adm_for(bs, s))
                 append_feedback(s, messages[s][-1]["content"])
         for s in idxs:
             if active[s]:

@@ -47,7 +47,24 @@ TOTAL=$(( ${EZ_TOTAL:-134} ))
 PER=$(( (TOTAL + NSHARD - 1) / NSHARD ))
 TAG="$(basename "$(dirname "$EZ_CKPT")")-$(basename "$EZ_CKPT")"
 # 基座对照：--base-only 时忽略 adapter；tag 加后缀避免与 adapter 结果互相覆盖
-EXTRA=""; [ "${EZ_BASE_ONLY:-0}" = "1" ] && { EXTRA="--base-only"; TAG="${TAG}-baseonly"; }
+# ▲ 步数上限必须显式可调并写进 tag：专家 oracle 实测 30 步会给成绩硬造 85.1% 天花板
+#   （20/134 个任务连官方专家都赢不了），所以不同 cap 的数字绝不能混在一起比。
+MAXSTEPS="${EZ_MAX_STEPS:-30}"
+# ▲ 采样参数必须显式可调：Qwen3-4B base 自己的 generation_config.json 推荐
+#   temperature=0.6 / top_k=20，而我们一直用 1.0 / 禁用 top_k —— 噪音大得多。
+TEMP="${EZ_TEMPERATURE:-1.0}"; TOPK="${EZ_TOP_K:--1}"
+MAXNEW="${EZ_MAX_NEW:-96}"
+EXTRA="--max-steps ${MAXSTEPS} --temperature ${TEMP} --top-k ${TOPK} --max-new-tokens ${MAXNEW}"
+TAG="${TAG}-mn${MAXNEW}"
+TAG="${TAG}-ms${MAXSTEPS}-t${TEMP}-k${TOPK}"
+# ★ 所有会影响结果的开关都必须进 tag，否则不同配置会**静默互相覆盖**输出文件
+[ "${EZ_SOLVER_ADMISSIBLE:-0}" = "1" ] && TAG="${TAG}-adm"
+[ "${EZ_SOLVER_FEWSHOT_SCHEMA:-0}" = "1" ] && TAG="${TAG}-fs"
+[ "${EZ_SOLVER_STYLE:-ours}" != "ours" ] && TAG="${TAG}-${EZ_SOLVER_STYLE}"
+[ "${EZ_SOLVER_BARE_FALLBACK:-0}" = "1" ] && TAG="${TAG}-bare"
+[ "${EZ_PARSER_STRICT:-0}" = "1" ] && TAG="${TAG}-strict"
+[ -n "${EZ_TAGSUF:-}" ] && TAG="${TAG}-${EZ_TAGSUF}"
+[ "${EZ_BASE_ONLY:-0}" = "1" ] && { EXTRA="$EXTRA --base-only"; TAG="${TAG}-baseonly"; }
 
 echo "job=${SLURM_JOB_ID} ckpt=$EZ_CKPT backend=$BACKEND samples=$SAMPLES"
 echo "全量 $TOTAL 任务 切成 $NSHARD 片，每片 $PER 个"
