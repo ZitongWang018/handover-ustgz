@@ -204,6 +204,8 @@ class HFPolicy:
 
         `stop_len[i]` 是"该行已经可以停下"的生成长度（含触发停止的那个换行）。
         """
+        if cfg.stop_mode not in {"tool_call", "action_line", "eos"}:
+            raise ValueError(f"unsupported stop_mode={cfg.stop_mode!r}")
         torch = self.torch
         # 生成必须用左 padding，否则右侧 pad 会被当成上下文
         prev_side = self.tokenizer.padding_side
@@ -234,26 +236,31 @@ class HFPolicy:
             # 输出永远不触发 -> 每轮白生成到 max_new_tokens（review P2-14）。
             criteria = _ToolCallStopCriteria(
                 self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
-        else:
+        elif cfg.stop_mode == "action_line":
             criteria = _ActionStopCriteria(
                 self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
 
         gen_kwargs = dict(
             max_new_tokens=cfg.max_new_tokens,
             do_sample=cfg.temperature > 0,
-            temperature=max(cfg.temperature, 1e-5),
-            top_p=cfg.top_p,
-            top_k=max(0, int(cfg.top_k)),
             repetition_penalty=cfg.repetition_penalty,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
-            # ⚠️ transformers>=4.5x 不再自动把单个 StoppingCriteria 包成列表，必须显式给 list
-            stopping_criteria=[criteria],
         )
-        if cfg.top_k and cfg.top_k > 0:
-            gen_kwargs["top_k"] = cfg.top_k
-        if cfg.min_p and cfg.min_p > 0:
-            gen_kwargs["min_p"] = cfg.min_p
+        if cfg.stop_mode != "eos":
+            # transformers>=4.5x requires a list for custom criteria.
+            gen_kwargs["stopping_criteria"] = [criteria]
+        if cfg.temperature > 0:
+            gen_kwargs.update(temperature=cfg.temperature, top_p=cfg.top_p,
+                              top_k=max(0, int(cfg.top_k)))
+            if cfg.top_k and cfg.top_k > 0:
+                gen_kwargs["top_k"] = cfg.top_k
+            if cfg.min_p and cfg.min_p > 0:
+                gen_kwargs["min_p"] = cfg.min_p
+        else:
+            # Explicitly clear generation_config sampling defaults for deterministic
+            # evaluation; greedy decoding must not inherit hidden temperature/top-k.
+            gen_kwargs.update(temperature=None, top_p=None, top_k=None, min_p=None)
         # This is safe for Qwen3's selective lm_head path. Other model families
         # fall back to their ordinary generation path.
         import inspect
@@ -329,7 +336,8 @@ class HFPolicy:
                         break
             # 2) 语义闸门：criterion 记录的"写完 Action: 那一行"的长度。
             #    以 eos_pos 作 fallback，避免 criterion 从未触发时把整段（含 pad）吞进来。
-            stop = min(int(criteria.stop_len(i, eos_pos)), eos_pos)
+            semantic_stop = eos_pos if cfg.stop_mode == "eos" else criteria.stop_len(i, eos_pos)
+            stop = min(int(semantic_stop), eos_pos)
             # 3) pad 过滤：整段过滤（而非只弹尾部），杜绝任何 pad 漏进 loss_mask=1。
             ids = [t for t in all_ids[:stop] if t != pad_id]
 

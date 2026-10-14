@@ -152,7 +152,7 @@ def _repair_json(obj_text: str):
 
 #: 动作类型写的常见别名 → 规范名（模型会写 "go to" / "goto" / "pick" 等）
 _ACTION_ALIASES = {
-    "go to": "go_to", "goto": "go_to", "move to": "go_to", "move": "go_to",
+    "go to": "go_to", "goto": "go_to", "move to": "go_to",
     "navigate": "go_to", "walk to": "go_to",
     "pick": "take", "pick up": "take", "grab": "take",
     "put": "move", "place": "move", "put in": "move", "put on": "move",

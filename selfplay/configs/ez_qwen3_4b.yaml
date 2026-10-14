@@ -1,4 +1,4 @@
-# Explorer-Zero 复现配置（ALFWorld × Qwen3-4B base）
+# Explorer-Zero 复现配置（ALFWorld × Qwen3-4B）
 # 数值除注明外均对齐论文 Table 3；标「补全/偏差」的是论文未披露或我们有意偏离处。
 #
 # 用法：
@@ -11,7 +11,7 @@ run:
   output_dir: runs
 
 model:
-  path: $ZTWANG_MODEL_PATH            # 注意：论文用 Qwen3-4B **base**（非 instruct）
+  path: $ZTWANG_MODEL_PATH            # 使用显式配置的 Qwen3-4B 路径；按实际 model card 核验，不据名称替换成 Qwen3-4B-Base。
   # ★ bf16 基座（与主线 fp32 不同，这是有意的）：
   #   主线的 fp32 铁律来自"AdamW 直接更新 bf16 基座权重、更新量被舍入抹掉"。
   #   EZ 里基座**冻结**，只更新 LoRA adapter（peft 默认 fp32 创建），

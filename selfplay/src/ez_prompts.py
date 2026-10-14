@@ -113,30 +113,24 @@ Explore the environment and complete the task."""
 # （骨架注明"因版面省略"），说明论文真实 prompt 是**带示例**的，我们照抄骨架时留空了。
 # 用环境变量 EZ_SOLVER_FEWSHOT=1 打开 one-shot worked example；**默认关闭**
 # （=0 / 未设），保证仍在跑的正式训练的行为与改动前逐字一致。
-# 这块内容逐字使用任务给定的示例，不做改写。
+# 这是仓库自拟诊断示例，不是论文中被省略的作者示例；启用后会改变评测协议。
 SOLVER_FEWSHOT_EXAMPLE = """# Example
 The environment gave this observation:
     You are in a kitchen. You see a countertop 1, a fridge 1, a microwave 1 and an apple 1.
 Your task is: put a hot apple in the microwave.
 Your response must look like this:
     <think></think> I need a hot apple. Apples are usually inside the fridge, so I should go there first.
-    <tool_call>{"name":"alfworld_tool","arguments":{"action_type":"go to fridge 1"}}</tool_call>"""
+    <tool_call>{"name":"alfworld_tool","arguments":{"action_type":"go_to","receptacle_name":"fridge 1"}}</tool_call>"""
 
-# 去混杂用的**同 schema** 变体：任务给定示例里的动作 `{"action_type":"go to fridge 1"}`
-# 与 SOLVER_SYSTEM 的 `_ACTION_SPACE_DOC` 自相矛盾（文档要求 action_type="go_to" +
-# receptacle_name）。实测 `ez_proposer.parse_tool_call`：前者 → malformed（被静默降级成
-# look），后者 → action。为了把"示例无效"和"示例格式错"分开，这里只把那一行换成同 schema 形式，
-# 其余逐字不变。用独立开关 EZ_SOLVER_FEWSHOT_SCHEMA=1 打开（默认关闭）。
-SOLVER_FEWSHOT_EXAMPLE_ONSCHEMA = SOLVER_FEWSHOT_EXAMPLE.replace(
-    '{"action_type":"go to fridge 1"}',
-    '{"action_type":"go_to","receptacle_name":"fridge 1"}')
+# 兼容旧环境变量的别名。它不保留任何可追溯到作者的示例内容。
+SOLVER_FEWSHOT_EXAMPLE_ONSCHEMA = SOLVER_FEWSHOT_EXAMPLE
 
 
 def _solver_fewshot() -> str:
     """返回要在 `# Your Task` 前插入的示例块（含尾换行分隔），默认（都未设/0）为空串。
 
-    - EZ_SOLVER_FEWSHOT=1        → 任务给定的逐字示例
-    - EZ_SOLVER_FEWSHOT_SCHEMA=1 → 同 schema 变体（去混杂对照）
+    - EZ_SOLVER_FEWSHOT=1        → 仓库自拟合法 JSON 示例
+    - EZ_SOLVER_FEWSHOT_SCHEMA=1 → 为兼容旧配置保留的同内容别名
     两者默认都关闭，保证正式训练行为与改动前逐字一致。
     """
     if os.environ.get("EZ_SOLVER_FEWSHOT_SCHEMA", "0") == "1":
@@ -156,11 +150,13 @@ def build_proposer_messages(observation: str, max_turns: int,
     ]
 
 
-def build_solver_messages(observation: str, task_desc: str) -> List[Dict[str, str]]:
+def build_solver_messages(observation: str, task_desc: str,
+                         admissible: Sequence[str] = ()) -> List[Dict[str, str]]:
+    initial_admissible = admissible_suffix(admissible)
     return [
         {"role": "system", "content": SOLVER_SYSTEM},
         {"role": "user", "content": _solver_fewshot() + SOLVER_USER_TEMPLATE.format(
-            observation=observation, task_description=task_desc)},
+            observation=observation, task_description=task_desc) + initial_admissible},
     ]
 
 
@@ -260,33 +256,34 @@ def admissible_suffix(admissible: Sequence[str]) -> str:
     return "\n" + ADMISSIBLE_HINT.format(admissible=", ".join(items))
 
 
-def resolve_action(text: str, admissible: Sequence[str]) -> tuple:
+def resolve_action(text: str, admissible: Sequence[str], *, strict: bool | None = None) -> tuple:
     """把模型输出解析成一条合法动作，返回 `(command, how)`。**永不返回"无动作"**。
 
-    逐字移植自公开 rich-scaffold 复现（`Masoudjafaripour/VLM-VLA-Embodied-Agents`,
-    `baseline/ALFWorld/alfworld_eval/llm_agent.py::parse_action`）的六档链，
-    这是目前唯一被验证能把 Qwen3-4B base 拉到 valid_unseen 10.4% 的解析器：
+    这是为公开 rich-scaffold 适配的多档解析实现，参考了公开 agent 的动作选择逻辑；
+    它并非逐字移植，也不把公开结果归因于单一解析器：
 
         exact → index → cleaned → substring → fuzzy → fallback(永不 no-action)
 
-    为什么必须这么宽（2026-10-14 落盘 4033 条真实样本后定论）：rich scaffold 每步把
-    合法动作表**编号列出**，Qwen3 base 的输出原样长这样：
+    这些启发式用于 rich scaffold 每步提供编号菜单时的输出兼容：
+    合法动作表编号列出时，输出可能包含序号和额外文字，例如：
         '2. go to the desklamp. use desklamp.'
         '2. go to the sinkbasin, then "clean OBJ from the sinkbasin".'
-    即 **接着编号往下写 + 散文式多从句**。我们原来的解析器只有 exact/子串两档，
-    于是 **89.8% 被判失败**（`action: 0`）、全塌成 `look`。缺的就是 index 与 fuzzy。
+    这类输出可能在编号后带有额外文字；不同模型与 prompt 下的命中率需由当前 run 实测。
 
     ★ 每一档都只在 admissible 白名单里取，**不可能**返回非法动作。
     """
     import os
     import re as _re
-    if not admissible or os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1":
+    if strict is None:
+        strict = os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1"
+    if not admissible or strict:
         return "", "none"
     adm = [str(a).strip() for a in admissible]
 
     def _normalize(x: str) -> str:
-        x = _re.sub(r"[^a-zA-Z0-9 ]+", " ", str(x).lower())
-        return _re.sub(r"\s+", " ", x).strip()
+        # Match the public parser's safety-preserving normalization exactly:
+        # case folding and whitespace normalization only.
+        return " ".join(str(x).lower().split())
 
     raw = str(text).strip()
     # 1) exact（未清洗前先试）
@@ -297,19 +294,19 @@ def resolve_action(text: str, admissible: Sequence[str]) -> tuple:
     lines = [l for l in raw.strip().splitlines() if l.strip()]
     text = lines[0].strip() if lines else ""
     text = text.strip("`*\"' ")
-    text = __re.sub(r"^(?:action|next action|answer|command|output)\s*[:\-]\s*", "", text, flags=_re.I)
+    text = _re.sub(r"^(?:action|next action|answer|command|output)\s*[:\-]\s*", "", text, flags=_re.I)
     text = text.lstrip("> ").strip("`*\"' ").rstrip(".").strip()
     # 2) index：整串就是个编号 → 直接取 admissible[i]
     if text.isdigit() and int(text) < len(adm):
         return adm[int(text)], "index"
     # 3) cleaned：去掉 `N.` 前缀后再试
-    text = __re.sub(r"^\d+\s*[.):\-]\s*", "", text).strip("`*\"' ").rstrip(".").strip()
+    text = _re.sub(r"^\d+\s*[.):\-]\s*", "", text).strip("`*\"' ").rstrip(".").strip()
     norm = {_normalize(c): c for c in adm}
     if _normalize(text) in norm:
         return norm[_normalize(text)], "cleaned"
     # 4) substring：带词边界地在**整段原文**里找（去包含关系，避免 look 抢走更长的命令）
     low = _normalize(raw)
-    hits = [c for c in adm if __re.search(r"(?<!\w)" + _re.escape(_normalize(c)) + r"(?!\w)", low)]
+    hits = [c for c in adm if _re.search(r"(?<!\w)" + _re.escape(_normalize(c)) + r"(?!\w)", low)]
     hits = [c for c in hits if not any(c != h and _normalize(c) in _normalize(h) for h in hits)]
     if len(hits) == 1:
         return hits[0], "substring"
@@ -338,7 +335,7 @@ def recover_bare_command(text: str, admissible: Sequence[str]) -> str:
                                                           -> action "go to desk 1" ✓
         而 `_rollout_batch` / `run_ez_solver_rollouts` 会把 malformed **静默换成 look**。
         基座模型很可能根本不吐 JSON、直接吐自然命令 ⇒ **完全可用的回答被丢掉**，
-        表现成"模型一直在 look"。实测基座 malformed 占比 **53.1%**（每两步丢一条）。
+        历史诊断样本出现过这种格式差异；当前格式比例应从对应运行的 trace 单独统计。
 
     ★ 安全性：只在**与当前 admissible 列表能对上**时才采用 ——
       先小写化 + 空白归一，再要求整条命令作为子串出现，取命中的**最长**那条。
@@ -389,3 +386,23 @@ def append_tool_result(messages: List[Dict[str, str]], action_text: str,
         adm = "\nAdmissible actions at this step: " + ", ".join(admissible)
     messages.append({"role": "user",
                      "content": f"You did: {action_text}\nThe environment responds:\n{obs_text}{adm}"})
+
+
+def format_execution_feedback(command: str, observation: str, *, malformed: bool = False,
+                              recovered: bool = False, control: bool = False,
+                              admissible: Sequence[str] = (),
+                              format_error: str = "") -> str:
+    """Include the executed command and real environment observation in every feedback."""
+    prefix = ""
+    if format_error:
+        prefix = format_error.rstrip() + "\n"
+    elif malformed:
+        if recovered:
+            prefix = "Your response format was invalid; the recovered command was executed.\n"
+        else:
+            prefix = "Your response was not a valid tool call; the fallback command was executed.\n"
+    elif control:
+        prefix = "Declarations are not environment actions; the fallback command was executed.\n"
+    text = f"{prefix}You did: {command}\nThe environment responds:\n{observation}"
+    hint = admissible_suffix(admissible)
+    return text + hint

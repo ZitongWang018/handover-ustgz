@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -19,9 +20,12 @@ sys.path.insert(0, str(SRC))
 from alfworld_env import (ALFWorldBatchEnv, collect_game_files, load_alfworld_config,
                           task_instance_id, task_type_of)
 from ez_proposer import parse_tool_call
-from ez_prompts import (admissible_suffix, build_solver_messages,
+from ez_prompts import (build_solver_messages,
                         build_solver_messages_rich, dump_malformed,
-                        recover_bare_command, resolve_action, solver_style)
+                        format_execution_feedback, recover_bare_command,
+                        resolve_action, solver_style)
+from ez_eval_protocol import (aggregate_complete_evaluation,
+                              align_records_to_slots)
 from rollout import HFPolicy, RolloutConfig
 
 
@@ -30,6 +34,80 @@ def _pkg_version(name):
         return version(name)
     except PackageNotFoundError:
         return "unknown"
+
+
+def _manifest(args, policy, *, effective_profile, style, decode, overrides):
+    import ez_prompts
+    prompt_parts = [ez_prompts.SOLVER_SYSTEM, ez_prompts.SOLVER_USER_TEMPLATE]
+    if style == "rich":
+        prompt_parts.extend([ez_prompts._RICH_SYSTEM, ez_prompts._RICH_USER])
+    else:
+        prompt_parts.append(ez_prompts._solver_fewshot())
+    prompt_hash = hashlib.sha256("\n\0\n".join(prompt_parts).encode("utf-8")).hexdigest()
+    chat_template = getattr(getattr(policy, "tokenizer", None), "chat_template", None)
+    chat_hash = (hashlib.sha256(str(chat_template).encode("utf-8")).hexdigest()
+                 if chat_template is not None else None)
+    env_keys = ("ALFWORLD_DATA", "ZTWANG_MODEL_PATH", "EZ_SOLVER_STYLE",
+                "EZ_SOLVER_ADMISSIBLE", "EZ_SOLVER_BARE_FALLBACK",
+                "EZ_SOLVER_STRICT_RESOLVE", "EZ_SOLVER_FEWSHOT",
+                "EZ_SOLVER_FEWSHOT_SCHEMA", "EZ_PARSER_STRICT")
+    model = getattr(policy, "model", None)
+    config = getattr(model, "config", None)
+    actual_attn = getattr(config, "_attn_implementation", None)
+    return {
+        "protocol_requested": args.protocol,
+        "protocol_effective": effective_profile,
+        "faithfulness": ("paper approximation; Figure 14 says Example Omitted and the paper's sampling details are incomplete"
+                         if effective_profile == "paper-approx" else
+                         "public rich zero-shot control; not the Explorer-Zero paper protocol"
+                         if effective_profile == "public-rich" else "custom evaluation protocol"),
+        "prompt_style": style,
+        "prompt_sha256": prompt_hash,
+        "tokenizer_chat_template_sha256": chat_hash,
+        "enable_thinking": False,
+        "tokenizer": getattr(getattr(policy, "tokenizer", None), "name_or_path", None),
+        "base_model": os.path.expandvars(os.path.expanduser(args.base)),
+        "checkpoint": None if args.base_only else str(Path(args.ckpt).resolve()),
+        "adapter": None if args.base_only else "solver",
+        "base_only": args.base_only,
+        "backend": args.backend,
+        "parser": {"type": ("public_admissible_action_text" if style == "rich"
+                              else "ez_json_tool_call"),
+                   "strict": (False if style == "rich" else
+                              os.environ.get("EZ_PARSER_STRICT", "0") == "1"),
+                   "strict_is_diagnostic_only": style == "rich"},
+        "resolver": {"type": "public_whitespace_normalization_plus_unique_resolver",
+                     "strict": (False if style == "rich" else
+                                os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1"),
+                     "ignored_environment_flags": (["EZ_PARSER_STRICT",
+                                                     "EZ_SOLVER_STRICT_RESOLVE"]
+                                                    if style == "rich" else []),
+                     "menu_enabled": True,
+                     "menu_scope": "initial prompt and execution feedback",
+                     "natural_command_recovery": True},
+        "fewshot": {"enabled": (style != "rich" and any(
+                                     os.environ.get(k, "0") == "1"
+                                     for k in ("EZ_SOLVER_FEWSHOT", "EZ_SOLVER_FEWSHOT_SCHEMA"))),
+                    "requested_flags": {k: os.environ.get(k, "0") for k in
+                                        ("EZ_SOLVER_FEWSHOT", "EZ_SOLVER_FEWSHOT_SCHEMA")},
+                    "schema_variant": os.environ.get("EZ_SOLVER_FEWSHOT_SCHEMA", "0") == "1"},
+        "ignored_environment_flags": (["EZ_SOLVER_FEWSHOT", "EZ_SOLVER_FEWSHOT_SCHEMA",
+                                       "EZ_SOLVER_ADMISSIBLE", "EZ_PARSER_STRICT",
+                                       "EZ_SOLVER_STRICT_RESOLVE"]
+                                      if style == "rich" else []),
+        "decode": decode,
+        "samples_per_task": args.samples,
+        "split": "eval_out_of_distribution",
+        "cli_overrides": overrides,
+        "seed": args.seed,
+        "environment": {k: os.environ.get(k) for k in env_keys},
+        "software": {name: _pkg_version(name) for name in
+                     ("alfworld", "textworld", "torch", "transformers", "peft", "vllm")},
+        "model_attention_backend": ("vllm" if args.backend == "vllm"
+                                     else actual_attn or args.attn),
+        "schema_version": 2,
+        "evaluation_run_id": args.run_id,
+    }
 
 
 def _load_policy(args):
@@ -72,6 +150,7 @@ def _load_policy(args):
             gpu_memory_utilization=float(os.environ.get("ZTWANG_VLLM_GMEM", "0.85")),
             max_model_len=int(args.max_context_tokens),
             max_num_seqs=int(os.environ.get("ZTWANG_VLLM_MAX_SEQS", "64")),
+            seed=int(args.seed),
         )
         policy = VLLMPolicy(eng, tok, log_fn=lambda m: print(m, flush=True))
         if adapter_dir:
@@ -151,8 +230,9 @@ def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps)
     won = [False] * n
     steps = [0] * n
     actions = [[] for _ in range(n)]
+    traces = [[] for _ in range(n)]
     kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0,
-                    "invalid_action": 0} for _ in range(n)]
+                    "resolver_modes": {}, "invalid_action": 0} for _ in range(n)]
     dump_path = os.environ.get("EZ_DUMP_MALFORMED", "")
 
     for _step in range(max_steps):
@@ -166,21 +246,30 @@ def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps)
         texts, _gen, _ = policy.generate_from_token_ids(buffers, cfg)
         commands = ["look"] * n
         parsed_by_slot = [None] * n
+        recovered_by_slot = [False] * n
+        resolver_by_slot = ["not_used"] * n
         for j, slot in enumerate(idxs):
-            parsed = parse_tool_call(texts[j])
-            command = parsed.action if parsed.kind == "action" else "look"
-            if parsed.kind == "malformed":
+            parsed = parse_tool_call(texts[j])  # diagnostic only; public rich selects action text
+            # The public rich profile always uses its menu parser semantics; do not
+            # let an ambient EZ-specific strict flag change the executed command.
+            _rec, _how = resolve_action(texts[j], adm[slot], strict=False)
+            resolver_by_slot[slot] = _how
+            command = (_rec if _how != "none" else
+                       ("look" if "look" in adm[slot] else (adm[slot][0] if adm[slot] else "look")))
+            modes = kind_counts[slot]["resolver_modes"]
+            modes[_how] = modes.get(_how, 0) + 1
+            if _how == "fallback":
                 kind_counts[slot]["malformed"] += 1
-                _rec, _how = resolve_action(texts[j], adm[slot])
-                if _rec:
-                    command = _rec
-                    kind_counts[slot]["recovered"] += 1
-                    kind_counts[slot][_how.split('-')[0]] = kind_counts[slot].get(
-                        _how.split('-')[0], 0) + 1
-                dump_malformed(dump_path, used[slot], _step, texts[j])
-            elif parsed.kind == "action":
-                kind_counts[slot]["action"] += 1
             else:
+                kind_counts[slot]["action"] += 1
+                kind_counts[slot]["menu_resolved"] = kind_counts[slot].get("menu_resolved", 0) + 1
+                recovered_by_slot[slot] = _how not in ("exact", "none")
+                if recovered_by_slot[slot]:
+                    kind_counts[slot]["recovered"] += 1
+            if parsed.kind == "action":
+                kind_counts[slot]["json_diagnostic_action_ignored"] = (
+                    kind_counts[slot].get("json_diagnostic_action_ignored", 0) + 1)
+            elif parsed.kind in ("declare", "sub_finish", "finish"):
                 kind_counts[slot]["control"] += 1
             if adm[slot] and command not in adm[slot]:
                 kind_counts[slot]["invalid_action"] += 1
@@ -195,19 +284,31 @@ def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps)
                 adm[slot] = result.admissible[slot]
             _o = result.obs[slot]
             hist[slot].append((commands[slot], _o))
+            traces[slot].append({"step": steps[slot] - 1, "raw_output": texts[idxs.index(slot)],
+                                 "parse_kind": ("menu_fallback" if resolver_by_slot[slot] == "fallback"
+                                                else "menu_action"),
+                                 "json_parse_kind": parsed_by_slot[slot].kind,
+                                 "resolver_mode": resolver_by_slot[slot],
+                                 "executed_command": commands[slot],
+                                 "observation": _o})
             if "Nothing happens" in (_o or ""):
                 failed[slot].append(commands[slot])
+            # Public rich prompts carry the action in history and use the raw
+            # environment observation as the current observation.
             cur_obs[slot] = _o
             if result.dones[slot]:
                 active[slot] = False
     return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
              "game_file": used[i], "sample": records[i]["sample"],
              "won": won[i], "steps": steps[i], "actions": actions[i],
+             "trace": traces[i],
              "kinds": kind_counts[i],
-             "max_steps_reached": bool(active[i])} for i in range(n)]
+             "max_steps_reached": steps[i] >= max_steps,
+             "budget_boundary_not_won": bool(not won[i] and steps[i] >= max_steps)}
+            for i in range(n)]
 
 
-def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
+def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, style=None):
     observations, views, admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
         raise RuntimeError("ALFWorld reset returned a different number of evaluation slots")
@@ -215,10 +316,9 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     #   `used`（实际装载）与 `game_files`（请求）顺序不一致是**正常**的，不能按序比对。
     #   views 与 used 是同一次 shuffle 后的对齐顺序，所以用 `used` 现场重算
     #   task_id/task_type，才是 slot 的真实对应关系。
-    records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
-                "sample": (task_records[0]["sample"] if task_records else 0)}
-               for g in used]
-    if solver_style() == "rich":
+    records = align_records_to_slots(game_files, task_records, used)
+    style = style or solver_style()
+    if style == "rich":
         return _rollout_batch_rich(env, policy, used, views, records, admissible,
                                    cfg, max_steps)
     prompts = [build_solver_messages(views[i].env_desc or views[i].raw,
@@ -228,6 +328,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     won = [False] * len(used)
     steps = [0] * len(used)
     actions = [[] for _ in used]
+    traces = [[] for _ in used]
     # ★ `admissible`（reset 的第 3 个返回值）原来被丢掉了。它是"当前这步环境允许的
     #   全部命令"，是 `recover_bare_command` 唯一的安全依据（只从这张表里挑），
     #   所以必须接住并且**逐步更新**。
@@ -235,7 +336,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     # ★ 逐回合记录解析结果：`parse_tool_call` 判成 malformed 时，下面会**静默**
     #   把动作换成 "look"。不统计就会把"输出没解析成功"误读成"模型一直在 look"。
     kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0,
-                    "invalid_action": 0} for _ in used]
+                    "resolver_modes": {}, "invalid_action": 0} for _ in used]
     dump_path = os.environ.get("EZ_DUMP_MALFORMED", "")
     for _step in range(max_steps):
         if not any(active):
@@ -244,6 +345,8 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
         texts, generated, _ = policy.generate_from_token_ids([buffers[i] for i in idxs], cfg)
         commands = ["look"] * len(used)
         parsed_by_slot = [None] * len(used)
+        recovered_by_slot = [False] * len(used)
+        resolver_by_slot = ["not_used"] * len(used)
         for j, slot in enumerate(idxs):
             parsed = parse_tool_call(texts[j])
             command = parsed.action if parsed.kind == "action" else "look"
@@ -251,11 +354,13 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
                 kind_counts[slot]["malformed"] += 1
                 # 抢救：模型很可能吐的是 ALFWorld 原生自然命令而不是我们的 JSON
                 _rec, _how = resolve_action(texts[j], adm[slot])
-                if _rec:
+                resolver_by_slot[slot] = _how
+                if _rec and _how not in ("none", "fallback"):
                     command = _rec
+                    recovered_by_slot[slot] = True
                     kind_counts[slot]["recovered"] += 1
-                    kind_counts[slot][_how.split('-')[0]] = kind_counts[slot].get(
-                        _how.split('-')[0], 0) + 1
+                    modes = kind_counts[slot]["resolver_modes"]
+                    modes[_how] = modes.get(_how, 0) + 1
                 dump_malformed(dump_path, used[slot], _step, texts[j])
             elif parsed.kind == "action":
                 kind_counts[slot]["action"] += 1
@@ -279,34 +384,38 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
             won[slot] = bool(result.won[slot]) if result.won else False
             if result.admissible:
                 adm[slot] = result.admissible[slot]
+            traces[slot].append({"step": steps[slot] - 1, "raw_output": texts[idxs.index(slot)],
+                                 "parse_kind": parsed_by_slot[slot].kind,
+                                 "resolver_mode": resolver_by_slot[slot],
+                                 "executed_command": commands[slot],
+                                 "observation": result.obs[slot]})
             if result.dones[slot]:
                 active[slot] = False
                 continue
             parsed = parsed_by_slot[slot]
-            # ★ 开关 EZ_SOLVER_ADMISSIBLE=1 时把本步合法动作表附在 feedback 尾巴上
-            #   （默认返回空串，行为与改动前逐字节一致）。见 ez_prompts.admissible_suffix。
-            _hint = admissible_suffix(adm[slot])
-            if parsed.kind == "malformed":
-                feedback = ("Your last response was not a valid tool call. Emit exactly one "
-                            "<tool_call>{...}</tool_call> block." + _hint)
-            elif parsed.kind in ("declare", "sub_finish", "finish"):
-                feedback = ("Only environment actions are valid for you. Keep working on the task."
-                            + _hint)
-            else:
-                feedback = (f"You did: {commands[slot]}\nThe environment responds:\n"
-                            f"{result.obs[slot]}" + _hint)
+            feedback = format_execution_feedback(
+                commands[slot], result.obs[slot], malformed=parsed.kind == "malformed",
+                recovered=recovered_by_slot[slot],
+                control=parsed.kind not in ("action", "malformed"),
+                admissible=adm[slot])
             suffix = (policy.assistant_end_ids() + policy.append_feedback_ids(feedback) +
                       policy.next_generation_prefix_ids(feedback))
             buffers[slot].extend(suffix)
     return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
              "game_file": used[i], "sample": records[i]["sample"],
              "won": won[i], "steps": steps[i], "actions": actions[i],
+             "trace": traces[i],
              "kinds": kind_counts[i],
-             "max_steps_reached": bool(active[i])} for i in range(len(used))]
+             "max_steps_reached": steps[i] >= max_steps,
+             "budget_boundary_not_won": bool(not won[i] and steps[i] >= max_steps)}
+            for i in range(len(used))]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--protocol", choices=["paper-approx", "public-rich", "custom"],
+                    default="paper-approx",
+                    help="paper approximation or separate public rich zero-shot control")
     ap.add_argument("--base", default=os.environ.get("ZTWANG_MODEL_PATH", ""),
                     help="explicit HF base model path（默认取 $ZTWANG_MODEL_PATH）")
     ap.add_argument("--ckpt", default=None, help="EZ checkpoint directory containing solver/")
@@ -318,9 +427,7 @@ def main():
     ap.add_argument("--n", type=int, default=0, help="valid_unseen games; 0 evaluates the full split")
     # ★ 任务子集怎么选，决定这个数字能不能和别的评测点比：
     #   "shuffle" = 固定 seed 随机抽 n 个（本脚本的历史行为，适合独立评测）
-    #   "head"    = 取排序后的前 n 个 —— **与训练中 mid_eval_solver 完全同一批任务**
-    #               （ez_train 里就是 `eval_game_files[:_n]`，无 shuffle）。
-    #               想补训练期间漏掉的某个 outer 的评测点，必须用 head 才可比。
+    #   "head"    = 取排序后的前 n 个；全量 8 卡脚本按 offset 用它做不重叠分片。
     # ★ 任务子集怎么选，决定这个数字能不能和别的评测点比：
     #   "stratify" = 按 task_type 轮转，**覆盖全部 6 类**（默认，强烈推荐）
     #   "head"     = 排序后取前 n 个 —— ⚠️ 实测前 16 个全是 look_at_obj_in_light，
@@ -331,25 +438,88 @@ def main():
     #   valid_unseen（134 任务 × 4 采样 = 536 条轨迹）压到一次作业里跑完。
     ap.add_argument("--offset", type=int, default=0,
                     help="从排序后的第 offset 个任务开始取（与 --select head 配合做分片）")
-    ap.add_argument("--samples", type=int, default=4)
+    ap.add_argument("--samples", type=int, default=None)
     ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--max-steps", type=int, default=30)
-    ap.add_argument("--max-context-tokens", type=int, default=40960)
-    ap.add_argument("--max-new-tokens", type=int, default=96)
-    ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--max-context-tokens", type=int, default=None)
+    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--top-p", type=float, default=None)
     # ★★ 默认值必须是 -1（禁用），不能是 0。历史上这里是 0：HF 的
     #   `if cfg.top_k and cfg.top_k > 0` 让 0 = "不启用" 所以无害，但 vLLM 把 0 当
     #   非法值直接抛 `ValueError: top_k must be -1 (disable), or at least 1, got 0.`
     #   —— 同一个坑在训练里已经炸过一次（job 13026569 整个作业报废）。
     #   现在两条后端都由 `normalize_sampling` 兜底，但默认值本身也要给对。
-    ap.add_argument("--top-k", type=int, default=-1)
-    ap.add_argument("--repetition-penalty", type=float, default=1.05)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--repetition-penalty", type=float, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     ap.add_argument("--attn", choices=["flash_attention_2", "sdpa", "eager"], default="flash_attention_2")
+    ap.add_argument("--style", choices=["ours", "rich"], default=None,
+                    help="explicit prompt style; deviation from profile marks output custom")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--run-id", default=None,
+                    help="shard-run identity written to the protocol manifest")
     args = ap.parse_args()
+    defaults = ({"samples": 1, "max_steps": 50, "max_context_tokens": 40960,
+                 "max_new_tokens": 32, "temperature": 0.0, "top_p": 0.95,
+                 "top_k": -1, "repetition_penalty": 1.0, "style": "rich",
+                 "stop_mode": "eos"}
+                if args.protocol == "public-rich" else
+                {"samples": 4, "max_steps": 30, "max_context_tokens": 40960,
+                 "max_new_tokens": 96, "temperature": 1.0, "top_p": 0.95,
+                 "top_k": -1, "repetition_penalty": 1.05,
+                 "style": "ours", "stop_mode": "tool_call"})
+    option_names = {"samples": "samples", "max_steps": "max_steps",
+                    "max_context_tokens": "max_context_tokens",
+                    "max_new_tokens": "max_new_tokens", "temperature": "temperature",
+                    "top_p": "top_p", "top_k": "top_k",
+                    "repetition_penalty": "repetition_penalty", "style": "style"}
+    overrides = {}
+    explicit_style = args.style
+    for name, dest in option_names.items():
+        if name == "style":
+            continue
+        supplied = getattr(args, dest)
+        if supplied is None:
+            setattr(args, dest, defaults[name])
+        elif supplied != defaults[name]:
+            overrides[name] = {"profile_default": defaults[name], "effective": supplied}
+    env_profile_overrides = {
+        "fewshot": any(os.environ.get(k, "0") == "1"
+                        for k in ("EZ_SOLVER_FEWSHOT", "EZ_SOLVER_FEWSHOT_SCHEMA")),
+        "admissible_menu": os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") == "1",
+        "parser_strict": os.environ.get("EZ_PARSER_STRICT", "0") == "1",
+        "resolver_strict": os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1",
+    }
+    if args.protocol == "public-rich":
+        args.style = explicit_style or "rich"
+    elif explicit_style is not None:
+        args.style = explicit_style
+    else:
+        args.style = solver_style()
+    if args.style != defaults["style"]:
+        overrides["style"] = {"profile_default": defaults["style"], "effective": args.style}
+    if args.protocol == "paper-approx" and solver_style() != defaults["style"]:
+        overrides["environment_style"] = solver_style()
+    effective_flags = dict(env_profile_overrides)
+    # This evaluator always includes the current admissible menu in the initial
+    # prompt and in feedback, independent of the training-only exposure switch.
+    effective_flags["admissible_menu"] = True
+    if args.style == "rich":
+        effective_flags["fewshot"] = False
+        effective_flags["admissible_menu"] = True
+        effective_flags["parser_strict"] = False
+        effective_flags["resolver_strict"] = False
+    if (effective_flags["parser_strict"] or effective_flags["resolver_strict"] or
+            effective_flags["fewshot"]):
+        overrides["environment_protocol_flags"] = env_profile_overrides
+    defaults["stop_mode"] = "eos" if args.style == "rich" else "tool_call"
+    effective_profile = args.protocol
+    if args.protocol == "public-rich" and overrides:
+        effective_profile = "custom"
+    elif args.protocol == "paper-approx" and overrides:
+        effective_profile = "custom"
     if not args.base:
         ap.error("--base 未给且 $ZTWANG_MODEL_PATH 为空")
     if not args.base_only and not args.ckpt:
@@ -359,9 +529,9 @@ def main():
     # 只拒绝**真正非法**的 top-k：-1 = 禁用（vLLM 口径），>=1 = 启用。
     # 0 按"禁用"处理（HF 的历史语义），不再像旧版那样把它当合法默认值、
     # 反而把 -1 当非法（那正好写反了）。
-    if args.max_context_tokens <= args.max_new_tokens or args.top_k < -1:
+    if args.max_context_tokens <= args.max_new_tokens or args.top_k < -1 or args.temperature < 0:
         ap.error("max-context-tokens must exceed max-new-tokens, "
-                 "and top-k must be -1 (disable) or >= 1")
+                 "top-k must be -1 (disable) or >= 1, and temperature must be >= 0")
 
     from alfworld_compat import install as install_alfworld_compat
     install_alfworld_compat(verbose=True)
@@ -391,7 +561,7 @@ def main():
         max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p,
         top_k=args.top_k, repetition_penalty=args.repetition_penalty,
         max_context_tokens=args.max_context_tokens,
-        stop_mode="tool_call", max_batch_size=2)
+        stop_mode=defaults["stop_mode"], max_batch_size=2)
     samples = []
     started = time.time()
     if args.backend == "vllm":
@@ -405,57 +575,56 @@ def main():
                     "sample": sample} for g, sample in rows]
         env = ALFWorldBatchEnv(env_cfg, split="eval_out_of_distribution",
                                batch_size=len(rows), seed=args.seed + start,
+                               max_episode_steps=args.max_steps,
                                with_expert=False, with_facts=False,
                                ignore_benchmark_done=False)
         try:
             samples.extend(_rollout_batch(env, policy, game_batch, records, rollout_cfg,
-                                          args.max_steps))
+                                          args.max_steps, style=args.style))
         finally:
             env.close()
         if start == 0 or (start // args.batch + 1) % 25 == 0:
             print(f"[eval-ez] {min(start + len(rows), len(eval_rows))}/{len(eval_rows)} samples",
                   flush=True)
 
-    by_type = defaultdict(list)
-    by_task = defaultdict(list)
-    for row in samples:
-        by_type[row["task_type"]].append(float(row["won"]))
-        by_task[row["task_id"]].append(float(row["won"]))
+    expected_tasks = {task_instance_id(g): task_type_of(g) for g in games}
+    if len(expected_tasks) != len(games):
+        raise RuntimeError("selected valid_unseen games contain duplicate task ids")
+    summary = aggregate_complete_evaluation(samples, expected_tasks, args.samples)
+    decode = {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k,
+              "repetition_penalty": args.repetition_penalty,
+              "max_new_tokens": args.max_new_tokens, "max_steps": args.max_steps,
+              "max_context_tokens": args.max_context_tokens, "stop_mode": defaults["stop_mode"]}
+    if args.backend == "vllm":
+        from ez_vllm_policy import normalize_sampling
+        decode_effective = normalize_sampling(rollout_cfg)
+    elif args.temperature == 0:
+        decode_effective = {"do_sample": False, "temperature": None, "top_p": None,
+                            "top_k": None, "repetition_penalty": args.repetition_penalty,
+                            "stop_mode": defaults["stop_mode"]}
+    else:
+        decode_effective = {"do_sample": True, **decode}
+    manifest = _manifest(args, policy, effective_profile=effective_profile,
+                         style=args.style, decode=decode, overrides=overrides)
     report = {
-        "protocol": "official_alfworld_valid_unseen_benchmark_done",
-        "base": os.path.expandvars(os.path.expanduser(args.base)),
-        "checkpoint": None if args.base_only else str(Path(args.ckpt).resolve()),
-        "base_only": args.base_only,
-        "split": "eval_out_of_distribution", "n_tasks": len(games),
+        "schema_version": 2,
+        "protocol": "alfworld_valid_unseen_official_benchmark_done",
+        "protocol_manifest": manifest,
+        "split": "eval_out_of_distribution",
         "select": args.select, "offset": args.offset,
-        "samples_per_task": args.samples, "sample_count": len(samples),
-        "sample_level_success_mean": statistics.mean([r["won"] for r in samples]) if samples else 0.0,
-        "sample_level_success_std": statistics.pstdev([r["won"] for r in samples]) if samples else 0.0,
-        "task_type": {k: {"mean": statistics.mean(v), "std": statistics.pstdev(v), "n": len(v)}
-                      for k, v in sorted(by_type.items())},
-        "per_task_sample_success": {k: {"mean": statistics.mean(v),
-                                        "std": statistics.pstdev(v), "n": len(v)}
-                                    for k, v in by_task.items()},
-        "seed": args.seed, "backend": args.backend,
-        "decode": {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k,
-                   "repetition_penalty": args.repetition_penalty,
-                   "max_new_tokens": args.max_new_tokens, "max_steps": args.max_steps,
-                   "max_context_tokens": args.max_context_tokens},
-        # ★ 把**后端实际收到**的参数也记下来（归一化之后），否则事后看 JSON 无法判断
-        #   `top_k=0` 到底被当成了"禁用"还是"报错"。
-        "decode_effective": (normalize_sampling(rollout_cfg)
-                             if args.backend == "vllm" else None),
-        "metadata": {"alfworld": _pkg_version("alfworld"), "textworld": _pkg_version("textworld"),
-                     "torch": _pkg_version("torch"), "transformers": _pkg_version("transformers"),
-                     "peft": _pkg_version("peft"), "elapsed_seconds": time.time() - started},
-        "samples": samples,
+        "expected_task_ids": list(expected_tasks),
+        "summary": summary,
+        "decode_effective": decode_effective,
+        "elapsed_seconds": time.time() - started,
+        "sample_rows": samples,
     }
     out = Path(args.out) if args.out else Path("runs/eval_ez") / (
         "base-only.json" if args.base_only else "solver-adapter.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[eval-ez] sample SR={report['sample_level_success_mean']:.4f} "
-          f"sample SD={report['sample_level_success_std']:.4f}; wrote {out}")
+    print(f"[eval-ez] episode-weighted SR={summary['episode_weighted_sr']:.4f}; "
+          f"per-sample whole-suite SR={summary['sample_suite_success_rates']} "
+          f"population SD={summary['sample_suite_sr_population_std']:.4f}; wrote {out}")
     return 0
 
 

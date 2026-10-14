@@ -17,8 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 
 from ez_proposer import _slot_snapshot, parse_tool_call, sanitize_explore_action
-from ez_prompts import append_tool_result, build_solver_messages
-from ez_prompts import admissible_suffix, recover_bare_command
+from ez_prompts import (build_solver_messages, format_execution_feedback,
+                        recover_bare_command)
 from ez_state import StateSnapshot, assert_facts_mode
 from ez_verify import ProposedTask, SolverRolloutResult, verify_solver_rollout
 from rollout import (RolloutConfig, Trajectory, _align_slot_tasks)
@@ -94,7 +94,7 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
         t = tasks[slot_task[s]]
         # ★ EZ：附录 G Fig.14 solver prompt；观测里塞 proposer 任务 x
         v = views[s]
-        msg = build_solver_messages(v.env_desc or v.raw, t.task_desc)
+        msg = build_solver_messages(v.env_desc or v.raw, t.task_desc, admissible[s])
         messages.append(msg)
         # Solve-rate estimation and training must sample from identical token-native
         # histories. `tokenize` controls only whether the final trajectory is retained.
@@ -125,6 +125,7 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
         parsed_by_slot: Dict[int, Any] = {}
         for k, s in enumerate(idxs):
             parsed = parse_tool_call(texts[k])
+            recovered = False
             if parsed.kind == "action":
                 # EZ's default policy is raw: preserve invalid commands as generated.
                 executed, exact = parsed.action.strip(), parsed.action.strip().lower() in {
@@ -137,6 +138,7 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
                 _rec = recover_bare_command(texts[k], admissible[s])
                 if _rec:
                     executed = _rec
+                    recovered = True
                     exact = _rec.strip().lower() in {
                         a.strip().lower() for a in admissible[s]}
                 else:
@@ -144,7 +146,7 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             else:
                 executed, exact = "look", True      # sub_finish/finish 对 solver 无意义：空转
             step_actions[s] = executed
-            parsed_by_slot[s] = (parsed, executed, exact, texts[k], gen_ids[k])
+            parsed_by_slot[s] = (parsed, executed, exact, texts[k], gen_ids[k], recovered)
             # Every generated response is part of the policy trajectory, even if malformed
             # or a control action. Keep its real ids so subsequent feedback has context.
             messages[s].append({"role": "assistant", "content": texts[k].strip()})
@@ -160,29 +162,16 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             snap_hist[s].append(_sn)
 
         for s in idxs:
-            parsed, executed, exact, text, gid = parsed_by_slot[s]
+            parsed, executed, exact, text, gid, recovered = parsed_by_slot[s]
             st = stats[s]
             st.n_steps += 1
-            if parsed.kind == "malformed" and executed == "look":
+            if parsed.kind == "malformed":
                 st.n_format_violation += 1
-                messages[s].append({"role": "user", "content":
-                    "Your last response was not a valid tool call. Emit exactly one "
-                    "<tool_call>{...}</tool_call> block."
-                    + admissible_suffix(adm[s])})
-                append_feedback(s, messages[s][-1]["content"])
-                if bool(bs.dones[s]):
-                    active[s] = False
-                continue
-            if parsed.kind in ("sub_finish", "finish"):
-                # solver 协议里没有这两个声明：当作普通空转，只轻微计数
+            is_control = parsed.kind not in ("action", "malformed")
+            if is_control:
+                # Declarations are ignored as actions, but the fallback look is real and
+                # its observation must remain in the trajectory context.
                 st.n_invalid += 0
-                messages[s].append({"role": "user", "content":
-                    "Only environment actions are valid for you. Keep working on the task."
-                    + admissible_suffix(adm[s])})
-                append_feedback(s, messages[s][-1]["content"])
-                if bool(bs.dones[s]):
-                    active[s] = False
-                continue
             if exact:
                 st.n_valid_steps += 1
             else:
@@ -193,12 +182,16 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
             if bool(bs.dones[s]):
                 active[s] = False
             else:
-                append_tool_result(messages[s], executed, bs.obs[s],
-                                   _adm_for(bs, s))
-                append_feedback(s, messages[s][-1]["content"])
+                step_admissible = _adm_for(bs, s)
+                content = format_execution_feedback(
+                    executed, bs.obs[s], malformed=parsed.kind == "malformed",
+                    recovered=recovered,
+                    control=is_control, admissible=step_admissible)
+                messages[s].append({"role": "user", "content": content})
+                append_feedback(s, content)
         for s in idxs:
             if active[s]:
-                admissible[s] = bs.admissible[s]
+                admissible[s] = bs.admissible[s] if bs.admissible else []
 
     out: List[EzSolverTrajectory] = []
     for s in range(n):

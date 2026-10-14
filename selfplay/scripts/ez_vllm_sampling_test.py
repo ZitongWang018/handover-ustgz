@@ -41,7 +41,8 @@ CASES = [
     ("min_p=0（HF 不启用）", {"min_p": 0.0}, {"min_p": 0.0}),
     ("min_p<0（非法）", {"min_p": -0.3}, {"min_p": 0.0}),
     ("min_p=1.5（非法）", {"min_p": 1.5}, {"min_p": 1.0}),
-    ("temperature=0（HF 走 greedy）", {"temperature": 0.0}, {"temperature": 1e-5}),
+    ("temperature=0（HF/vLLM 走 greedy）", {"temperature": 0.0},
+     {"temperature": 0.0, "top_k": -1, "top_p": 1.0, "min_p": 0.0}),
     ("repetition_penalty=0（非法）", {"repetition_penalty": 0.0},
      {"repetition_penalty": 1e-5}),
 ]
@@ -61,10 +62,17 @@ def main() -> int:
     for name, over, _ in CASES:
         n = normalize_sampling(RolloutConfig(**over))
         assert n["top_k"] == -1 or n["top_k"] >= 1, name
-        assert 0.0 < n["temperature"], name
+        assert 0.0 <= n["temperature"], name
         assert 0.0 < n["repetition_penalty"], name
         assert 0.0 < n["top_p"] <= 1.0, name
         assert 0.0 <= n["min_p"] <= 1.0, name
+    try:
+        normalize_sampling(RolloutConfig(temperature=-0.1))
+    except ValueError:
+        print("  ok  negative temperature is rejected")
+    else:
+        print("FAIL negative temperature accepted")
+        bad += 1
     print(f"  ok  {len(CASES)} 组互不越界")
     print(f"cases={len(CASES)} failures={bad}")
     print("P1-GATE-1b " + ("PASS：采样参数归一化正确" if bad == 0 else "FAIL"))

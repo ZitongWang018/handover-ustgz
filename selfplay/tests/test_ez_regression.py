@@ -581,6 +581,7 @@ def test_eval_loads_only_solver_adapter_and_uses_official_done():
     sys.modules["transformers"], sys.modules["peft"] = transformers, peft
     try:
         args = types.SimpleNamespace(base="base", dtype="bfloat16", attn="eager",
+                                     backend="hf", seed=42,
                                      base_only=False, ckpt="/run/ckpt")
         policy = _load_policy(args)
         assert policy.model.active_adapter == "solver"
@@ -607,8 +608,10 @@ def test_eval_loads_only_solver_adapter_and_uses_official_done():
             view = types.SimpleNamespace(env_desc="room", raw="room", task_desc="look")
             return ["room"], [view], [[]], list(games), [None]
         def step(self, actions):
-            return types.SimpleNamespace(won=[True], dones=[True], obs=["official goal reached"])
+            return types.SimpleNamespace(won=[True], dones=[True], obs=["official goal reached"],
+                                        admissible=[[]])
     out = _rollout_batch(FakeEnv(), FakePolicy(), ["game"],
                          [{"task_id": "id", "task_type": "type", "sample": 0}],
                          types.SimpleNamespace(), max_steps=1)
-    assert out[0]["won"] is True and out[0]["max_steps_reached"] is False
+    assert out[0]["won"] is True and out[0]["max_steps_reached"] is True
+    assert out[0]["budget_boundary_not_won"] is False

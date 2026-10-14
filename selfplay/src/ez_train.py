@@ -45,6 +45,7 @@ import yaml  # noqa: E402
 from alfworld_env import ALFWorldBatchEnv, collect_game_files, load_alfworld_config  # noqa: E402
 from ez_proposer import ProposerConfig, ProposerRollout, run_proposer_exploration  # noqa: E402
 from ez_solver import EzSolverTrajectory, run_ez_solver_rollouts  # noqa: E402
+from ez_prompts import solver_style  # noqa: E402
 from ez_swanlab import EzSwanLab  # noqa: E402
 from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
@@ -386,29 +387,39 @@ def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
     # ★ 调用方传进来的 games 可能已经是子集；这里再按类型轮转重排一次，
     #   保证"取前 k 个做评测"永远覆盖全部任务类型（见 eval_game_files 处的注释）。
     games = stratified_games(list(games), 0)
+    eval_style = solver_style()
     eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
                              max_new_tokens=max_new_tokens, temperature=temperature,
                              top_p=0.95, top_k=-1, repetition_penalty=1.05,
                              max_context_tokens=max_context_tokens,
-                             stop_mode="tool_call", max_batch_size=batch_size)
-    won = []
+                             stop_mode=("eos" if eval_style == "rich" else "tool_call"),
+                             max_batch_size=batch_size)
+    won_rows = []
     for start in range(0, len(games), batch_size):
         gb = games[start:start + batch_size]
         records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
                     "sample": 0} for g in gb]
         env = ALFWorldBatchEnv(alf_cfg, split="eval_out_of_distribution",
                                batch_size=len(gb), seed=seed + start,
+                               max_episode_steps=max_steps,
                                with_expert=False, with_facts=False,
                                ignore_benchmark_done=False)
         try:
-            won.extend(r["won"] for r in _rollout_batch(
-                env, policy, gb, records, eval_cfg, max_steps))
+            won_rows.extend(_rollout_batch(
+                env, policy, gb, records, eval_cfg, max_steps, style=eval_style))
         finally:
             env.close()
     select_adapter(raw, "proposer")
     if sync_fn:
         sync_fn("proposer")
-    return (sum(won) / len(won)) if won else 0.0, won
+    from ez_eval_protocol import aggregate_complete_evaluation
+    from alfworld_env import task_instance_id, task_type_of
+    expected = {task_instance_id(g): task_type_of(g) for g in games}
+    if len(expected) != len(games):
+        raise RuntimeError("quick valid_unseen subset contains duplicate task ids")
+    summary = aggregate_complete_evaluation(won_rows, expected, 1)
+    won = [bool(r["won"]) for r in won_rows]
+    return summary["episode_weighted_sr"], won
 
 
 def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
@@ -921,6 +932,7 @@ def main() -> int:
             dist.barrier()
         if is_main(rank):
             _pt0 = time.time()
+            from eval_ez import stratified_games
             _pt_n = max(1, min(eval_n_tasks, 4))
             _sr0, _won0 = mid_eval_solver(
                 raw, policy, alf_cfg, stratified_games(eval_game_files, _pt_n),
@@ -930,7 +942,7 @@ def main() -> int:
                 max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
                 batch_size=eval_batch, seed=seed,
                 log_fn=log, sync_fn=sync_rollout_adapter)
-            log(f"[eval-pretest] 评测链路 OK：SR={_sr0:.4f} "
+            log(f"[eval-pretest] quick subset/single-sample check (not paper-final): SR={_sr0:.4f} "
                 f"({int(sum(_won0))}/{len(_won0)}，{(time.time() - _pt0) / 60:.1f}min)")
         if world > 1:
             dist.barrier()
@@ -1330,6 +1342,7 @@ def main() -> int:
                     if world > 1:
                         dist.barrier()
                     if is_main(rank):
+                        from eval_ez import stratified_games
                         _n = min(eval_n_tasks, 4) if args.dry_run else eval_n_tasks
                         # ★ 必须按类型轮转取子集：`eval_game_files[:_n]` 会全落在一个类型上
                         _eg = (stratified_games(eval_game_files, _n) if _n > 0
@@ -1361,7 +1374,7 @@ def main() -> int:
                             select_adapter(raw, "proposer")
                             sync_rollout_adapter("proposer")
                         else:
-                            log(f"[eval] outer {outer} 完成 valid_unseen SR={_sr:.4f} "
+                            log(f"[eval] outer {outer} quick subset/single-sample valid_unseen SR={_sr:.4f} "
                                 f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
                                 f"{(time.time() - _t0) / 60:.1f}min)")
                             _REPORTER.log({

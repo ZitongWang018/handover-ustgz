@@ -7,10 +7,9 @@
 #
 # 用法：
 #   sbatch --export=ALL,ZTWANG_MODEL_PATH=...,EZ_CKPT=<ckpt 目录> scripts/ez_eval_ckpt.sbatch
-#   可选：EZ_N=16 EZ_SAMPLES=2 EZ_SELECT=head EZ_BACKENDS="vllm hf"
+#   可选：EZ_PROTOCOL=public-rich EZ_N=16 EZ_SAMPLES=1 EZ_SELECT=stratify EZ_BACKENDS="vllm hf"
 #
-# ★ 默认用 --select head：与训练中 mid_eval_solver 取的是**同一批** 16 个任务
-#   （ez_train 是 eval_game_files[:_n]，不 shuffle），所以补出来的点能和后面的点连成曲线。
+# 默认 stratify：子集覆盖各任务类型。需要与训练中 mid_eval_solver 对齐时，显式 EZ_SELECT=head。
 #SBATCH --job-name=ez-evalckpt
 #SBATCH --account=root
 #SBATCH --partition=i64m1tga800u
@@ -23,7 +22,7 @@
 #SBATCH --output=/hpc2hdd/home/xyu608/ztwang/logs/%x-%j.out
 #SBATCH --error=/hpc2hdd/home/xyu608/ztwang/logs/%x-%j.err
 
-set -uo pipefail
+set -euo pipefail
 PROJ="$HOME/ztwang/selfplay"
 cd "$PROJ"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -35,57 +34,50 @@ export ZTWANG_MODEL_PATH="${ZTWANG_MODEL_PATH:-$HOME/thinktool/models/qwen3_4b}"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=2
 mkdir -p logs eval_out
 
-: "${EZ_CKPT:?Set EZ_CKPT to a checkpoint dir containing solver/}"
-# 允许直接给 run 目录，自动补 /ckpt
-if [ ! -d "$EZ_CKPT/solver" ] && [ -d "$EZ_CKPT/ckpt/solver" ]; then
-  EZ_CKPT="$EZ_CKPT/ckpt"
+BASE_ONLY="${EZ_BASE_ONLY:-0}"
+if [ "$BASE_ONLY" != "1" ]; then
+  : "${EZ_CKPT:?Set EZ_CKPT to a checkpoint dir containing solver/}"
+  if [ ! -d "$EZ_CKPT/solver" ] && [ -d "$EZ_CKPT/ckpt/solver" ]; then
+    EZ_CKPT="$EZ_CKPT/ckpt"
+  fi
+  [ -d "$EZ_CKPT/solver" ] || { echo "FATAL: $EZ_CKPT 下没有 solver/"; exit 2; }
 fi
-[ -d "$EZ_CKPT/solver" ] || { echo "FATAL: $EZ_CKPT 下没有 solver/"; exit 2; }
 
 N="${EZ_N:-16}"
-SAMPLES="${EZ_SAMPLES:-2}"
-SELECT="${EZ_SELECT:-head}"
+PROTOCOL="${EZ_PROTOCOL:-paper-approx}"
+SAMPLES="${EZ_SAMPLES:-$([ "$PROTOCOL" = public-rich ] && echo 1 || echo 4)}"
+SELECT="${EZ_SELECT:-stratify}"
 BATCH="${EZ_BATCH:-$N}"
 BACKENDS="${EZ_BACKENDS:-vllm hf}"
-TAG="$(basename "$(dirname "$EZ_CKPT")")-$(basename "$EZ_CKPT")"
+TAG="${EZ_TAG:-$(basename "${EZ_CKPT:-base-only}")-job${SLURM_JOB_ID:-manual}}"
 export TAG
-echo "job=${SLURM_JOB_ID} ckpt=$EZ_CKPT n=$N samples=$SAMPLES select=$SELECT batch=$BATCH backends=[$BACKENDS]"
+BASE_SUFFIX=""
+[ "$BASE_ONLY" = "1" ] && BASE_SUFFIX="-baseonly"
+echo "job=${SLURM_JOB_ID:-manual} protocol=$PROTOCOL base_only=$BASE_ONLY n=$N samples=$SAMPLES select=$SELECT batch=$BATCH backends=[$BACKENDS]"
 nvidia-smi -L
 
-GPU=0
 for B in $BACKENDS; do
-  OUT="eval_out/${TAG}-${B}-${SELECT}-n${N}s${SAMPLES}${EZ_BASE_ONLY:+-baseonly}.json"
-  echo "########## backend=$B -> $OUT (gpu$GPU) ##########"
-  EXTRA=""; [ "${EZ_BASE_ONLY:-0}" = "1" ] && EXTRA="--base-only"
-  CUDA_VISIBLE_DEVICES=$GPU python src/eval_ez.py \
-      --backend "$B" $EXTRA \
+  OUT="eval_out/${TAG}-${PROTOCOL}-${B}-${SELECT}-n${N}s${SAMPLES}${BASE_SUFFIX}.json"
+  echo "########## protocol=$PROTOCOL backend=$B -> $OUT (serial on visible GPU 0) ##########"
+  EXTRA=(); [ "$BASE_ONLY" = "1" ] && EXTRA+=(--base-only) || EXTRA+=(--ckpt "$EZ_CKPT")
+  CUDA_VISIBLE_DEVICES=0 python src/eval_ez.py \
+      --protocol "$PROTOCOL" --backend "$B" "${EXTRA[@]}" \
       --base "$ZTWANG_MODEL_PATH" \
-      --ckpt "$EZ_CKPT" \
       --n "$N" --samples "$SAMPLES" --select "$SELECT" --batch "$BATCH" \
       --seed 42 --out "$OUT" \
       > "logs/eval_${TAG}_${B}.log" 2>&1
   echo "[$B] exit=$?"
-  GPU=$((GPU + 1))
 done
 
 echo "=================== SUMMARY ==================="
-python3 - <<'EOF'
-import json, glob, os
-for f in sorted(glob.glob("eval_out/" + os.environ.get("TAG", "*") + "*.json")):
-    d = json.load(open(f))
-    print(f"{os.path.basename(f)}")
-    print(f"   SR={d['sample_level_success_mean']:.4f} ± {d['sample_level_success_std']:.4f}"
-          f"  n_tasks={d['n_tasks']} samples={d['sample_count']} select={d.get('select')}"
-          f"  backend={d.get('backend')}")
-    if d.get("decode_effective"):
-        print(f"   实际采样参数={d['decode_effective']}")
-EOF
-echo "=== 逐文件结果 ==="
-for f in eval_out/*.json; do
-  python3 -c "
-import json,sys
-d=json.load(open('$f'))
-print('$f', 'SR=%.4f'%d['sample_level_success_mean'], 'n=%d'%d['n_tasks'],
-      'won=%d/%d'%(round(d['sample_level_success_mean']*d['sample_count']), d['sample_count']))
-" 2>/dev/null
+for B in $BACKENDS; do
+  OUT="eval_out/${TAG}-${PROTOCOL}-${B}-${SELECT}-n${N}s${SAMPLES}${BASE_SUFFIX}.json"
+  python3 - "$OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+s = d["summary"]
+print(f"{sys.argv[1]} episode_weighted_SR={s['episode_weighted_sr']:.4f} "
+      f"sample_suite_SR={s['sample_suite_success_rates']} "
+      f"population_SD={s['sample_suite_sr_population_std']:.4f}")
+PY
 done

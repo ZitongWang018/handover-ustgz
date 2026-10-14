@@ -157,7 +157,7 @@ def normalize_sampling(cfg: RolloutConfig) -> Dict[str, Any]:
         top_k <= 0   → -1（禁用）      （HF: 只有 > 0 才加）
         top_p         → clamp 到 (0,1] （HF: 只有 < 1.0 才加；1.0 等价于不加）
         min_p <= 0    → 0.0（禁用）    （HF: 只有 > 0 才加）
-        temperature   → > 0            （vLLM 不接受 0）
+        temperature   → >= 0           （0 表示 greedy）
         rep. penalty  → > 0
     """
     top_k = int(cfg.top_k)
@@ -166,15 +166,18 @@ def normalize_sampling(cfg: RolloutConfig) -> Dict[str, Any]:
     top_p = 1.0 if top_p >= 1.0 else max(top_p, 1e-6)
     min_p = float(cfg.min_p)
     min_p = min(max(min_p, 0.0), 1.0)
-    temp = max(float(cfg.temperature), 1e-5)
+    temp = float(cfg.temperature)
     rep = max(float(cfg.repetition_penalty), 1e-5)
+    if temp == 0.0:
+        # Greedy decoding must not inherit sampling filters from model defaults.
+        top_k, top_p, min_p = -1, 1.0, 0.0
 
     # 兜底断言：任何一处超界都在**采样之前**报错并指出是哪个参数，
     # 而不是让 vLLM 在引擎深处抛异常把 EngineCore 打死（那样整个作业一起完）。
     if top_k != -1 and top_k < 1:
         raise ValueError(f"top_k 归一化失败：{top_k}")
-    if not (0.0 < temp):
-        raise ValueError(f"temperature 必须 > 0，得到 {temp}")
+    if not (0.0 <= temp):
+        raise ValueError(f"temperature 必须 >= 0，得到 {temp}")
     if not (0.0 < rep):
         raise ValueError(f"repetition_penalty 必须 > 0，得到 {rep}")
     if not (0.0 < top_p <= 1.0):
@@ -214,8 +217,8 @@ class VLLMPolicy(HFPolicy):
                                 ) -> Tuple[List[str], List[List[int]], List[int]]:
         if not prompt_ids_list:
             return [], [], []
-        if cfg.stop_mode != "tool_call":
-            raise ValueError(f"VLLMPolicy only implements stop_mode='tool_call', got {cfg.stop_mode!r}")
+        if cfg.stop_mode not in ("tool_call", "eos"):
+            raise ValueError(f"VLLMPolicy supports stop_mode='tool_call' or 'eos', got {cfg.stop_mode!r}")
 
         budget = int(cfg.max_context_tokens)
         # ★ 与 HF 版**同一道闸门**：绝不做"截断 prompt 重采样"这种 off-policy 操作。
@@ -251,8 +254,10 @@ class VLLMPolicy(HFPolicy):
         stops: List[int] = []
         for o in outs:
             raw = list(o.outputs[0].token_ids)
-            # 与 HF 版第三条闸门一致：先按停止判据截断，再整段过滤 pad。
-            stop = toolcall_stop_len(self.tokenizer, raw, _TC_START_AFTER)
+            # Tool-call mode removes any spill after the closing tool call. EOS mode
+            # relies only on the model's EOS stop and retains all returned tokens.
+            stop = (toolcall_stop_len(self.tokenizer, raw, _TC_START_AFTER)
+                    if cfg.stop_mode == "tool_call" else len(raw))
             ids = [int(t) for t in raw[:stop] if int(t) != pad_id]
             gen_ids.append(ids)
             stops.append(len(ids))

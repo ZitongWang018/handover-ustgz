@@ -28,7 +28,7 @@ The regression suite includes global G=16 sharding, rank rotation, typed TextWor
 
 An eight-GPU smoke must use an explicit base-model path and verify all ranks emit proposer and solver adapter-sync PASS records. If rewards are all equal or parameters do not move because group advantages are zero, the checker labels this **structure/communication passed, learning signal unverified**. It is not a learning-validation pass. The formal acceptance sequence is:
 
-1. Confirm `ZTWANG_MODEL_PATH` points to the intended Qwen3-4B **base** weights; no default instruct checkpoint is selected.
+1. Confirm `ZTWANG_MODEL_PATH` points to the intended Qwen3-4B weights by checking the actual model card and path. The paper's model name alone does not establish that it is Qwen3-4B-Base, and this config does not replace the user's explicit path.
 2. Run the eight-rank smoke with global `G=16`, `TPS=1`, and verify local `G=2` in logs.
 3. Require facts-channel checks, every rank log, global group-size checks, and real proposer/solver adapter parameter synchronization checks.
 4. Separately establish nonzero reward variation and nonzero solver/proposer learning signal before calling the run a learning validation.

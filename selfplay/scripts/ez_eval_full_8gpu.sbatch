@@ -1,15 +1,8 @@
 #!/bin/bash
-# 全量 valid_unseen 评测（论文可比口径）：134 任务 × N 采样，8 卡分片并行。
-#
-# 用法：
-#   sbatch --export=ALL,ZTWANG_MODEL_PATH=...,EZ_CKPT=<ckpt> scripts/ez_eval_full_8gpu.sbatch
-#   可选：EZ_SAMPLES=4 EZ_BACKEND=vllm EZ_SHARDS=8
-#
-# 为什么分片：单个 eval_ez.py 是串行 batch，跑 536 条轨迹要很久；
-#   切成 8 片各占一卡，8 倍并行，整节点一次跑完。
-#
-# ⚠️ 分区写死 i64m1tga800u8ka：1 卡作业会掉进 1483 个作业的长队里排队，
-#    而 8 卡分区经常有空闲节点（本脚本只用到 1 卡/分片，但整节点申请才排得上）。
+# Full valid_unseen evaluation with eight explicitly declared, uniquely named shards.
+# No cluster job is started by editing or validating this script.
+# Usage: sbatch --export=ALL,ZTWANG_MODEL_PATH=/path/to/model,EZ_CKPT=/path/to/ckpt scripts/ez_eval_full_8gpu.sbatch
+# Base control: add EZ_BASE_ONLY=1; no checkpoint is needed in that mode.
 #SBATCH --job-name=ez-evalfull
 #SBATCH --account=root
 #SBATCH --partition=i64m1tga800u8ka
@@ -22,7 +15,7 @@
 #SBATCH --output=/hpc2hdd/home/xyu608/ztwang/logs/%x-%j.out
 #SBATCH --error=/hpc2hdd/home/xyu608/ztwang/logs/%x-%j.err
 
-set -uo pipefail
+set -euo pipefail
 PROJ="$HOME/ztwang/selfplay"
 cd "$PROJ"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -30,83 +23,97 @@ conda activate thinktool
 
 export PYTHONPATH="$PROJ/src:$PROJ/third_party/py310deps:${PYTHONPATH:-}"
 export ALFWORLD_DATA="${ALFWORLD_DATA:-$HOME/.cache/alfworld}"
-export ZTWANG_MODEL_PATH="${ZTWANG_MODEL_PATH:-$HOME/thinktool/models/qwen3_4b}"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1
-mkdir -p logs eval_out
+: "${ZTWANG_MODEL_PATH:?Set ZTWANG_MODEL_PATH explicitly}"
 
-: "${EZ_CKPT:?Set EZ_CKPT}"
-if [ ! -d "$EZ_CKPT/solver" ] && [ -d "$EZ_CKPT/ckpt/solver" ]; then
-  EZ_CKPT="$EZ_CKPT/ckpt"
+BASE_ONLY="${EZ_BASE_ONLY:-0}"
+if [ "$BASE_ONLY" != "1" ]; then
+  : "${EZ_CKPT:?Set EZ_CKPT to a checkpoint directory containing solver/}"
+  if [ ! -d "$EZ_CKPT/solver" ] && [ -d "$EZ_CKPT/ckpt/solver" ]; then
+    EZ_CKPT="$EZ_CKPT/ckpt"
+  fi
+  [ -d "$EZ_CKPT/solver" ] || { echo "FATAL: $EZ_CKPT has no solver/"; exit 2; }
 fi
-[ -d "$EZ_CKPT/solver" ] || { echo "FATAL: $EZ_CKPT 下没有 solver/"; exit 2; }
 
-SAMPLES="${EZ_SAMPLES:-4}"
-BACKEND="${EZ_BACKEND:-vllm}"
-NSHARD="${EZ_SHARDS:-8}"
-TOTAL=$(( ${EZ_TOTAL:-134} ))
-PER=$(( (TOTAL + NSHARD - 1) / NSHARD ))
-TAG="$(basename "$(dirname "$EZ_CKPT")")-$(basename "$EZ_CKPT")"
-# 基座对照：--base-only 时忽略 adapter；tag 加后缀避免与 adapter 结果互相覆盖
-# ▲ 步数上限必须显式可调并写进 tag：专家 oracle 实测 30 步会给成绩硬造 85.1% 天花板
-#   （20/134 个任务连官方专家都赢不了），所以不同 cap 的数字绝不能混在一起比。
-MAXSTEPS="${EZ_MAX_STEPS:-30}"
-# ▲ 采样参数必须显式可调：Qwen3-4B base 自己的 generation_config.json 推荐
-#   temperature=0.6 / top_k=20，而我们一直用 1.0 / 禁用 top_k —— 噪音大得多。
-TEMP="${EZ_TEMPERATURE:-1.0}"; TOPK="${EZ_TOP_K:--1}"
-MAXNEW="${EZ_MAX_NEW:-96}"
-EXTRA="--max-steps ${MAXSTEPS} --temperature ${TEMP} --top-k ${TOPK} --max-new-tokens ${MAXNEW}"
-TAG="${TAG}-mn${MAXNEW}"
-TAG="${TAG}-ms${MAXSTEPS}-t${TEMP}-k${TOPK}"
-# ★ 所有会影响结果的开关都必须进 tag，否则不同配置会**静默互相覆盖**输出文件
-[ "${EZ_SOLVER_ADMISSIBLE:-0}" = "1" ] && TAG="${TAG}-adm"
-[ "${EZ_SOLVER_FEWSHOT_SCHEMA:-0}" = "1" ] && TAG="${TAG}-fs"
-[ "${EZ_SOLVER_STYLE:-ours}" != "ours" ] && TAG="${TAG}-${EZ_SOLVER_STYLE}"
-[ "${EZ_SOLVER_BARE_FALLBACK:-0}" = "1" ] && TAG="${TAG}-bare"
-[ "${EZ_PARSER_STRICT:-0}" = "1" ] && TAG="${TAG}-strict"
-[ -n "${EZ_TAGSUF:-}" ] && TAG="${TAG}-${EZ_TAGSUF}"
-[ "${EZ_BASE_ONLY:-0}" = "1" ] && { EXTRA="$EXTRA --base-only"; TAG="${TAG}-baseonly"; }
+TASKS=134
+SHARDS="${EZ_SHARDS:-8}"
+[ "$SHARDS" = "8" ] || { echo "FATAL: full benchmark merge currently requires EZ_SHARDS=8"; exit 2; }
+PROTOCOL="${EZ_PROTOCOL:-paper-approx}"
+if [ -n "${EZ_SAMPLES:-}" ]; then
+  SAMPLES="$EZ_SAMPLES"
+elif [ "$PROTOCOL" = "public-rich" ]; then
+  SAMPLES=1
+else
+  SAMPLES=4
+fi
+case "$SAMPLES" in ''|*[!0-9]*) echo "FATAL: EZ_SAMPLES must be a positive integer"; exit 2;; esac
+[ "$SAMPLES" -gt 0 ] || { echo "FATAL: EZ_SAMPLES must be positive"; exit 2; }
+PER=$(( (TASKS + SHARDS - 1) / SHARDS ))
+BACKEND="${EZ_BACKEND:-hf}"
+BATCH="${EZ_BATCH:-2}"
+RUN_ID="${SLURM_JOB_ID:-manual-$(date +%s)-$$}"
+TAG="${EZ_TAG:-${PROTOCOL}-$(basename "${EZ_CKPT:-base-only}")-job${RUN_ID}}"
+OUTDIR="eval_out/full_${TAG}"
+mkdir -p "$OUTDIR" logs
+[ ! -e "$OUTDIR/expected_shards.json" ] || { echo "FATAL: refusing existing run directory $OUTDIR"; exit 2; }
 
-echo "job=${SLURM_JOB_ID} ckpt=$EZ_CKPT backend=$BACKEND samples=$SAMPLES"
-echo "全量 $TOTAL 任务 切成 $NSHARD 片，每片 $PER 个"
-nvidia-smi -L
+python3 - "$OUTDIR/expected_shards.json" "$OUTDIR" "$TASKS" "$SAMPLES" "$SHARDS" "$PER" "$RUN_ID" <<'PY'
+import json, sys
+manifest, outdir, tasks, samples, shards, per, run_id = sys.argv[1:]
+tasks, samples, shards, per = map(int, (tasks, samples, shards, per))
+items = []
+for rank in range(shards):
+    offset = rank * per
+    count = max(0, min(per, tasks - offset))
+    items.append({"rank": rank, "offset": offset, "n": count,
+                  "path": f"{outdir}/shard_{rank:02d}.json"})
+with open(manifest, "w", encoding="utf-8") as fh:
+    json.dump({"run_id": run_id, "required_task_count": tasks, "samples_per_task": samples,
+               "required_task_type_count": 6,
+               "expected_shards": items}, fh, indent=2)
+PY
 
-for k in $(seq 0 $((NSHARD - 1))); do
+PIDS=()
+for k in $(seq 0 $((SHARDS - 1))); do
   OFF=$((k * PER))
-  OUT="eval_out/full_${TAG}_shard${k}.json"
-  ( CUDA_VISIBLE_DEVICES=$k python src/eval_ez.py \
-        --backend "$BACKEND" $EXTRA --base "$ZTWANG_MODEL_PATH" --ckpt "$EZ_CKPT" \
-        --select head --offset "$OFF" --n "$PER" \
-        --samples "$SAMPLES" --batch "$PER" --seed 42 --out "$OUT" \
-        > "logs/evalshard_${TAG}_${k}.log" 2>&1 ; \
-    echo "shard$k (offset=$OFF) exit=$?" ) &
+  COUNT=$(( TASKS - OFF ))
+  [ "$COUNT" -gt "$PER" ] && COUNT="$PER"
+  [ "$COUNT" -lt 0 ] && COUNT=0
+  OUT="$OUTDIR/shard_$(printf '%02d' "$k").json"
+  EXTRA=()
+  DECODE=()
+  if [ "$BASE_ONLY" = "1" ]; then EXTRA+=(--base-only); else EXTRA+=(--ckpt "$EZ_CKPT"); fi
+  [ -n "${EZ_MAX_STEPS:-}" ] && DECODE+=(--max-steps "$EZ_MAX_STEPS")
+  if [ -n "${EZ_MAX_NEW_TOKENS:-}" ]; then
+    DECODE+=(--max-new-tokens "$EZ_MAX_NEW_TOKENS")
+  elif [ -n "${EZ_MAX_NEW:-}" ]; then
+    DECODE+=(--max-new-tokens "$EZ_MAX_NEW")
+  fi
+  [ -n "${EZ_MAX_CONTEXT_TOKENS:-}" ] && DECODE+=(--max-context-tokens "$EZ_MAX_CONTEXT_TOKENS")
+  [ -n "${EZ_TEMPERATURE:-}" ] && DECODE+=(--temperature "$EZ_TEMPERATURE")
+  [ -n "${EZ_TOP_P:-}" ] && DECODE+=(--top-p "$EZ_TOP_P")
+  [ -n "${EZ_TOP_K:-}" ] && DECODE+=(--top-k "$EZ_TOP_K")
+  [ -n "${EZ_REPETITION_PENALTY:-}" ] && DECODE+=(--repetition-penalty "$EZ_REPETITION_PENALTY")
+  CUDA_VISIBLE_DEVICES="$k" python src/eval_ez.py \
+    --protocol "$PROTOCOL" "${EXTRA[@]}" --backend "$BACKEND" \
+    --base "$ZTWANG_MODEL_PATH" --select head --offset "$OFF" --n "$COUNT" \
+    --samples "$SAMPLES" --batch "$BATCH" --seed "${EZ_SEED:-42}" \
+    --run-id "$RUN_ID" "${DECODE[@]}" --out "$OUT" > "$OUTDIR/shard_$(printf '%02d' "$k").log" 2>&1 &
+  PIDS+=("$!")
 done
-wait
 
-echo "=================== 合并 ==================="
-python3 - <<PYEOF
-import json, glob, statistics as st
-files = sorted(glob.glob("eval_out/full_${TAG}_shard*.json"))
-rows, by_type, cfg = [], {}, None
-for f in files:
-    d = json.load(open(f))
-    cfg = cfg or d
-    rows.extend(d["samples"])
-    for k, v in d.get("task_type", {}).items():
-        by_type.setdefault(k, []).extend([v["mean"]] * v["n"])
-if not rows:
-    print("没有结果（所有分片都失败了，看 logs/evalshard_*.log）")
-    raise SystemExit(1)
-won = [1.0 if r["won"] else 0.0 for r in rows]
-print(f"分片数 {len(files)}  轨迹数 {len(rows)}  任务数 {len({r['task_id'] for r in rows})}")
-print(f"[FULL valid_unseen] sample SR = {st.mean(won):.4f} ± {st.pstdev(won):.4f}")
-for k in sorted(by_type):
-    v = by_type[k]
-    print(f"   {k:28s} n={len(v):4d}  SR={sum(v)/len(v):.4f}")
-json.dump({"n_samples": len(rows), "sr": st.mean(won), "std": st.pstdev(won),
-           "backend": cfg.get("backend"), "samples_per_task": cfg.get("samples_per_task"),
-           "decode": cfg.get("decode"), "decode_effective": cfg.get("decode_effective"),
-           "per_type": {k: sum(v)/len(v) for k, v in by_type.items()},
-           "samples": rows},
-          open(f"eval_out/full_${TAG}_MERGED.json", "w"), ensure_ascii=False, indent=2)
-print(f"-> eval_out/full_${TAG}_MERGED.json")
-PYEOF
+FAILED=0
+for k in $(seq 0 $((SHARDS - 1))); do
+  if wait "${PIDS[$k]}"; then
+    echo "[eval-shard] rank=$k exit=0"
+  else
+    rc=$?
+    echo "[eval-shard] rank=$k exit=$rc"
+    FAILED=1
+  fi
+done
+[ "$FAILED" = "0" ] || { echo "FATAL: one or more evaluation shards failed"; exit 1; }
+
+python src/ez_eval_merge.py --expected-manifest "$OUTDIR/expected_shards.json" \
+  --output "$OUTDIR/merged.json"
+echo "[eval-full] result=$OUTDIR/merged.json"
