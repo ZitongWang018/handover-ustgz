@@ -32,11 +32,24 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 MKL_NUM
 export OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export HF_HUB_OFFLINE=1
-# ★ 不要把 py310deps 放进 PYTHONPATH：它含 numpy 源码目录，会遮蔽 site-packages
-#   的 numpy 并抛 "should not try to import numpy from its source directory"。
-#   改由 skillrise/_deps/sitecustomize.py 在 site-packages 就位后 append 到 sys.path 末尾。
-export SKR_PY310DEPS="$PROJ/selfplay/third_party/py310deps"
-export PYTHONPATH="$PROJ/selfplay/src:$PROJ/skillrise/_deps:${PYTHONPATH:-}"
+# ★ py310deps 的优先级很讲究，踩过两次坑，这个 shim 是两次教训的合成解：
+#   (1) 直接放进 PYTHONPATH（= 优先于 site-packages）⇒ py310deps 里那个 **numpy 源码目录**
+#       会被导入并抛 "should not try to import numpy from its source directory"。
+#   (2) 改成追加到 sys.path **末尾** ⇒ numpy 好了，但 textworld 的语法解析器行为变了，
+#       ALFWorld 加载 alfred.twl2 时抛 tatsu.exceptions.FailedToken + IndexError。
+#   正解：把 py310deps 里**除 numpy/torch 之外**的包软链到一个 shim 目录，让 shim 排在
+#   site-packages **之前** —— textworld/tatsu/alfworld 仍走 py310deps（与之前能跑通的
+#   配置一致），而 numpy/torch 落到 site-packages。
+DEPS_SHIM="$PROJ/skillrise/_deps/shim"
+mkdir -p "$DEPS_SHIM"
+for _d in "$PROJ"/selfplay/third_party/py310deps/*; do
+  _n="$(basename "$_d")"
+  case "$_n" in
+    numpy|numpy.libs|torch|torchgen|functorch|__pycache__|*.dist-info) continue ;;
+  esac
+  [ -e "$DEPS_SHIM/$_n" ] || ln -s "$_d" "$DEPS_SHIM/$_n" 2>/dev/null || true
+done
+export PYTHONPATH="$PROJ/selfplay/src:$DEPS_SHIM:${PYTHONPATH:-}"
 
 # Respect a scheduler/container-assigned device mask. Each worker sees exactly
 # one entry from that mask, while rank-to-device ordering stays deterministic.
