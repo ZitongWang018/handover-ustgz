@@ -434,5 +434,3 @@ def test_eval_cli_profiles_resolve_to_recorded_effective_protocol(
         assert report["decode_effective"]["do_sample"] is False
         assert report["decode_effective"]["temperature"] is None
         assert manifest["resolver"]["menu_enabled"] is True
-
-\n
