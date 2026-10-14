@@ -109,8 +109,8 @@ SOLVER_USER_TEMPLATE = """# Your Task
 Your task is: {task_description}
 Explore the environment and complete the task."""
 
-# 补全: 论文附录 G Fig.14 的 user 轮里 **确实有一个 `# Example Omitted` 节**
-# （骨架注明"因版面省略"），说明论文真实 prompt 是**带示例**的，我们照抄骨架时留空了。
+# 论文附录 G Fig.14 标注 `# Example Omitted`，但示例具体内容及 n=0 时是否包含未知；
+# 不能据此推断 one-shot baseline。这里的手写 demo 是仓库自拟内容，启用即属 custom。
 # 用环境变量 EZ_SOLVER_FEWSHOT=1 打开 one-shot worked example；**默认关闭**
 # （=0 / 未设），保证仍在跑的正式训练的行为与改动前逐字一致。
 # 这是仓库自拟诊断示例，不是论文中被省略的作者示例；启用后会改变评测协议。
@@ -151,8 +151,9 @@ def build_proposer_messages(observation: str, max_turns: int,
 
 
 def build_solver_messages(observation: str, task_desc: str,
-                         admissible: Sequence[str] = ()) -> List[Dict[str, str]]:
-    initial_admissible = admissible_suffix(admissible)
+                         admissible: Sequence[str] = (), *,
+                         menu_enabled: bool | None = None) -> List[Dict[str, str]]:
+    initial_admissible = admissible_suffix(admissible, menu_enabled=menu_enabled)
     return [
         {"role": "system", "content": SOLVER_SYSTEM},
         {"role": "user", "content": _solver_fewshot() + SOLVER_USER_TEMPLATE.format(
@@ -232,7 +233,8 @@ def build_solver_messages_rich(task: str, observation: str, history, admissible,
     ]
 
 
-def admissible_suffix(admissible: Sequence[str]) -> str:
+def admissible_suffix(admissible: Sequence[str], *,
+                      menu_enabled: bool | None = None) -> str:
     """把**当前这步的全部合法动作**拼成一小段，附在每回合的 feedback 尾巴上。
 
     ⚠️ 为什么（2026-10-14 实测诊断）：基座的评测动作分布是
@@ -248,7 +250,9 @@ def admissible_suffix(admissible: Sequence[str]) -> str:
     `EZ_SOLVER_ADMISSIBLE=1` 打开。
     """
     import os
-    if os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") != "1" or not admissible:
+    enabled = (os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") == "1"
+               if menu_enabled is None else bool(menu_enabled))
+    if not enabled or not admissible:
         return ""
     items = [str(a).strip() for a in admissible if str(a).strip()]
     if not items:
@@ -391,7 +395,8 @@ def append_tool_result(messages: List[Dict[str, str]], action_text: str,
 def format_execution_feedback(command: str, observation: str, *, malformed: bool = False,
                               recovered: bool = False, control: bool = False,
                               admissible: Sequence[str] = (),
-                              format_error: str = "") -> str:
+                              format_error: str = "",
+                              menu_enabled: bool | None = None) -> str:
     """Include the executed command and real environment observation in every feedback."""
     prefix = ""
     if format_error:
@@ -404,5 +409,5 @@ def format_execution_feedback(command: str, observation: str, *, malformed: bool
     elif control:
         prefix = "Declarations are not environment actions; the fallback command was executed.\n"
     text = f"{prefix}You did: {command}\nThe environment responds:\n{observation}"
-    hint = admissible_suffix(admissible)
+    hint = admissible_suffix(admissible, menu_enabled=menu_enabled)
     return text + hint

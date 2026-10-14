@@ -186,8 +186,12 @@ def test_rich_json_is_diagnostic_only_and_menu_resolver_selects_action(monkeypat
     import eval_ez
 
     monkeypatch.setenv("EZ_SOLVER_STRICT_RESOLVE", "1")
+    monkeypatch.setenv("EZ_SOLVER_ADMISSIBLE", "0")
     class Policy:
-        def initial_prompt_ids(self, messages, cfg): return [1]
+        prompts = []
+        def initial_prompt_ids(self, messages, cfg):
+            self.prompts.append(messages[-1]["content"])
+            return [1]
         def generate_from_token_ids(self, prompts, cfg):
             text = '<tool_call>{"arguments":{"action_type":"go_to","receptacle_name":"fridge 1"}}</tool_call>'
             return [text], [[7, 8]], [2]
@@ -201,14 +205,17 @@ def test_rich_json_is_diagnostic_only_and_menu_resolver_selects_action(monkeypat
                                    admissible=[["look", "go to fridge 1"]])
 
     env = Env()
+    policy = Policy()
     rows = eval_ez._rollout_batch(
-        env, Policy(), ["game"], [{"task_id": "id", "task_type": "type", "sample": 0}],
+        env, policy, ["game"], [{"task_id": "id", "task_type": "type", "sample": 0}],
         SimpleNamespace(), max_steps=1, style="rich")
     assert env.command == "look"  # no menu action appears in the JSON response
     assert rows[0]["trace"][0]["json_parse_kind"] == "action"  # diagnostic only
     assert rows[0]["trace"][0]["parse_kind"] == "menu_fallback"
     assert rows[0]["trace"][0]["resolver_mode"] == "fallback"
     assert rows[0]["kinds"]["json_diagnostic_action_ignored"] == 1
+    assert "Available actions:" in policy.prompts[-1]
+    assert "0. look" in policy.prompts[-1] and "1. go to fridge 1" in policy.prompts[-1]
     assert rows[0]["max_steps_reached"] is True
     assert rows[0]["budget_boundary_not_won"] is True
 
@@ -373,17 +380,18 @@ def test_vllm_engine_uses_manifest_seed(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "argv,expected_profile,expected_style,expected_steps,expected_temp,expected_samples",
+    "argv,expected_profile,expected_style,expected_steps,expected_temp,expected_samples,expected_menu",
     [
-        (["--protocol", "public-rich"], "public-rich", "rich", 50, 0.0, 1),
+        (["--protocol", "public-rich", "--action-menu", "on"],
+         "public-rich", "rich", 50, 0.0, 1, True),
         (["--protocol", "paper-approx", "--max-steps", "11",
           "--temperature", "0.5", "--samples", "2"],
-         "custom", "ours", 11, 0.5, 2),
+         "custom", "ours", 11, 0.5, 2, False),
     ],
 )
 def test_eval_cli_profiles_resolve_to_recorded_effective_protocol(
         monkeypatch, tmp_path, argv, expected_profile, expected_style,
-        expected_steps, expected_temp, expected_samples):
+        expected_steps, expected_temp, expected_samples, expected_menu):
     import types
     import eval_ez
 
@@ -391,6 +399,7 @@ def test_eval_cli_profiles_resolve_to_recorded_effective_protocol(
     monkeypatch.delenv("EZ_SOLVER_FEWSHOT", raising=False)
     monkeypatch.delenv("EZ_SOLVER_FEWSHOT_SCHEMA", raising=False)
     monkeypatch.delenv("EZ_SOLVER_ADMISSIBLE", raising=False)
+    monkeypatch.setenv("EZ_SOLVER_ADMISSIBLE", "0")
     monkeypatch.delenv("EZ_PARSER_STRICT", raising=False)
     monkeypatch.delenv("EZ_SOLVER_STRICT_RESOLVE", raising=False)
     out = tmp_path / "report.json"
@@ -411,9 +420,11 @@ def test_eval_cli_profiles_resolve_to_recorded_effective_protocol(
         def __init__(self, *args, **kwargs): captured["env"] = kwargs
         def close(self): pass
     monkeypatch.setattr(eval_ez, "ALFWorldBatchEnv", Env)
-    def rollout(env, policy, games, records, cfg, max_steps, *, style=None):
+    def rollout(env, policy, games, records, cfg, max_steps, *, style=None,
+                menu_enabled=None):
         captured["cfg"] = cfg
         captured["style"] = style
+        captured["menu_enabled"] = menu_enabled
         return [{"task_id": record["task_id"], "task_type": record["task_type"],
                  "game_file": games[i], "sample": record["sample"], "won": True,
                  "steps": 1, "actions": ["look"], "trace": [], "kinds": {},
@@ -430,7 +441,149 @@ def test_eval_cli_profiles_resolve_to_recorded_effective_protocol(
     assert captured["cfg"].temperature == expected_temp
     assert captured["cfg"].stop_mode == ("eos" if expected_style == "rich" else "tool_call")
     assert captured["env"]["max_episode_steps"] == expected_steps
+    assert captured["menu_enabled"] is expected_menu
     if expected_profile == "public-rich":
         assert report["decode_effective"]["do_sample"] is False
         assert report["decode_effective"]["temperature"] is None
         assert manifest["resolver"]["menu_enabled"] is True
+
+
+def _run_eval_menu_case(monkeypatch, tmp_path, menu_enabled, env_flag, request_mode=None):
+    import types
+    import eval_ez
+
+    monkeypatch.setenv("EZ_SOLVER_ADMISSIBLE", env_flag)
+    monkeypatch.delenv("EZ_SOLVER_STYLE", raising=False)
+    monkeypatch.delenv("EZ_SOLVER_FEWSHOT", raising=False)
+    monkeypatch.delenv("EZ_SOLVER_FEWSHOT_SCHEMA", raising=False)
+    monkeypatch.delenv("EZ_PARSER_STRICT", raising=False)
+    monkeypatch.delenv("EZ_SOLVER_STRICT_RESOLVE", raising=False)
+    out = tmp_path / f"menu-{menu_enabled}.json"
+    requested = request_mode or ("on" if menu_enabled else "off")
+    monkeypatch.setattr(sys, "argv", ["eval_ez.py", "--protocol", "paper-approx",
+        "--action-menu", requested, "--base", "base", "--base-only", "--backend", "hf",
+        "--n", "1", "--batch", "1", "--out", str(out)])
+    monkeypatch.setattr(eval_ez, "load_alfworld_config", lambda path: {})
+    monkeypatch.setattr(eval_ez, "collect_game_files", lambda *args: ["game-a"])
+    monkeypatch.setattr(eval_ez, "task_instance_id", lambda game: "task-a")
+    monkeypatch.setattr(eval_ez, "task_type_of", lambda game: "type-a")
+    monkeypatch.setitem(sys.modules, "alfworld_compat",
+                        types.SimpleNamespace(install=lambda **kwargs: None))
+    model = types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa"))
+    tokenizer = types.SimpleNamespace(name_or_path="fake-tokenizer", chat_template="template")
+
+    class Policy:
+        def __init__(self):
+            self.model, self.tokenizer = model, tokenizer
+            self.prompts = []
+            self.feedback = []
+        def initial_prompt_ids(self, messages, cfg):
+            self.prompts.append(messages[-1]["content"])
+            return [1]
+        def generate_from_token_ids(self, prompts, cfg):
+            text = '<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"look"}}</tool_call>'
+            return [text for _ in prompts], [[9] for _ in prompts], [1] * len(prompts)
+        def assistant_end_ids(self): return [2]
+        def append_feedback_ids(self, text):
+            self.feedback.append(text)
+            return [3]
+        def next_generation_prefix_ids(self, text): return [4]
+
+    policy = Policy()
+    monkeypatch.setattr(eval_ez, "_load_policy", lambda args: policy)
+
+    class Env:
+        def __init__(self, *args, **kwargs): self.steps = 0
+        def reset(self, games):
+            view = SimpleNamespace(env_desc="room", raw="room", task_desc="task")
+            return ["room"], [view], [["look", "go to fridge 1"]], list(games), [None]
+        def step(self, commands):
+            self.steps += 1
+            return SimpleNamespace(won=[False], dones=[self.steps == 2], obs=[f"obs {self.steps}"],
+                                   admissible=[["look", "go to cabinet 99"]])
+        def close(self): pass
+    monkeypatch.setattr(eval_ez, "ALFWorldBatchEnv", Env)
+
+    assert eval_ez.main() == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    manifest = report["protocol_manifest"]
+    prompts = policy.prompts
+    assert len(prompts) == 4
+    assert all(("Admissible actions at this step:" in prompt) is menu_enabled
+               for prompt in prompts)
+    assert manifest["resolver"]["menu_enabled"] is menu_enabled
+    assert manifest["resolver"]["menu_scope"] == (
+        "initial prompt and execution feedback" if menu_enabled else "none")
+    assert manifest["resolver"]["menu_requested"] == requested
+    expected_source = ("legacy_environment" if menu_enabled else "legacy_environment_default_off") \
+        if requested == "auto" else "cli"
+    assert manifest["resolver"]["menu_resolution_source"] == expected_source
+    assert manifest["protocol_effective"] == ("custom" if menu_enabled else "paper-approx")
+    assert len(report["sample_rows"]) == 4
+    assert [row["sample"] for row in report["sample_rows"]] == [0, 1, 2, 3]
+    assert report["sample_rows"][0]["trace"][0]["admissible_actions"] == [
+        "look", "go to fridge 1"]
+    assert report["sample_rows"][0]["trace"][1]["admissible_actions"] == [
+        "look", "go to cabinet 99"]
+    assert report["sample_rows"][0]["trace"][0]["admissible_menu_enabled"] is menu_enabled
+    assert report["sample_rows"][0]["trace"][0]["visible_menu_count"] == (
+        2 if menu_enabled else 0)
+    assert len(policy.feedback) == 4
+    assert all(("Admissible actions at this step:" in feedback) is menu_enabled
+               for feedback in policy.feedback)
+    assert all(("go to cabinet 99" in feedback) is menu_enabled
+               for feedback in policy.feedback)
+    return manifest["prompt_sha256"], prompts[0], manifest["protocol_effective"]
+
+
+@pytest.mark.parametrize(("menu_enabled", "env_flag"), [(True, "0"), (False, "1")])
+def test_eval_menu_cli_controls_prompt_manifest_and_prompt_hash(
+        monkeypatch, tmp_path, menu_enabled, env_flag):
+    prompt_hash, prompt, _effective = _run_eval_menu_case(
+        monkeypatch, tmp_path, menu_enabled, env_flag)
+    assert bool("Admissible actions at this step:" in prompt) is menu_enabled
+    assert isinstance(prompt_hash, str) and len(prompt_hash) == 64
+
+
+def test_eval_menu_hash_changes_with_exposure_and_cli_beats_environment(monkeypatch, tmp_path):
+    # Reuse the test helper twice while explicitly steering the legacy environment oppositely.
+    on_hash, on_prompt, _ = _run_eval_menu_case(
+        monkeypatch, tmp_path, True, "0")
+    off_hash, off_prompt, _ = _run_eval_menu_case(
+        monkeypatch, tmp_path, False, "1")
+    assert on_hash != off_hash
+    assert "go to fridge 1" in on_prompt and "go to fridge 1" not in off_prompt
+
+
+@pytest.mark.parametrize(("env_flag", "menu_enabled", "effective"), [
+    ("0", False, "paper-approx"), ("1", True, "custom")])
+def test_eval_auto_menu_follows_legacy_env(monkeypatch, tmp_path, env_flag,
+                                          menu_enabled, effective):
+    _hash, prompt, resolved = _run_eval_menu_case(monkeypatch, tmp_path, menu_enabled,
+                                                  env_flag, request_mode="auto")
+    assert bool("Admissible actions at this step:" in prompt) is menu_enabled
+    assert resolved == effective
+
+
+def test_training_prompt_keeps_legacy_menu_environment_default(monkeypatch):
+    from ez_prompts import build_solver_messages, format_execution_feedback
+    admissible = ["look", "go to fridge 1"]
+    monkeypatch.setenv("EZ_SOLVER_ADMISSIBLE", "1")
+    assert "Admissible actions at this step:" in build_solver_messages(
+        "room", "task", admissible)[-1]["content"]
+    assert "Admissible actions at this step:" in format_execution_feedback(
+        "look", "room", admissible=admissible)
+    monkeypatch.setenv("EZ_SOLVER_ADMISSIBLE", "0")
+    assert "Admissible actions at this step:" not in build_solver_messages(
+        "room", "task", admissible)[-1]["content"]
+    assert "Admissible actions at this step:" in build_solver_messages(
+        "room", "task", admissible, menu_enabled=True)[-1]["content"]
+
+
+def test_rich_rejects_explicit_menu_off(monkeypatch):
+    import eval_ez
+    monkeypatch.setattr(sys, "argv", ["eval_ez.py", "--protocol", "public-rich",
+        "--action-menu", "off", "--base", "base", "--base-only"])
+    with pytest.raises(SystemExit) as exc:
+        eval_ez.main()
+    assert exc.value.code == 2

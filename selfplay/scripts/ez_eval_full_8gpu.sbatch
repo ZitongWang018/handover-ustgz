@@ -94,8 +94,10 @@ for k in $(seq 0 $((SHARDS - 1))); do
   [ -n "${EZ_TOP_P:-}" ] && DECODE+=(--top-p "$EZ_TOP_P")
   [ -n "${EZ_TOP_K:-}" ] && DECODE+=(--top-k "$EZ_TOP_K")
   [ -n "${EZ_REPETITION_PENALTY:-}" ] && DECODE+=(--repetition-penalty "$EZ_REPETITION_PENALTY")
+  ACTION_MENU="${EZ_ACTION_MENU:-auto}"
   CUDA_VISIBLE_DEVICES="$k" python src/eval_ez.py \
     --protocol "$PROTOCOL" "${EXTRA[@]}" --backend "$BACKEND" \
+    --action-menu "$ACTION_MENU" \
     --base "$ZTWANG_MODEL_PATH" --select head --offset "$OFF" --n "$COUNT" \
     --samples "$SAMPLES" --batch "$BATCH" --seed "${EZ_SEED:-42}" \
     --run-id "$RUN_ID" "${DECODE[@]}" --out "$OUT" > "$OUTDIR/shard_$(printf '%02d' "$k").log" 2>&1 &

@@ -49,6 +49,7 @@ SAMPLES="${EZ_SAMPLES:-$([ "$PROTOCOL" = public-rich ] && echo 1 || echo 4)}"
 SELECT="${EZ_SELECT:-stratify}"
 BATCH="${EZ_BATCH:-$N}"
 BACKENDS="${EZ_BACKENDS:-vllm hf}"
+ACTION_MENU="${EZ_ACTION_MENU:-auto}"
 TAG="${EZ_TAG:-$(basename "${EZ_CKPT:-base-only}")-job${SLURM_JOB_ID:-manual}}"
 export TAG
 BASE_SUFFIX=""
@@ -62,6 +63,7 @@ for B in $BACKENDS; do
   EXTRA=(); [ "$BASE_ONLY" = "1" ] && EXTRA+=(--base-only) || EXTRA+=(--ckpt "$EZ_CKPT")
   CUDA_VISIBLE_DEVICES=0 python src/eval_ez.py \
       --protocol "$PROTOCOL" --backend "$B" "${EXTRA[@]}" \
+      --action-menu "$ACTION_MENU" \
       --base "$ZTWANG_MODEL_PATH" \
       --n "$N" --samples "$SAMPLES" --select "$SELECT" --batch "$BATCH" \
       --seed 42 --out "$OUT" \

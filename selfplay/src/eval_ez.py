@@ -26,6 +26,7 @@ from ez_prompts import (build_solver_messages,
                         resolve_action, solver_style)
 from ez_eval_protocol import (aggregate_complete_evaluation,
                               align_records_to_slots)
+from ez_model_identity import inspect_model_identity
 from rollout import HFPolicy, RolloutConfig
 
 
@@ -36,13 +37,27 @@ def _pkg_version(name):
         return "unknown"
 
 
-def _manifest(args, policy, *, effective_profile, style, decode, overrides):
+def _safe_model_identity(path):
+    try:
+        return inspect_model_identity(path)
+    except OSError as exc:
+        return {"status": "metadata_unavailable", "requested_path": str(path),
+                "reason": f"local metadata I/O failed: {type(exc).__name__}",
+                "weights_verified": False}
+
+
+def _manifest(args, policy, *, effective_profile, style, decode, overrides,
+              menu_enabled, menu_requested, menu_source, legacy_menu_value):
     import ez_prompts
-    prompt_parts = [ez_prompts.SOLVER_SYSTEM, ez_prompts.SOLVER_USER_TEMPLATE]
     if style == "rich":
-        prompt_parts.extend([ez_prompts._RICH_SYSTEM, ez_prompts._RICH_USER])
+        prompt_parts = [ez_prompts._RICH_SYSTEM, ez_prompts._RICH_USER]
     else:
-        prompt_parts.append(ez_prompts._solver_fewshot())
+        prompt_parts = [ez_prompts.SOLVER_SYSTEM, ez_prompts.SOLVER_USER_TEMPLATE,
+                        ez_prompts._solver_fewshot()]
+        if menu_enabled:
+            prompt_parts.append(ez_prompts.ADMISSIBLE_HINT)
+    prompt_parts.extend(["prompt_style=" + style,
+                         "action_menu_enabled=" + str(bool(menu_enabled))])
     prompt_hash = hashlib.sha256("\n\0\n".join(prompt_parts).encode("utf-8")).hexdigest()
     chat_template = getattr(getattr(policy, "tokenizer", None), "chat_template", None)
     chat_hash = (hashlib.sha256(str(chat_template).encode("utf-8")).hexdigest()
@@ -67,6 +82,7 @@ def _manifest(args, policy, *, effective_profile, style, decode, overrides):
         "enable_thinking": False,
         "tokenizer": getattr(getattr(policy, "tokenizer", None), "name_or_path", None),
         "base_model": os.path.expandvars(os.path.expanduser(args.base)),
+        "model_identity": _safe_model_identity(args.base),
         "checkpoint": None if args.base_only else str(Path(args.ckpt).resolve()),
         "adapter": None if args.base_only else "solver",
         "base_only": args.base_only,
@@ -80,10 +96,17 @@ def _manifest(args, policy, *, effective_profile, style, decode, overrides):
                      "strict": (False if style == "rich" else
                                 os.environ.get("EZ_SOLVER_STRICT_RESOLVE", "0") == "1"),
                      "ignored_environment_flags": (["EZ_PARSER_STRICT",
+                                                     "EZ_SOLVER_ADMISSIBLE",
                                                      "EZ_SOLVER_STRICT_RESOLVE"]
                                                     if style == "rich" else []),
-                     "menu_enabled": True,
-                     "menu_scope": "initial prompt and execution feedback",
+                     "menu_enabled": bool(menu_enabled),
+                     "menu_requested": menu_requested,
+                     "menu_resolution_source": menu_source,
+                     "legacy_environment_value": legacy_menu_value,
+                     "menu_scope": ("numbered actions rebuilt in every prompt" if style == "rich"
+                                    else "initial prompt and execution feedback"
+                                    if menu_enabled else "none"),
+                     "recovery_menu_used_separately_from_visible_menu": True,
                      "natural_command_recovery": True},
         "fewshot": {"enabled": (style != "rich" and any(
                                      os.environ.get(k, "0") == "1"
@@ -308,7 +331,8 @@ def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps)
             for i in range(n)]
 
 
-def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, style=None):
+def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
+                   style=None, menu_enabled=None):
     observations, views, admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
         raise RuntimeError("ALFWorld reset returned a different number of evaluation slots")
@@ -321,8 +345,12 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, sty
     if style == "rich":
         return _rollout_batch_rich(env, policy, used, views, records, admissible,
                                    cfg, max_steps)
+    resolved_menu = (os.environ.get("EZ_SOLVER_ADMISSIBLE", "0") == "1"
+                     if menu_enabled is None else bool(menu_enabled))
+    adm = list(admissible) if admissible else [[] for _ in used]
     prompts = [build_solver_messages(views[i].env_desc or views[i].raw,
-                                     views[i].task_desc or "") for i in range(len(used))]
+                                     views[i].task_desc or "", adm[i],
+                                     menu_enabled=resolved_menu) for i in range(len(used))]
     buffers = [policy.initial_prompt_ids(m, cfg) for m in prompts]
     active = [True] * len(used)
     won = [False] * len(used)
@@ -332,7 +360,6 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, sty
     # ★ `admissible`（reset 的第 3 个返回值）原来被丢掉了。它是"当前这步环境允许的
     #   全部命令"，是 `recover_bare_command` 唯一的安全依据（只从这张表里挑），
     #   所以必须接住并且**逐步更新**。
-    adm = list(admissible) if admissible else [[] for _ in used]
     # ★ 逐回合记录解析结果：`parse_tool_call` 判成 malformed 时，下面会**静默**
     #   把动作换成 "look"。不统计就会把"输出没解析成功"误读成"模型一直在 look"。
     kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0,
@@ -343,6 +370,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, sty
             break
         idxs = [i for i, yes in enumerate(active) if yes]
         texts, generated, _ = policy.generate_from_token_ids([buffers[i] for i in idxs], cfg)
+        step_admissible = [list(x) for x in adm]
         commands = ["look"] * len(used)
         parsed_by_slot = [None] * len(used)
         recovered_by_slot = [False] * len(used)
@@ -388,7 +416,16 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, sty
                                  "parse_kind": parsed_by_slot[slot].kind,
                                  "resolver_mode": resolver_by_slot[slot],
                                  "executed_command": commands[slot],
-                                 "observation": result.obs[slot]})
+                                 "observation": result.obs[slot],
+                                 "initial_observation": views[slot].env_desc or views[slot].raw,
+                                 "task_description": views[slot].task_desc or "",
+                                 "admissible_menu_enabled": resolved_menu,
+                                 "visible_menu_count": (len(step_admissible[slot])
+                                                        if resolved_menu else 0),
+                                 "resolver_consulted_action_list": (
+                                     parsed_by_slot[slot].kind == "malformed"),
+                                 "resolver_action_list_available": bool(step_admissible[slot]),
+                                 "admissible_actions": step_admissible[slot]})
             if result.dones[slot]:
                 active[slot] = False
                 continue
@@ -397,7 +434,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *, sty
                 commands[slot], result.obs[slot], malformed=parsed.kind == "malformed",
                 recovered=recovered_by_slot[slot],
                 control=parsed.kind not in ("action", "malformed"),
-                admissible=adm[slot])
+                admissible=adm[slot], menu_enabled=resolved_menu)
             suffix = (policy.assistant_end_ids() + policy.append_feedback_ids(feedback) +
                       policy.next_generation_prefix_ids(feedback))
             buffers[slot].extend(suffix)
@@ -457,6 +494,8 @@ def main():
     ap.add_argument("--attn", choices=["flash_attention_2", "sdpa", "eager"], default="flash_attention_2")
     ap.add_argument("--style", choices=["ours", "rich"], default=None,
                     help="explicit prompt style; deviation from profile marks output custom")
+    ap.add_argument("--action-menu", choices=["auto", "on", "off"], default="auto",
+                    help="auto follows EZ_SOLVER_ADMISSIBLE for ours; rich always shows its native numbered menu")
     ap.add_argument("--out", default=None)
     ap.add_argument("--run-id", default=None,
                     help="shard-run identity written to the protocol manifest")
@@ -502,10 +541,22 @@ def main():
         overrides["style"] = {"profile_default": defaults["style"], "effective": args.style}
     if args.protocol == "paper-approx" and solver_style() != defaults["style"]:
         overrides["environment_style"] = solver_style()
+    legacy_menu_value = os.environ.get("EZ_SOLVER_ADMISSIBLE", "0")
+    if args.style == "rich" and args.action_menu == "off":
+        ap.error("--action-menu off is incompatible with rich, which requires its native numbered menu")
+    menu_requested = args.action_menu
+    if args.style == "rich":
+        menu_enabled = True
+        menu_source = "rich_required"
+    elif args.action_menu == "on":
+        menu_enabled, menu_source = True, "cli"
+    elif args.action_menu == "off":
+        menu_enabled, menu_source = False, "cli"
+    else:
+        menu_enabled = legacy_menu_value == "1"
+        menu_source = "legacy_environment" if menu_enabled else "legacy_environment_default_off"
     effective_flags = dict(env_profile_overrides)
-    # This evaluator always includes the current admissible menu in the initial
-    # prompt and in feedback, independent of the training-only exposure switch.
-    effective_flags["admissible_menu"] = True
+    effective_flags["admissible_menu"] = menu_enabled
     if args.style == "rich":
         effective_flags["fewshot"] = False
         effective_flags["admissible_menu"] = True
@@ -514,6 +565,10 @@ def main():
     if (effective_flags["parser_strict"] or effective_flags["resolver_strict"] or
             effective_flags["fewshot"]):
         overrides["environment_protocol_flags"] = env_profile_overrides
+    if menu_enabled and args.style != "rich":
+        overrides["action_menu"] = {"requested": menu_requested,
+                                     "source": menu_source,
+                                     "effective": True}
     defaults["stop_mode"] = "eos" if args.style == "rich" else "tool_call"
     effective_profile = args.protocol
     if args.protocol == "public-rich" and overrides:
@@ -580,7 +635,8 @@ def main():
                                ignore_benchmark_done=False)
         try:
             samples.extend(_rollout_batch(env, policy, game_batch, records, rollout_cfg,
-                                          args.max_steps, style=args.style))
+                                          args.max_steps, style=args.style,
+                                          menu_enabled=menu_enabled))
         finally:
             env.close()
         if start == 0 or (start // args.batch + 1) % 25 == 0:
@@ -605,7 +661,9 @@ def main():
     else:
         decode_effective = {"do_sample": True, **decode}
     manifest = _manifest(args, policy, effective_profile=effective_profile,
-                         style=args.style, decode=decode, overrides=overrides)
+                         style=args.style, decode=decode, overrides=overrides,
+                         menu_enabled=menu_enabled, menu_requested=menu_requested,
+                         menu_source=menu_source, legacy_menu_value=legacy_menu_value)
     report = {
         "schema_version": 2,
         "protocol": "alfworld_valid_unseen_official_benchmark_done",
