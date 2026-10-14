@@ -19,7 +19,8 @@ sys.path.insert(0, str(SRC))
 from alfworld_env import (ALFWorldBatchEnv, collect_game_files, load_alfworld_config,
                           task_instance_id, task_type_of)
 from ez_proposer import parse_tool_call
-from ez_prompts import build_solver_messages
+from ez_prompts import (build_solver_messages, dump_malformed,
+                        recover_bare_command)
 from rollout import HFPolicy, RolloutConfig
 
 
@@ -130,7 +131,7 @@ def stratified_games(games, n: int):
 
 
 def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
-    observations, views, _admissible, used, _ = env.reset(game_files)
+    observations, views, admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
         raise RuntimeError("ALFWorld reset returned a different number of evaluation slots")
     # ★ textworld 批量环境会 shuffle gamefiles（textworld_batch.py 的 rng.shuffle），
@@ -147,12 +148,16 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
     won = [False] * len(used)
     steps = [0] * len(used)
     actions = [[] for _ in used]
+    # ★ `admissible`（reset 的第 3 个返回值）原来被丢掉了。它是"当前这步环境允许的
+    #   全部命令"，是 `recover_bare_command` 唯一的安全依据（只从这张表里挑），
+    #   所以必须接住并且**逐步更新**。
+    adm = list(admissible) if admissible else [[] for _ in used]
     # ★ 逐回合记录解析结果：`parse_tool_call` 判成 malformed 时，下面会**静默**
-    #   把动作换成 "look"。如果不统计，看到的就是"模型一直在 look"这种假象 ——
-    #   而真实情况可能是"模型想说别的、但输出没被解析成功"。这两种情况的修法完全不同。
-    kind_counts = [{"action_valid": 0, "action_invalid": 0, "malformed": 0,
-                    "control": 0} for _ in used]
-    for _ in range(max_steps):
+    #   把动作换成 "look"。不统计就会把"输出没解析成功"误读成"模型一直在 look"。
+    kind_counts = [{"action": 0, "malformed": 0, "control": 0, "recovered": 0}
+                   for _ in used]
+    dump_path = os.environ.get("EZ_DUMP_MALFORMED", "")
+    for _step in range(max_steps):
         if not any(active):
             break
         idxs = [i for i, yes in enumerate(active) if yes]
@@ -164,8 +169,14 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
             command = parsed.action if parsed.kind == "action" else "look"
             if parsed.kind == "malformed":
                 kind_counts[slot]["malformed"] += 1
+                # 抢救：模型很可能吐的是 ALFWorld 原生自然命令而不是我们的 JSON
+                _rec = recover_bare_command(texts[j], adm[slot])
+                if _rec:
+                    command = _rec
+                    kind_counts[slot]["recovered"] += 1
+                dump_malformed(dump_path, used[slot], _step, texts[j])
             elif parsed.kind == "action":
-                kind_counts[slot]["action_valid"] += 1
+                kind_counts[slot]["action"] += 1
             else:
                 kind_counts[slot]["control"] += 1
             parsed_by_slot[slot] = parsed
@@ -176,6 +187,8 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps):
         result = env.step(commands)
         for slot in idxs:
             won[slot] = bool(result.won[slot]) if result.won else False
+            if result.admissible:
+                adm[slot] = result.admissible[slot]
             if result.dones[slot]:
                 active[slot] = False
                 continue

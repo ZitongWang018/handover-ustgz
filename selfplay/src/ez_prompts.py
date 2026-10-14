@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Sequence
 
 # ALFWorld 动作空间的公共说明段（附录 G Fig.13/14 的 "Common actions" 节）
@@ -108,6 +109,42 @@ SOLVER_USER_TEMPLATE = """# Your Task
 Your task is: {task_description}
 Explore the environment and complete the task."""
 
+# 补全: 论文附录 G Fig.14 的 user 轮里 **确实有一个 `# Example Omitted` 节**
+# （骨架注明"因版面省略"），说明论文真实 prompt 是**带示例**的，我们照抄骨架时留空了。
+# 用环境变量 EZ_SOLVER_FEWSHOT=1 打开 one-shot worked example；**默认关闭**
+# （=0 / 未设），保证仍在跑的正式训练的行为与改动前逐字一致。
+# 这块内容逐字使用任务给定的示例，不做改写。
+SOLVER_FEWSHOT_EXAMPLE = """# Example
+The environment gave this observation:
+    You are in a kitchen. You see a countertop 1, a fridge 1, a microwave 1 and an apple 1.
+Your task is: put a hot apple in the microwave.
+Your response must look like this:
+    <think></think> I need a hot apple. Apples are usually inside the fridge, so I should go there first.
+    <tool_call>{"name":"alfworld_tool","arguments":{"action_type":"go to fridge 1"}}</tool_call>"""
+
+# 去混杂用的**同 schema** 变体：任务给定示例里的动作 `{"action_type":"go to fridge 1"}`
+# 与 SOLVER_SYSTEM 的 `_ACTION_SPACE_DOC` 自相矛盾（文档要求 action_type="go_to" +
+# receptacle_name）。实测 `ez_proposer.parse_tool_call`：前者 → malformed（被静默降级成
+# look），后者 → action。为了把"示例无效"和"示例格式错"分开，这里只把那一行换成同 schema 形式，
+# 其余逐字不变。用独立开关 EZ_SOLVER_FEWSHOT_SCHEMA=1 打开（默认关闭）。
+SOLVER_FEWSHOT_EXAMPLE_ONSCHEMA = SOLVER_FEWSHOT_EXAMPLE.replace(
+    '{"action_type":"go to fridge 1"}',
+    '{"action_type":"go_to","receptacle_name":"fridge 1"}')
+
+
+def _solver_fewshot() -> str:
+    """返回要在 `# Your Task` 前插入的示例块（含尾换行分隔），默认（都未设/0）为空串。
+
+    - EZ_SOLVER_FEWSHOT=1        → 任务给定的逐字示例
+    - EZ_SOLVER_FEWSHOT_SCHEMA=1 → 同 schema 变体（去混杂对照）
+    两者默认都关闭，保证正式训练行为与改动前逐字一致。
+    """
+    if os.environ.get("EZ_SOLVER_FEWSHOT_SCHEMA", "0") == "1":
+        return SOLVER_FEWSHOT_EXAMPLE_ONSCHEMA + "\n"
+    if os.environ.get("EZ_SOLVER_FEWSHOT", "0") == "1":
+        return SOLVER_FEWSHOT_EXAMPLE + "\n"
+    return ""
+
 
 def build_proposer_messages(observation: str, max_turns: int,
                             admissible: Sequence[str] = ()) -> List[Dict[str, str]]:
@@ -122,9 +159,60 @@ def build_proposer_messages(observation: str, max_turns: int,
 def build_solver_messages(observation: str, task_desc: str) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": SOLVER_SYSTEM},
-        {"role": "user", "content": SOLVER_USER_TEMPLATE.format(
+        {"role": "user", "content": _solver_fewshot() + SOLVER_USER_TEMPLATE.format(
             observation=observation, task_description=task_desc)},
     ]
+
+
+def recover_bare_command(text: str, admissible: Sequence[str]) -> str:
+    """从"被判 malformed"的输出里抢救出一条**确实可执行**的自然命令。
+
+    ⚠️ 为什么需要（2026-10-14 实测，可能是复现卡住的主因之一）：
+        ALFWorld 的**原生动作空间本来就是自然命令字符串**（`"go to desk 1"`），
+        但我们要求模型输出 JSON tool-call，而 `parse_tool_call` **只认 JSON**。实测：
+            parse_tool_call("go to desk 1")               -> malformed
+            parse_tool_call("take apple 1 from fridge 1") -> malformed
+            parse_tool_call('{"action_type":"go_to","receptacle_name":"desk 1"}')
+                                                          -> action "go to desk 1" ✓
+        而 `_rollout_batch` / `run_ez_solver_rollouts` 会把 malformed **静默换成 look**。
+        基座模型很可能根本不吐 JSON、直接吐自然命令 ⇒ **完全可用的回答被丢掉**，
+        表现成"模型一直在 look"。实测基座 malformed 占比 **53.1%**（每两步丢一条）。
+
+    ★ 安全性：只在**与当前 admissible 列表能对上**时才采用 ——
+      先小写化 + 空白归一，再要求整条命令作为子串出现，取命中的**最长**那条。
+      所以本函数**不可能**返回非法动作，最坏情况返回 ""（退回原来的 look）。
+
+    默认关闭（`EZ_SOLVER_BARE_FALLBACK!=1` 时恒返回 ""），保证正式训练行为逐字节不变。
+    """
+    import os
+    if not admissible or os.environ.get("EZ_SOLVER_BARE_FALLBACK", "0") != "1":
+        return ""
+    norm = " ".join(str(text).lower().split())
+    if not norm:
+        return ""
+    best, best_len = "", 0
+    for a in admissible:
+        a_str = str(a).strip()
+        a_norm = " ".join(a_str.lower().split())
+        if a_norm and a_norm in norm and len(a_norm) > best_len:
+            best, best_len = a_str, len(a_norm)
+    return best
+
+
+def dump_malformed(path: str, game, turn: int, text: str) -> None:
+    """把被判 malformed 的**原始生成文本**逐条落盘（`EZ_DUMP_MALFORMED` 为空时不做）。
+
+    没有这个就没法判断"模型是真的不会"还是"我们的解析器把它的回答扔了"。
+    """
+    if not path:
+        return
+    import json as _json
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"game": str(game), "turn": int(turn),
+                                  "text": text}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 —— 诊断落盘失败绝不能影响评测
+        pass
 
 
 def append_tool_result(messages: List[Dict[str, str]], action_text: str,

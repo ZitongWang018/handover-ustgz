@@ -102,6 +102,140 @@ class ParsedToolCall:
     end_idx: int = -1                            # 工具调用在原文中的结束下标（开区间）；-1 = 未知
 
 
+def _repair_json(obj_text: str):
+    """尽力把"缺右括号 / 多尾巴"的 JSON 修成可解析对象；修不了返回 None。
+
+    实测动机（2026-10-14，7550 条真实 malformed 原文的分类）：
+      * `{...,"receptacle_name": "cabinet 1"` —— **只差最后一个 `}`**，占 malformed 的 2.5%
+      * 另有 11.8% 是"JSON 非法/截断"
+
+    修复手法：扫描一遍算括号欠账（**跳过字符串字面量内部的括号**，并处理 `\\` 转义），
+    然后补上缺的 `]` / `}`；若扫描结束时仍在字符串里，先补一个 `"`。
+    """
+    import os
+    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
+        return None
+    t = obj_text.strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    depth_c = depth_b = 0
+    in_str = esc = False
+    for ch in t:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth_c += 1
+        elif ch == "}":
+            depth_c -= 1
+        elif ch == "[":
+            depth_b += 1
+        elif ch == "]":
+            depth_b -= 1
+    if in_str:
+        t += '"'
+    t = t + ("]" * max(0, depth_b)) + ("}" * max(0, depth_c))
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        return None
+
+
+#: 动作类型写的常见别名 → 规范名（模型会写 "go to" / "goto" / "pick" 等）
+_ACTION_ALIASES = {
+    "go to": "go_to", "goto": "go_to", "move to": "go_to", "move": "go_to",
+    "navigate": "go_to", "walk to": "go_to",
+    "pick": "take", "pick up": "take", "grab": "take",
+    "put": "move", "place": "move", "put in": "move", "put on": "move",
+    "look at": "examine", "inspect": "examine", "check": "examine",
+    "use": "use", "turn on": "use", "activate": "use",
+    "clean with": "clean", "wash": "clean", "heat with": "heat",
+    "cook": "heat", "cool with": "cool", "chill": "cool",
+    "open it": "open", "close it": "close", "list": "inventory",
+}
+
+
+def _action_type_of(args: dict) -> str:
+    """从参数对象里取动作类型，**带容错**。
+
+    实测动机（7550 条 malformed 分类，占 76.6%）：
+      * `{"name": "go_to", "receptacle_name": "cabinet 2"}`         —— 扁平写法、缺 arguments 包裹
+      * `{"name":"alfworld_tool","arguments":{"name":"go_to",...}}` —— 包裹层对，内层该叫 action_type
+    即模型**语义正确**，只是把动作类型放进了 `name` / `action` 字段。
+    所以这里按 `action_type → name → action → tool → command` 依次取，并做别名归一。
+    """
+    import os
+    raw = ""
+    for k in ("action_type", "action", "name", "tool", "command", "task"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            raw = v.strip()
+            break
+    if not raw:
+        return ""
+    at = raw.lower()
+    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
+        return at
+    at = _ACTION_ALIASES.get(at, at.replace(" ", "_").replace("-", "_"))
+    return at
+
+
+def _scan_truncated_call(obj_src: str):
+    """兜底扫描：找一个"扫到文本结尾都没闭合"的工具调用起点，返回 `(start, len)`。
+
+    `scan_bare_json_call` 要求括号**配平**，于是：
+      * "只差最后一个 `}`" —— 实测占 malformed 的 **2.5%**
+      * 被 `max_new_tokens` 截断的一批（"JSON 非法/截断" 11.8% 里的一部分）
+    会被整条丢掉。这里把没闭合的那段整块交给 `_repair_json` 补括号。
+    `EZ_PARSER_STRICT=1` 时直接返回 None（保持原始行为）。
+    """
+    import os
+    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
+        return None
+    n = len(obj_src)
+    i = 0
+    while True:
+        i = obj_src.find("{", i)
+        if i < 0:
+            return None
+        depth, in_str, esc, closed = 0, False, False, False
+        for j in range(i, n):
+            c = obj_src[j]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    closed = True
+                    break
+        if not closed:
+            cand = obj_src[i:]
+            if ('"action_type"' in cand or '"name"' in cand
+                    or '"task_description"' in cand or '"action"' in cand):
+                return i, n
+        i += 1
+
+
 def parse_tool_call(text: str) -> ParsedToolCall:
     """从模型输出解析工具调用。
 
@@ -121,17 +255,23 @@ def parse_tool_call(text: str) -> ParsedToolCall:
         from rollout import scan_bare_json_call
         span = scan_bare_json_call(text)
         if span is None:
+            span = _scan_truncated_call(text)   # ★ 兜底：没闭合/被截断的也算
+        if span is None:
             return ParsedToolCall(kind="malformed", raw=text[-200:])
         end_idx = span[1]
         obj_text = text[span[0]:span[1]]
     try:
         obj = json.loads(obj_text)
     except json.JSONDecodeError:
+        obj = _repair_json(obj_text)      # ★ 容错：缺右括号/截断也能救回来
+        if obj is None:
+            return ParsedToolCall(kind="malformed", raw=obj_text[:200])
+    if not isinstance(obj, dict):
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     args = obj.get("arguments", obj)
     if not isinstance(args, dict):
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
-    at = str(args.get("action_type", "")).strip().lower()
+    at = _action_type_of(args)            # ★ 容错：name/action/别名都对上
     desc = str(args.get("task_description", "")).strip()
     if at in ("declare", "declare_task"):
         return ParsedToolCall(kind="declare", task_description=desc, raw=obj_text,

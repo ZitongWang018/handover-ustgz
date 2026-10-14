@@ -494,11 +494,35 @@ def scan_bare_json_call(text: str) -> Optional[Tuple[int, int]]:
                 depth -= 1
                 if depth == 0:
                     cand = text[i:j + 1]
-                    if ('"action_type"' in cand or '"task_description"' in cand) and \
+                    if _looks_like_tool_call(cand) and \
                             not re.search(r'"arguments"\s*:\s*$', text[:i].rstrip()):
                         return i, j + 1
                     break          # 不是完整工具调用，从下一个 '{' 继续找
         i += 1
+
+
+#: 严格模式下，只有这两个键才算"工具调用"（原始行为）
+_TOOL_KEYS_STRICT = ('"action_type"', '"task_description"')
+#: 容错模式下额外认这两个 —— 模型把动作类型写进 `name`/`action` 的实测占比 14.6%
+_TOOL_KEYS_TOLERANT = _TOOL_KEYS_STRICT + ('"name"', '"action"')
+
+
+def _looks_like_tool_call(cand: str) -> bool:
+    """候选对象是否"像一个工具调用"（决定 `scan_bare_json_call` 要不要把它切出来）。
+
+    ★★ 2026-10-14 实测抓到的**真根因**：这里原来硬编码只认
+       `'"action_type"'` / `'"task_description"'`。于是模型只要
+         * 把动作类型写进 `name`（`{"name":"alfworld_tool","arguments":{"name":"go_to",...}}`，
+           占 malformed 的 **14.6%**），或
+         * 写扁平形式 `{"name":"go_to","receptacle_name":"cabinet 2"}`（占 **62.0%**）
+       —— **在扫描阶段就返回 None**，`parse_tool_call` 后面那套容错解析**根本没机会执行**。
+       所以光改 `parse_tool_call` 不够，这道前置闸门必须一起放宽。
+
+    容错模式默认开；`EZ_PARSER_STRICT=1` 可恢复原始行为做对照。
+    """
+    keys = (_TOOL_KEYS_STRICT if os.environ.get("EZ_PARSER_STRICT", "0") == "1"
+            else _TOOL_KEYS_TOLERANT)
+    return any(k in cand for k in keys)
 
 
 # --------------------------------------------------------------------------- gradient checkpointing 开关
