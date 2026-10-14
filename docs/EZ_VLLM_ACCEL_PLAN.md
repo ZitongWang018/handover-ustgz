@@ -68,34 +68,69 @@
 **结论**：vLLM 0.8.5 在二期可用；token-in/token-out（`prompt_token_ids` 进、`outputs[0].token_ids` 出）
 走的通，与 EZ 训练序列"assistant 段用真实生成 token id"的要求一致。
 
-### P1 — solve rate 接 vLLM（收益最大、最好隔离）
+### P1 — solve rate 接 vLLM（✅ 已完成 2026-10-14）
 **为什么先做这段**：solver 在整个 proposer 相位**冻结**，权重不用每步刷新 —— 最适合常驻引擎 + 前缀缓存。
-- 新增 `src/ez_vllm_policy.py`：实现与 `HFPolicy` 同接口的 vLLM 版
-  （`initial_prompt_ids` / `generate_from_token_ids` / `assistant_end_ids` / `append_feedback_ids` /
-  `next_generation_prefix_ids`），**内部走 vLLM 的 token-in/token-out**；
-  停止条件 `tool_call` 需要在 vLLM 侧用 `stop`/自定义 `StoppingCriteria` 复刻
-  （对应 `rollout._ToolCallStopCriteria`）。
-- `ez_train.py` 的 solve rate 段：把 `run_ez_solver_rollouts(env_sr, policy, ...)` 换成
-  轨迹级异步循环 + vLLM 后端；env 用工作池并行。
-- **验收**：同一份 solver 权重、固定 32 个任务、每任务 8 条采样 ——
-  对比"256 条轨迹全部完成的时间"与 HF 版；并核对 p̂ 与 HF 版一致（同权重同种子）。
-- 风险：停止条件复刻不一致 → 生成长度分布变化 → p̂ 偏。必须逐条对齐验证。
 
-### P2 — exploration + solver rollout 接入
-- exploration（proposer）每个 step 后权重刷新，需要 **策略版本边界**：
-  完成当前版本的请求 → 暂停收请求 → 训练更新 → 刷 adapter + 版本号 → 清失效缓存 → 恢复采样。
-- vLLM 的 LoRA：用 `LoRARequest` 挂 adapter；每步 `wake/sleep` 或增量更新 adapter 权重。
-- **验收**：训练序列（`build_token_sequence`）与采样历史在 vLLM 下仍逐 token 一致。
+- 新增 `src/ez_vllm_policy.py`：`VLLMPolicy` **继承** `HFPolicy`，分词面
+  （`initial_prompt_ids` / `append_feedback_ids` / `assistant_end_ids` /
+  `next_generation_prefix_ids` / `truncate_messages`）**一行都不重写** —— 两个后端给出的
+  prompt token 序列逐字节相同。被换掉的只有 `_generate_batch` 那一层。
+- **停止条件不进 vLLM，改成"生成满 + 事后精确截断"**：EZ 的判据是"括号配平的裸 JSON"
+  （`scan_bare_json_call`），vLLM 的 `stop=` 表达不了。可以这么做的依据：自回归采样
+  **逐行独立**，HF 的 per-row StoppingCriteria 只是提前冻结某行、不改它已吐出的 token。
+  等价的单测：`scripts/ez_vllm_stop_equiv.py` → **309/309 PASS**（9 个历史坑例 + 300 随机序列）。
+  代价：多生成"本会提前停掉"的 token（实测填充浪费 ≈1.4x），换 10x 吞吐，划算。
+- LoRA 热同步：`export_lora_adapter`（**注意 PEFT 0.18 会多套一层 `<adapter>/`**，
+  函数负责探测真实路径）+ `lora_workdir`（按 rank 分目录、只留最近 2 份、写前清空）。
 
-### P3 — 环境工作池 + 并发调优
-- 把 env 状态数与进程数解耦：有限 worker 管 env 实例，限制同时执行的 action。
-- 先分别实测 reset / step / facts 提取耗时，再定 worker 数（推理实例和 tokenizer 也要 CPU）。
-- 调参：`max_num_seqs` 16/32/64、`max_num_batched_tokens` 8192/16384、
-  chunked prefill 开、`enable_prefix_caching` 开；同时看**完成速度 / 缓存命中 / 抢占次数 / 显存峰值**。
+### P2 — exploration + solver rollout 接入（✅ 已完成 2026-10-14）
+- `ez_train.py` 新增开关 `ZTWANG_ROLLOUT_BACKEND=hf|vllm`（默认 hf）+ `sync_rollout_adapter()`，
+  在 **4 处相位边界**刷 LoRA：proposer 步内（每步权重都变）/ solve rate 前（→solver）/
+  恢复（→proposer）/ solver 步内（每步权重都变）；另有 2 处评测点（`mid_eval_solver` 的 `sync_fn`）。
+  漏刷 = 采样策略 ≠ 训练策略 = **on-policy 静默破坏**，所以每次刷完都打日志。
+- **发射方式必须换（关键坑）**：`torchrun --nproc_per_node=8` 让 8 个 rank 都看得到 8 张卡，
+  而 vLLM 的 `LLM()` **没有 device 参数**，只看 `CUDA_VISIBLE_DEVICES` ⇒ 8 个引擎全挤 GPU0。
+  "先 `torch.cuda.set_device(local)` 再改环境变量"**必崩**（torch 设备缓存已按 8 卡建好，
+  `IndexError` @ `_dynamo/device_interface.py`）。最终方案：
+  ```bash
+  CUDA_VISIBLE_DEVICES=$i RANK=$i WORLD_SIZE=8 LOCAL_RANK=0 python src/ez_train.py ...
+  ```
+  **零 Python 代码改动**（`dist_info()` 本来就只读环境变量），已验收 8 进程并发起引擎无 OOM。
+- 验收（`scripts/ez_vllm_real_bench.py`，真实 ALFWorld 环境）：
 
-### P4 — 推理与训练共用八卡
-- rollout 阶段八卡全给推理；update 阶段（实测仅 ~30s）切回训练。
-- vLLM `sleep` 释放权重与 KV，`wake` 恢复；训练显存预算要同时覆盖训练模型 + 推理权重 + KV + 峰值。
+| 环节 | HF（旧） | vLLM（新） | 倍数 |
+|---|---|---|---|
+| proposer 探索 16 slot × 30 回合 | 787.8s | **92.2s** | 8.6x |
+| solve rate 8 条轨迹 | ~250s | **14.6s** | 17x |
+| 纯环境步进（对照，8 进程并发 vs 单进程） | 25.6s | 31.2s | 1.22x（几乎不争抢）|
+
+  第三行说明：**环境不是瓶颈**，GPU 生成才是。
+
+### P3 — 环境工作池 + 并发调优（结论：不需要）
+实测环境步进在 8 进程并发下只慢 1.22x（11.5ms/slot-turn），且 env reset 只占 ~1s/步。
+**P3 原计划的工作池/解耦没有必要**，跳过。
+
+### P4 — 推理与训练共用八卡（结论：不需要 sleep/wake）
+训练侧实测显存峰值 **10.5~11.9GB**（bf16 基座 8G + fp32 双 adapter + 梯度 + AdamW），
+vLLM 取 `gpu_memory_utilization=0.40`（≈32GB）⇒ 合计 ~45GB / 80GB，**直接共存即可**，
+不需要 vLLM 的 sleep/wake。
+
+### 端到端实测（job 13026569，TPS=1 / 4 outer / M_P=M_S=25 / G=16 / G_P=8）
+| 环节 | 实测 |
+|---|---|
+| proposer 探索（2 slot × 29 回合） | 34~43s |
+| solve rate（1 任务 × G_P=8） | 21~25s |
+| vLLM LoRA 热刷 | 0.3~0.5s/次（每步 2 次） |
+| `all_gather_object` + 等最慢 rank | ~30s |
+| backward | 1.7~4.3s |
+| **P 步合计** | **77~112s**（对比旧 HF+TSP=8 的探索 787.8s + 250s×N） |
+
+投影 **4 outer ≈ 4~5h**，达成「≤10h」目标。
+
+> ⚠️ 一个容易搞错的前提：现在 `ez_qwen3_4b.yaml` 是 `tasks_per_step: 1`，且代码里
+> **已经没有**"TPS 自动上调到 world"的逻辑。所以每步只有 **1 个全局 GRPO 组 = 16 条 rollout**，
+> rank 分片后每 rank 2 条。旧作业日志里的「TPS=8」是**那份配置 + 那份代码**的产物，
+> 意味着 8 倍数据量 —— 旧作业慢是两个因素叠加（HF 采样慢 + 8 倍数据）。
 
 ## 3. 验收口径（统一一份 solver 权重 + 固定任务集）
 

@@ -97,7 +97,17 @@ class HFPolicy:
         self.model = model
         self.tokenizer = tokenizer
         self.torch = torch
-        self.device = device or next(model.parameters()).device
+        # ★ model=None 是**允许**的：vLLM 后端（ez_vllm_policy.VLLMPolicy）继承本类
+        #   只为复用"chat 模板 + 分词"这一套，采样完全走 vLLM，不需要 HF 模型对象。
+        #   这样分词面（initial_prompt_ids / assistant_end_ids / append_feedback_ids /
+        #   next_generation_prefix_ids / truncate_messages）是**同一份代码**，
+        #   两个后端产出的 prompt token 序列逐字节相同 —— 这是"算法逻辑不变"的前提。
+        if device is not None:
+            self.device = device
+        elif model is not None:
+            self.device = next(model.parameters()).device
+        else:
+            self.device = "cpu"
         self.enable_thinking = enable_thinking
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

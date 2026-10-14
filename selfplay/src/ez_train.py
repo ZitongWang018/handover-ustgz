@@ -367,16 +367,21 @@ def resolve_resume_directory(path: Path, rank: int) -> Path:
 
 
 def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
-                    max_new_tokens, max_context_tokens, batch_size, seed, log_fn):
+                    max_new_tokens, max_context_tokens, batch_size, seed, log_fn,
+                    sync_fn=None):
     """在 valid_unseen 上评测当前 solver adapter（只读，不改权重、不动优化器）。
 
     判胜用官方 benchmark_done（ignore_benchmark_done=False），与训练内
     verify.final_match（状态匹配）口径不同 —— 这才是论文/官方 valid_unseen 成功率。
     rollout 复用 eval_ez._rollout_batch（已验证的官方评测链路）。
+
+    `sync_fn` = 采样后端权重刷新回调（vLLM 后端才需要；HF 后端传 None）。
     """
     from alfworld_env import task_instance_id, task_type_of
     from eval_ez import _rollout_batch
     select_adapter(raw, "solver")
+    if sync_fn:
+        sync_fn("solver")
     raw.eval()
     eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
                              max_new_tokens=max_new_tokens, temperature=temperature,
@@ -398,6 +403,8 @@ def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
         finally:
             env.close()
     select_adapter(raw, "proposer")
+    if sync_fn:
+        sync_fn("proposer")
     return (sum(won) / len(won)) if won else 0.0, won
 
 
@@ -777,6 +784,58 @@ def main() -> int:
     model = raw
     policy = HFPolicy(raw, tokenizer)
 
+    # ------------------------------------------------------------------ rollout 后端
+    # ★ ZTWANG_ROLLOUT_BACKEND=hf（默认，忠实路径）| vllm（工程加速）
+    #
+    #   换掉的**只有采样器**：`VLLMPolicy` 继承 `HFPolicy`，分词面完全复用，
+    #   训练侧拿到的 `input_ids/loss_mask` 语义一字不改（见 src/ez_vllm_policy.py 顶部）。
+    #
+    #   LoRA 热同步：每次采样前把"当前要采样的那个 adapter"单独导出成 PEFT 目录并
+    #   用新的 int_id 挂给 vLLM。三条相位边界都要刷：
+    #       proposer 步内（每步权重都变）/ solve rate 前（→solver）/ 恢复（→proposer）
+    #       solver 步内（每步权重都变）
+    #   ⚠️ 漏刷 = 采样策略 ≠ 训练策略 = on-policy 静默破坏，所以刷完都打日志。
+    rollout_backend = os.environ.get("ZTWANG_ROLLOUT_BACKEND", "hf").strip().lower()
+    vllm_policy = None
+    _vllm_ver: Dict[str, int] = {"proposer": 0, "solver": 0}
+    if rollout_backend == "vllm":
+        from ez_vllm_policy import (VLLMPolicy, build_vllm_engine,
+                                    export_lora_adapter, lora_workdir)
+
+        _base_path = os.path.expandvars(os.path.expanduser(str(cfg["model"]["path"])))
+        vllm_policy = VLLMPolicy(
+            build_vllm_engine(
+                _base_path,
+                gpu_memory_utilization=float(os.environ.get("ZTWANG_VLLM_GMEM", "0.40")),
+                max_model_len=int(cfg["solver"].get("max_context_tokens", 40960)),
+                max_num_seqs=int(os.environ.get("ZTWANG_VLLM_MAX_SEQS", "64")),
+                max_num_batched_tokens=int(os.environ.get("ZTWANG_VLLM_BATCHED", "16384")),
+            ),
+            tokenizer, log_fn=log)
+        policy = vllm_policy
+        log(f"[selfcheck] rollout backend=vllm（引擎已就绪，adapter 按需热刷）")
+    else:
+        log("[selfcheck] rollout backend=hf（默认）")
+
+    def sync_rollout_adapter(adapter: str) -> None:
+        """把指定 adapter 的**当前**权重刷进采样后端。HF 后端下是 no-op。"""
+        if vllm_policy is None:
+            return
+        _t0 = time.time()
+        _vllm_ver[adapter] += 1
+        # ★ 必须**按 rank 分目录**：run_dir 是全 rank 共享的，8 个 rank 同时
+        #   save_pretrained 到同一路径会写出损坏的 safetensors（且是静默的）。
+        _d = lora_workdir(str(run_dir), adapter, _vllm_ver[adapter], rank=rank)
+        # ★★ 必须用**返回值**：PEFT 0.18 的 save_pretrained 会多套一层 `<adapter>/`，
+        #    export_lora_adapter 负责探测出真正含 adapter_config.json 的那一层。
+        #    这里丢掉返回值 = 把父目录交给 vLLM ⇒ 第一次采样就
+        #        ValueError: Loading lora ... failed: No adapter found for <dir>
+        #    而且 EngineCore 会直接死，整个训练作业报废（实测 job 13009731）。
+        _d = export_lora_adapter(raw, adapter, _d)
+        vllm_policy.set_lora(adapter, _d)
+        log(f"[vllm] 刷新 {adapter} adapter v{_vllm_ver[adapter]} | "
+            f"{time.time() - _t0:.1f}s | {_d}")
+
     # ⚠️ 双 adapter 隔离由 peft 的 set_adapter 负责；optimizer 必须覆盖**两个**
     #    adapter 的全部参数（按名字里的 "lora_" 选），否则切到 solver 相位时新参数不在优化器里。
     #    raw.named_parameters() gives a stable fixed-order parameter set for manual sync.
@@ -861,7 +920,7 @@ def main() -> int:
                 max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
                 max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
                 batch_size=eval_batch, seed=seed,
-                log_fn=log)
+                log_fn=log, sync_fn=sync_rollout_adapter)
             log(f"[eval-pretest] 评测链路 OK：SR={_sr0:.4f} "
                 f"({int(sum(_won0))}/{len(_won0)}，{(time.time() - _pt0) / 60:.1f}min)")
         if world > 1:
@@ -884,6 +943,9 @@ def main() -> int:
             _cuda_sync_and_reset_peak()
             model.eval()
             select_adapter(raw, "proposer")
+            # ★ vLLM 后端：上一步 optimizer.step() 之后 proposer 权重已变，
+            #   采样前必须刷一次，否则本轮探索用的是**旧策略**（on-policy 静默破坏）。
+            sync_rollout_adapter("proposer")
             # All ranks process the same global task groups. Each group is sharded
             # rank-strided inside run_proposer_exploration.
             games: List[str] = []
@@ -936,6 +998,7 @@ def main() -> int:
                 uid_counter += 1
             if accepted:
                 select_adapter(raw, "solver")
+                sync_rollout_adapter("solver")
                 for _sub, _fill in _game_unique_calls(accepted, lambda c: c.task.game_file, sr_tasks):
                     _input: List[ProposedTask] = []
                     for c in _fill:
@@ -951,6 +1014,7 @@ def main() -> int:
                         c.task.meta["solve_rate"] = _p_hat
                         new_tasks.append(c.task)
                 select_adapter(raw, "proposer")
+                sync_rollout_adapter("proposer")
             if world > 1:
                 # ★ 任务池必须**每个 rank 完全一致**：solver 相位要从池里采样，
                 #   各 rank 池子不同则采出的任务数/内容不同 → backward 次数不同 → 死锁。
@@ -1117,6 +1181,8 @@ def main() -> int:
             st0 = time.time()
             _cuda_sync_and_reset_peak()
             model.eval()
+            # ★ vLLM 后端：solver 相位**每步都更新 solver 权重**，所以每步采样前都要刷。
+            sync_rollout_adapter("solver")
             # ★★ 采样改为**按 rank 分片**，不用 `rng.sample`（多卡下是真 bug，见下）
             #   旧写法 `rng.sample(outer_pool, k)`：rng 是 `random.Random(seed)`，
             #   各 rank 的 seed **完全相同**，而池子经 all_gather 后也完全一致 ——
@@ -1265,7 +1331,7 @@ def main() -> int:
                             max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
                             max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
                             batch_size=eval_batch, seed=seed + outer + 1,
-                            log_fn=log)
+                            log_fn=log, sync_fn=sync_rollout_adapter)
                         log(f"[eval] outer {outer} 完成 valid_unseen SR={_sr:.4f} "
                             f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
                             f"{(time.time() - _t0) / 60:.1f}min)")
