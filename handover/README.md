@@ -8,6 +8,7 @@
 | `eval_run_13044670/`（含[后续反馈](eval_run_13044670/gpt_feedback_20261014.md)） | ALFWorld `valid_unseen` 基座评测（paper-approx 协议，134 任务 × 4 采样 = 536 episode）。含协议 manifest、536 行 episode 明细、逐任务/逐类型聚合、8 分片日志、完整 `merged.json`（tar 包内）；反馈文档独立记录后续审计与修复 | 评测协议一致性与数字合理性；后续修复反馈 |
 | `skillrise_prompting_20261015/` | SkillRise ALFWorld prompting quick-run 的原始 JSON、selection、summary 与训练日志快照；历史事实保留 | 输入完整性、统计口径与证据边界；不作为 Explorer-Zero 结果 |
 | `explorer_zero_repro_plan_20261015/` | 本地只读审计 JSON、论文/上游协议矩阵与分阶段复现计划；不启动作业、不执行训练 | Explorer-Zero 复现边界、当前证据与后续验收计划 |
+| `explorer_zero_train_v2_20261015/`（含[实现反馈](explorer_zero_train_v2_20261015/gpt_feedback_v2.md)） | 从头训练的 schema-v3 入口、严格 checkpoint 合同、配对评测流程、便携 8 卡启动方式及 CPU 验收边界；不迁移旧 checkpoint、不运行 GPU 作业 | 新鲜训练合同、恢复资格与尚待目标 GPU 验证的事项 |
 
 每个子目录的 `README.md` 里都有：
 1. 运行事实（job id、节点、命令、代码 commit）

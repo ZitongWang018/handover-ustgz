@@ -65,7 +65,7 @@ def dist_info() -> Tuple[int, int, int]:
 
 def setup_dist() -> Tuple[int, int, int]:
     rank, world, local = dist_info()
-    if world > 1:
+    if world > 1 and not torch.distributed.is_initialized():
         torch.cuda.set_device(local)
         # NCCL 默认 timeout 只有 10 分钟：某个 rank 卡在 rollout / 评测（其它 rank 在
         # barrier 干等）超过 10 分钟就会被 watchdog 判死直接 abort 整队。
@@ -382,6 +382,8 @@ def grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     per_tok = -torch.min(surr1, surr2)
     kl_mean = 0.0
+    pg_per_tok = per_tok
+    kl_per_tok = torch.zeros_like(per_tok)
     if beta and ref_logps is None:
         raise ValueError("beta > 0 requires frozen-reference log probabilities")
     if beta and ref_logps is not None:
@@ -389,8 +391,8 @@ def grpo_loss(
         # exactly the same generated-token mask as the policy objective.
         delta = torch.where(mask.bool(), ref_logps - new_logps,
                             torch.zeros_like(new_logps))
-        kl = torch.exp(delta) - delta - 1.0
-        per_tok = per_tok + float(beta) * kl
+        kl_per_tok = torch.exp(delta) - delta - 1.0
+        per_tok = per_tok + float(beta) * kl_per_tok
     denom = mask.sum().clamp(min=1.0)
     # 归约口径单独放在 `grpo_norm.grpo_reduce`（只依赖 torch），
     # 这样离线单测能直接测到**跑的这份代码**，而不是测一份复刻实现。
@@ -399,6 +401,12 @@ def grpo_loss(
 
     with torch.no_grad():
         clipped = ((ratio - 1.0).abs() > clip_eps).float()
+        valid_sequences = int((mask.sum(dim=1) > 0).sum().item())
+        pg_sequence_sum = grpo_reduce(pg_per_tok.detach(), mask, loss_norm=loss_norm,
+                                      sequence_reduction="sum")
+        kl_sequence_sum = grpo_reduce(kl_per_tok.detach(), mask, loss_norm=loss_norm,
+                                      sequence_reduction="sum") if beta else torch.zeros((), device=mask.device)
+        objective_sequence_sum = pg_sequence_sum + float(beta) * kl_sequence_sum
         stats = {
             # ★ 这个式子看着像随手写的残差，其实是标准的 **k3 KL 估计**
             #   （Schulman）：令 Δ = new - old，则
@@ -410,6 +418,11 @@ def grpo_loss(
             "clip_frac": float((clipped * mask).sum().item() / max(denom.item(), 1.0)),
             "ratio_mean": float(((ratio * mask).sum() / denom).item()),
             "kl_ref": float(((torch.exp(torch.where(mask.bool(), ref_logps - new_logps, torch.zeros_like(new_logps))) - torch.where(mask.bool(), ref_logps - new_logps, torch.zeros_like(new_logps)) - 1.0) * mask).sum().item() / max(denom.item(), 1.0)) if ref_logps is not None else 0.0,
+            # Exact no-grad decomposition using the same masked seq reduction as loss.
+            "pg_sequence_sum": float(pg_sequence_sum.item()),
+            "kl_sequence_sum": float(kl_sequence_sum.item()),
+            "objective_sequence_sum": float(objective_sequence_sum.item()),
+            "valid_sequence_count": valid_sequences,
         }
     return loss, stats
 

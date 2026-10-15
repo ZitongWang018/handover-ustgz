@@ -1,0 +1,95 @@
+# Versioned, explicit Explorer-Zero fresh-training contract.
+# Values below are implementation choices where the paper does not specify them.
+protocol_version: 3
+protocol_name: explorer_zero_training_v2
+run:
+  name: explorer-zero-v2
+  seed: 42
+  output_dir: runs
+  allow_existing_run: false
+model:
+  path: null                 # required CLI --base; local directory only
+  dtype: bfloat16
+  attn_implementation: sdpa
+  gradient_checkpointing: true
+  lora: true
+  lora_r: 32
+  lora_alpha: 32
+  lora_targets: all-linear
+env:
+  data_root: null            # required CLI --alfworld-data; existing local dataset
+  config_path: configs/base_config.yaml
+  split: train
+  max_episode_steps: 30
+proposer:
+  max_turns: 30
+  max_new_tokens: 1024       # explicit local choice; not a paper-specified limit
+  temperature: 1.0
+  top_p: 0.95
+  top_k: -1
+  min_p: 0.0
+  repetition_penalty: 1.0
+  max_context_tokens: 40960
+  keep_recent_turns: 40
+  seed: null
+  give_admissible: false
+  invalid_action_mode: raw
+  finish_nudge: false
+solver:
+  max_turns: 30
+  max_new_tokens: 1024       # explicit local choice; not a paper-specified limit
+  temperature: 1.0
+  top_p: 0.95
+  top_k: -1
+  min_p: 0.0
+  repetition_penalty: 1.0
+  max_context_tokens: 40960
+  keep_recent_turns: 12
+  seed: null
+  stop_mode: tool_call
+  style: ours
+  menu_enabled: false
+  parser_strict: false
+  fallback_mode: raw
+  fewshot: false
+  rich: false
+train:
+  outer_loops: 4
+  proposer_steps: 25
+  solver_steps: 25
+  group_size: 16
+  tasks_per_step: 1
+  solve_rate_rollouts: 8
+  lr: 1.0e-4
+  weight_decay: 0.0
+  clip_eps: 0.3
+  adv_ddof: 1
+  loss_norm: seq
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  w_sub: 0.3
+  w_div: 0.3
+  kl_beta: 0.001
+  sync_bucket_mb: 25
+  check_adapter_sync_every: 5
+  generation_max_batch_size: 2
+  solve_rate_batch_tasks: 1
+  checkpoint_every: 5
+  checkpoint_keep: 0
+  eval_every_outer: 0
+  eval_n_tasks: 0
+runtime:
+  world_size: 8
+  backend: hf             # must be explicitly selected by --backend
+  stateful_resume_non_bitwise: true
+  vllm:
+    gpu_memory_utilization: 0.35
+    max_model_len: 40960
+    max_lora_rank: 32
+    max_num_seqs: 64
+    max_num_batched_tokens: 8192
+    enable_prefix_caching: true
+    enforce_eager: false
+    seed: 0
+telemetry:
+  swanlab: false

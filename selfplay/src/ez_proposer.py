@@ -37,6 +37,8 @@ class ProposerConfig:
     max_new_tokens: int = 160       # 补全: 附录未给，探索动作+理由预留比 solver(96) 多
     temperature: float = 1.0
     top_p: float = 0.95
+    top_k: int = -1
+    min_p: float = 0.0
     repetition_penalty: float = 1.05
     max_context_tokens: int = 40960  # Table 3 context length
     keep_recent_turns: int = 40     # 补全: 40960 token 大约能留 40 轮
@@ -342,7 +344,8 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
     from rollout import RolloutConfig as _RC  # 借 HFPolicy.generate 的 cfg 形态
 
     gen_cfg = _RC(group_size=1, max_steps=cfg.max_turns, max_new_tokens=cfg.max_new_tokens,
-                  temperature=cfg.temperature, top_p=cfg.top_p,
+                  temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k,
+                  min_p=cfg.min_p,
                   repetition_penalty=cfg.repetition_penalty,
                   max_context_tokens=cfg.max_context_tokens,
                   keep_recent_turns=cfg.keep_recent_turns,

@@ -332,7 +332,7 @@ def _rollout_batch_rich(env, policy, used, views, records, adm0, cfg, max_steps)
 
 
 def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
-                   style=None, menu_enabled=None):
+                   style=None, menu_enabled=None, capture_v2_trace=False):
     observations, views, admissible, used, _ = env.reset(game_files)
     if len(used) != len(game_files):
         raise RuntimeError("ALFWorld reset returned a different number of evaluation slots")
@@ -352,6 +352,7 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
                                      views[i].task_desc or "", adm[i],
                                      menu_enabled=resolved_menu) for i in range(len(used))]
     buffers = [policy.initial_prompt_ids(m, cfg) for m in prompts]
+    initial_prompt_ids = [list(x) for x in buffers]
     active = [True] * len(used)
     won = [False] * len(used)
     steps = [0] * len(used)
@@ -369,7 +370,16 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
         if not any(active):
             break
         idxs = [i for i, yes in enumerate(active) if yes]
-        texts, generated, _ = policy.generate_from_token_ids([buffers[i] for i in idxs], cfg)
+        step_prompts = [list(buffers[i]) for i in idxs]
+        request_seeds = [int(records[i].get("sample_seed", 0)) for i in idxs] if capture_v2_trace else None
+        if request_seeds is not None:
+            from ez_eval_v2_contract import request_seed
+            request_seeds = [request_seed(seed, steps[slot])
+                             for seed, slot in zip(request_seeds, idxs)]
+            texts, generated, stop_lens = policy.generate_from_token_ids(
+                step_prompts, cfg, request_seeds=request_seeds)
+        else:
+            texts, generated, stop_lens = policy.generate_from_token_ids(step_prompts, cfg)
         step_admissible = [list(x) for x in adm]
         commands = ["look"] * len(used)
         parsed_by_slot = [None] * len(used)
@@ -381,7 +391,8 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
             if parsed.kind == "malformed":
                 kind_counts[slot]["malformed"] += 1
                 # 抢救：模型很可能吐的是 ALFWorld 原生自然命令而不是我们的 JSON
-                _rec, _how = resolve_action(texts[j], adm[slot])
+                _rec, _how = ((None, "v2_recovery_disabled") if capture_v2_trace
+                              else resolve_action(texts[j], adm[slot]))
                 resolver_by_slot[slot] = _how
                 if _rec and _how not in ("none", "fallback"):
                     command = _rec
@@ -412,20 +423,34 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
             won[slot] = bool(result.won[slot]) if result.won else False
             if result.admissible:
                 adm[slot] = result.admissible[slot]
-            traces[slot].append({"step": steps[slot] - 1, "raw_output": texts[idxs.index(slot)],
+            j = idxs.index(slot)
+            traces[slot].append({"step": steps[slot] - 1, "raw_output": texts[j],
                                  "parse_kind": parsed_by_slot[slot].kind,
+                                 "parser_projection": {"kind": parsed_by_slot[slot].kind,
+                                     "action": parsed_by_slot[slot].action,
+                                     "task_description": parsed_by_slot[slot].task_description},
                                  "resolver_mode": resolver_by_slot[slot],
                                  "executed_command": commands[slot],
                                  "observation": result.obs[slot],
+                                 "won": won[slot], "done": bool(result.dones[slot]),
                                  "initial_observation": views[slot].env_desc or views[slot].raw,
                                  "task_description": views[slot].task_desc or "",
                                  "admissible_menu_enabled": resolved_menu,
                                  "visible_menu_count": (len(step_admissible[slot])
                                                         if resolved_menu else 0),
                                  "resolver_consulted_action_list": (
-                                     parsed_by_slot[slot].kind == "malformed"),
+                                     parsed_by_slot[slot].kind == "malformed" and not capture_v2_trace),
                                  "resolver_action_list_available": bool(step_admissible[slot]),
-                                 "admissible_actions": step_admissible[slot]})
+                                 "admissible_actions": step_admissible[slot],
+                                 **({"prompt_token_ids": step_prompts[j],
+                                     "output_token_ids": list(generated[j]),
+                                     "request_seed": request_seeds[j],
+                                     "stop_token_count": int(stop_lens[j]),
+                                     "finish_reason": (getattr(policy, "last_finish_reasons", [None] * len(idxs))[j]
+                                                       if getattr(policy, "last_finish_reasons", None) else
+                                                       "max_new_tokens" if len(generated[j]) >= cfg.max_new_tokens else "stop_or_eos"),
+                                     "truncated": len(generated[j]) >= cfg.max_new_tokens}
+                                    if capture_v2_trace else {})})
             if result.dones[slot]:
                 active[slot] = False
                 continue
@@ -440,6 +465,10 @@ def _rollout_batch(env, policy, game_files, task_records, cfg, max_steps, *,
             buffers[slot].extend(suffix)
     return [{"task_id": records[i]["task_id"], "task_type": records[i]["task_type"],
              "game_file": used[i], "sample": records[i]["sample"],
+             **({"sample_seed": records[i]["sample_seed"],
+                 "initial_prompt_token_ids": initial_prompt_ids[i],
+                 "chat_template": getattr(getattr(policy, "tokenizer", None), "chat_template", None)}
+                if capture_v2_trace else {}),
              "won": won[i], "steps": steps[i], "actions": actions[i],
              "trace": traces[i],
              "kinds": kind_counts[i],

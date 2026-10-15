@@ -110,7 +110,8 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
                       max_model_len: int = 40960, max_lora_rank: int = 32,
                       max_num_seqs: int = 64, max_num_batched_tokens: int = 16384,
                       enable_prefix_caching: bool = True,
-                      enforce_eager: bool = False, seed: int = 1234):
+                      enforce_eager: bool = False, seed: int = 1234,
+                      trust_remote_code: bool = True):
     """构造单进程（= 单卡 TP=1）vLLM 引擎。
 
     显存口径：训练侧的 HF 模型**同时**驻留同一张卡，所以 `gpu_memory_utilization`
@@ -122,7 +123,7 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
         model=base_path,
         tokenizer=base_path,
         dtype="bfloat16",
-        trust_remote_code=True,
+        trust_remote_code=bool(trust_remote_code),
         gpu_memory_utilization=float(gpu_memory_utilization),
         max_model_len=int(max_model_len),
         enable_lora=True,
@@ -213,7 +214,7 @@ class VLLMPolicy(HFPolicy):
 
     # ------------------------------------------------------------- 生成
     def generate_from_token_ids(self, prompt_ids_list: Sequence[Sequence[int]],
-                                cfg: RolloutConfig
+                                cfg: RolloutConfig, *, request_seeds: Optional[Sequence[int]] = None
                                 ) -> Tuple[List[str], List[List[int]], List[int]]:
         if not prompt_ids_list:
             return [], [], []
@@ -233,7 +234,9 @@ class VLLMPolicy(HFPolicy):
         eos = self.tokenizer.eos_token_id
         eos_ids = [int(eos)] if isinstance(eos, int) else [int(x) for x in (eos or [])]
 
-        sp = SamplingParams(
+        if request_seeds is not None and len(request_seeds) != len(prompt_ids_list):
+            raise ValueError("request_seeds must match prompt batch length")
+        base_params = dict(
             n=1,
             max_tokens=int(cfg.max_new_tokens),
             stop_token_ids=eos_ids or None,
@@ -244,6 +247,8 @@ class VLLMPolicy(HFPolicy):
             logprobs=None,
             **normalize_sampling(cfg),
         )
+        sp = ([SamplingParams(**base_params, seed=int(seed)) for seed in request_seeds]
+              if request_seeds is not None else SamplingParams(**base_params))
         prompts = [{"prompt_token_ids": [int(t) for t in ids]} for ids in prompt_ids_list]
         outs = self.llm.generate(prompts, sampling_params=sp,
                                  lora_request=self._lora_req, use_tqdm=False)
@@ -262,6 +267,7 @@ class VLLMPolicy(HFPolicy):
             gen_ids.append(ids)
             stops.append(len(ids))
             texts.append(self.tokenizer.decode(ids, skip_special_tokens=True))
+        self.last_finish_reasons = [getattr(o.outputs[0], "finish_reason", None) for o in outs]
         return texts, gen_ids, stops
 
     def generate(self, messages_list: Sequence[Sequence[Dict[str, str]]],

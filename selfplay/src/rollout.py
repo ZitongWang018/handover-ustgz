@@ -173,33 +173,59 @@ class HFPolicy:
         lengths = [len(self.tokenize_text(self.render(m, add_generation_prompt=True))) for m in rendered]
         order = sorted(range(len(rendered)), key=lambda i: lengths[i])
         texts, ids, stops = [None] * len(order), [None] * len(order), [None] * len(order)
+        reasons = [None] * len(order)
         for start in range(0, len(order), chunk):
             idx = order[start:start + chunk]
             out = self._generate_batch([rendered[i] for i in idx], cfg)
             for j, original in enumerate(idx):
                 texts[original], ids[original], stops[original] = out[0][j], out[1][j], out[2][j]
+                current = getattr(self, "last_finish_reasons", [])
+                reasons[original] = current[j] if j < len(current) else None
+        self.last_finish_reasons = reasons
         return texts, ids, stops
 
     def generate_from_token_ids(self, prompt_ids_list: Sequence[Sequence[int]],
-                                cfg: RolloutConfig) -> Tuple[List[str], List[List[int]], List[int]]:
+                                cfg: RolloutConfig, *, request_seeds: Optional[Sequence[int]] = None) -> Tuple[List[str], List[List[int]], List[int]]:
         """Generate from exact token-native histories, preserving sampled prefixes."""
         if not prompt_ids_list:
             return [], [], []
         budget = int(cfg.max_context_tokens)
         if any(len(ids) + cfg.max_new_tokens > budget for ids in prompt_ids_list):
             raise ValueError("EZ conversation exceeded hard context budget; refusing off-policy truncation")
+        if request_seeds is not None and len(request_seeds) != len(prompt_ids_list):
+            raise ValueError("request_seeds must match prompt batch length")
         chunk = len(prompt_ids_list) if int(cfg.max_batch_size) <= 0 else int(cfg.max_batch_size)
         order = sorted(range(len(prompt_ids_list)), key=lambda i: len(prompt_ids_list[i]))
         texts, ids, stops = [None] * len(order), [None] * len(order), [None] * len(order)
+        reasons = [None] * len(order)
+        if request_seeds is not None:
+            # Keep the HF reference path on Transformers' native sampler. HF does
+            # not expose stable per-row generators across supported versions, so
+            # seeded reference calls run one prompt at a time under isolated RNG.
+            # The production vLLM path remains batched with native per-request seeds.
+            for original in order:
+                seed = int(request_seeds[original])
+                out = self._generate_batch([], cfg,
+                    prompt_ids_list=[prompt_ids_list[original]], request_seeds=[seed])
+                texts[original], ids[original], stops[original] = out[0][0], out[1][0], out[2][0]
+                current = getattr(self, "last_finish_reasons", [])
+                reasons[original] = current[0] if current else None
+            self.last_finish_reasons = reasons
+            return texts, ids, stops
         for start in range(0, len(order), chunk):
             idx = order[start:start + chunk]
-            out = self._generate_batch([], cfg, prompt_ids_list=[prompt_ids_list[i] for i in idx])
+            out = self._generate_batch([], cfg, prompt_ids_list=[prompt_ids_list[i] for i in idx],
+                                       request_seeds=None)
             for j, original in enumerate(idx):
                 texts[original], ids[original], stops[original] = out[0][j], out[1][j], out[2][j]
+                current = getattr(self, "last_finish_reasons", [])
+                reasons[original] = current[j] if j < len(current) else None
+        self.last_finish_reasons = reasons
         return texts, ids, stops
 
     def _generate_batch(self, messages_list: Sequence[Sequence[Dict[str, str]]], cfg: RolloutConfig,
-                        prompt_ids_list: Optional[Sequence[Sequence[int]]] = None) -> Tuple[List[str], List[List[int]], List[int]]:
+                        prompt_ids_list: Optional[Sequence[Sequence[int]]] = None,
+                        request_seeds: Optional[Sequence[int]] = None) -> Tuple[List[str], List[List[int]], List[int]]:
         """返回 (texts, gen_ids, stop_len)。
 
         `stop_len[i]` 是"该行已经可以停下"的生成长度（含触发停止的那个换行）。
@@ -247,6 +273,11 @@ class HFPolicy:
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
+        if request_seeds is not None:
+            if len(request_seeds) != int(enc["input_ids"].shape[0]):
+                raise ValueError("request_seeds must match generated batch")
+            if len(request_seeds) != 1:
+                raise ValueError("seeded HF generation is intentionally single-request")
         if cfg.stop_mode != "eos":
             # transformers>=4.5x requires a list for custom criteria.
             gen_kwargs["stopping_criteria"] = [criteria]
@@ -310,15 +341,24 @@ class HFPolicy:
         _ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                              enabled=(_pdt == torch.float32), cache_enabled=False)
         try:
-            with torch.no_grad(), _ac:
-                out = self.model.generate(**enc, use_cache=True, **gen_kwargs)
+            if request_seeds is None:
+                with torch.no_grad(), _ac:
+                    out = self.model.generate(**enc, use_cache=True, **gen_kwargs)
+            else:
+                device = enc["input_ids"].device
+                devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+                with torch.random.fork_rng(devices=devices), torch.no_grad(), _ac:
+                    torch.manual_seed(int(request_seeds[0]))
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed(int(request_seeds[0]))
+                    out = self.model.generate(**enc, use_cache=True, **gen_kwargs)
         finally:
             if _gc_on:
                 gc_set(self.model, True)
 
         # 切片起点同样必须用 `gen_start`（含 padding 的总长），理由同上。
         plens = [gen_start] * enc["input_ids"].shape[0]
-        texts, gen_ids, stops = [], [], []
+        texts, gen_ids, stops, finish_reasons = [], [], [], []
         for i in range(out.shape[0]):
             plen = int(plens[i])
             all_ids = out[i, plen:].tolist()
@@ -344,6 +384,10 @@ class HFPolicy:
             gen_ids.append(ids)
             stops.append(len(ids))
             texts.append(self.tokenizer.decode(ids, skip_special_tokens=True))
+            finish_reasons.append("tool_call_stop" if cfg.stop_mode != "eos" and semantic_stop < eos_pos
+                                  else "eos" if eos_pos < len(all_ids)
+                                  else "max_new_tokens")
+        self.last_finish_reasons = finish_reasons
         return texts, gen_ids, stops
 
 
