@@ -1,30 +1,15 @@
-"""ReAct rollout：让策略模型在 ALFWorld 里一局一局地玩，并记录可训练的词元序列。
-
-关键约定
---------
-* **环境侧**：用 `ALFWorldBatchEnv`（`AsyncBatchEnv`，每 slot 一个子进程）。每个 task 采 `group_size`
-  条独立轨迹 —— 靠把同一个 game file 在 batch 里重复 `group_size` 次实现，再用
-  `extra.gamefile` 反查确认。
-* **模型侧**：只用 HF `generate`（不依赖 vLLM），DDP 下每个 rank 自己跑自己的轨迹，天然并行。
-* **词元序列**：assistant 部分用**真实生成的 token id**（不是重新 tokenize 的文本），
-  非 assistant 部分（chat 模板骨架 + 环境观测）用重新渲染得到的 token 并**置 mask=0**。
-  这样 loss 只作用在模型自己产出的词元上 —— 多轮智能体 RL 的标准做法。
-"""
+"""Shared rollout policy, token handling, and task-slot alignment helpers."""
 from __future__ import annotations
 
 import contextlib
 import os
-import random
 import re
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 
-from prompts import ParsedAction, build_system_prompt, format_observation, format_turn_feedback, match_admissible, parse_action
-from reward import RewardConfig, TrajectoryStats, compute_reward
+from reward import TrajectoryStats
 
 # --------------------------------------------------------------------------- 配置
 
@@ -33,23 +18,18 @@ from reward import RewardConfig, TrajectoryStats, compute_reward
 class RolloutConfig:
     group_size: int = 8
     max_steps: int = 30
-    max_new_tokens: int = 96
-    temperature: float = 1.0
+    max_new_tokens: int = 1024
+    temperature: float = 0.7
     top_p: float = 0.95
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.05
-    max_context_tokens: int = 8192
+    max_context_tokens: int = 32768
     keep_recent_turns: int = 12
-    invalid_action_mode: str = "raw"       # "raw" | "best_match"
-    fuzzy_threshold: float = 0.6
-    # 停止条件模式：
-    #   "action_line"（默认，主线）—— 等到 Action: 那行写完
-    #   "tool_call"（EZ）—— 一看到 </tool_call> 就停，避免白生成到 max_new_tokens
-    stop_mode: str = "action_line"
+    stop_mode: str = "tool_call"
     seed: Optional[int] = None
     log_every: int = 0
-    max_batch_size: int = 0             # 0 keeps mainline legacy batching
+    max_batch_size: int = 0             # 0 processes the full request batch
 
 
 # --------------------------------------------------------------------------- 数据结构
@@ -68,6 +48,19 @@ class Trajectory:
     advantage: float = 0.0
     n_turns: int = 0
     n_tokens: int = 0
+    # Solver segments are exact independent (prompt IDs, generated response IDs)
+    # pairs. Rebuilt prompts are not a continuation of the prior turn's token prefix.
+    segments: List[Tuple[List[int], List[int]]] = field(default_factory=list)
+
+    @property
+    def n_trainable_tokens(self) -> int:
+        if self.segments:
+            return sum(len(response_ids) for _prompt_ids, response_ids in self.segments)
+        return sum(self.loss_mask[1:])
+
+    @property
+    def has_trainable_tokens(self) -> bool:
+        return self.n_trainable_tokens > 0
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -230,7 +223,7 @@ class HFPolicy:
 
         `stop_len[i]` 是"该行已经可以停下"的生成长度（含触发停止的那个换行）。
         """
-        if cfg.stop_mode not in {"tool_call", "action_line", "eos"}:
+        if cfg.stop_mode not in {"tool_call", "action_tag", "eos"}:
             raise ValueError(f"unsupported stop_mode={cfg.stop_mode!r}")
         torch = self.torch
         # 生成必须用左 padding，否则右侧 pad 会被当成上下文
@@ -262,8 +255,8 @@ class HFPolicy:
             # 输出永远不触发 -> 每轮白生成到 max_new_tokens（review P2-14）。
             criteria = _ToolCallStopCriteria(
                 self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
-        elif cfg.stop_mode == "action_line":
-            criteria = _ActionStopCriteria(
+        elif cfg.stop_mode == "action_tag":
+            criteria = _ActionTagStopCriteria(
                 self.tokenizer, [gen_start] * enc["input_ids"].shape[0], cfg.max_new_tokens)
 
         gen_kwargs = dict(
@@ -384,75 +377,58 @@ class HFPolicy:
             gen_ids.append(ids)
             stops.append(len(ids))
             texts.append(self.tokenizer.decode(ids, skip_special_tokens=True))
-            finish_reasons.append("tool_call_stop" if cfg.stop_mode != "eos" and semantic_stop < eos_pos
+            stop_reason = {"tool_call": "tool_call_stop", "action_tag": "action_tag_stop"}.get(cfg.stop_mode)
+            finish_reasons.append(stop_reason if stop_reason and semantic_stop < eos_pos
                                   else "eos" if eos_pos < len(all_ids)
                                   else "max_new_tokens")
         self.last_finish_reasons = finish_reasons
         return texts, gen_ids, stops
 
 
-class _ActionStopCriteria:
-    """等到**所有**行都写完了 `Action:` 那一行再停（HF generate 无法按行停）。
-
-    记录每行第一次满足停止条件的**生成长度**（相对 prompt 的偏移），
-    这样 `stop_len()` 能把"这一行实际想说的内容"精确切出来。
-    """
+class _ActionTagStopCriteria:
+    """Stop each HF row at the first complete SkillRise `</action>` tag."""
 
     def __init__(self, tokenizer, prompt_lens: Sequence[int], max_new_tokens: int,
-                 start_after: int = 6, check_every: int = 2):
+                 check_every: int = 1):
         self.tokenizer = tokenizer
         self.prompt_lens = list(prompt_lens)
         self.max_new_tokens = max_new_tokens
-        self.start_after = start_after
         self.check_every = check_every
         self._stop: Dict[int, int] = {}
         self._step = 0
         self.torch = __import__("torch")
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
-        from prompts import stop_text_finished
+        from protocol import ACTION_CLOSE
 
         self._step += 1
         rows = input_ids.shape[0]
-        for i in range(rows):
-            if i in self._stop:
-                continue
-            generated_len = input_ids.shape[1] - self.prompt_lens[i]
-            if generated_len < self.start_after:
-                continue
-            if self._step % self.check_every != 0:
-                continue
-            text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:], skip_special_tokens=True)
-            if stop_text_finished(text):
-                self._stop[i] = generated_len
-        return self._finished(input_ids, rows)
-
-    def _finished(self, input_ids, rows):
+        if self._step % self.check_every == 0:
+            for i in range(rows):
+                if i in self._stop:
+                    continue
+                generated_len = input_ids.shape[1] - self.prompt_lens[i]
+                if generated_len <= 0:
+                    continue
+                text = self.tokenizer.decode(input_ids[i, self.prompt_lens[i]:],
+                                             skip_special_tokens=True)
+                if ACTION_CLOSE in text:
+                    self._stop[i] = generated_len
         if len(self._stop) == rows:
             return True
-        if isinstance(input_ids, self.torch.Tensor):
-            return self.torch.tensor([i in self._stop for i in range(rows)],
-                                     dtype=self.torch.bool, device=input_ids.device)
+        if hasattr(input_ids, "new_zeros"):
+            mask = input_ids.new_zeros((rows,), dtype=self.torch.bool)
+            for i in self._stop:
+                mask[i] = True
+            return mask
         return False
 
     def stop_len(self, row: int, fallback: int) -> int:
-        """返回该行的生成长度（相对 prompt 的偏移）。"""
         return self._stop.get(row, fallback)
 
 
 class _ToolCallStopCriteria:
-    """EZ 用：写完一个工具调用即停。
-
-    ★ 为什么要认**裸 JSON**（2026-10-12 冒烟实测）：
-    只按 `</tool_call>` 闭合标签停的话，Qwen3-4B-Instruct-2507 根本不吐标签——
-    它直接把 `{"name":"alfworld_tool","arguments":{...}}` 甩出来，并且**一轮里
-    连写 8 个动作**一路顶到 max_new_tokens。后果：
-      * 解析侧 `<tool_call>...</tool_call>` 正则 100% 失配 -> fmt_bad=6/6 -> accept=0
-      * 即使能解析，一次生成 8 个动作而循环只执行第 1 个，消息历史里的"8 个动作"
-        与环境实际执行的 1 个动作对不上，训练信号被污染
-    所以停止判据改成：**闭合标签 或 第一个括号配平的动作 JSON 对象**，
-    这样"一步一动作"在生成侧就被强制住，不需要事后裁剪。
-    """
+    """Stop at a closed tool call or the first complete bare JSON action."""
 
     CLOSE = "</tool_call>"
 
@@ -486,13 +462,8 @@ class _ToolCallStopCriteria:
     def _finished(self, input_ids, rows):
         if rows == 0:
             return True
-        # Transformers accepts a per-row bool tensor and suppresses finished rows.
-        # Older fakes/tests may pass ordinary lists and expect a scalar bool.
         if hasattr(input_ids, "new_zeros"):
-            mask = input_ids.new_zeros((rows,), dtype=self.torch.bool) if hasattr(self, "torch") else None
-            if mask is None:
-                import torch
-                mask = torch.zeros((rows,), dtype=torch.bool, device=input_ids.device)
+            mask = input_ids.new_zeros((rows,), dtype=self.torch.bool)
             for i in self._stop:
                 mask[i] = True
             return mask
@@ -503,91 +474,40 @@ class _ToolCallStopCriteria:
 
 
 def scan_bare_json_call(text: str) -> Optional[Tuple[int, int]]:
-    """扫出**第一个括号配平、且含 `"action_type"` 的 JSON 对象**。
-
-    返回 `(start, end)`（end 为开区间，指向对象右花括号之后）；没有则 None。
-
-    用括号配平而不是正则：`arguments` 是嵌套对象，`\\{.*?\\}` 这类非贪婪正则在
-    "有嵌套 + 后面还有别的对象"时会切错位置。字符串内部的花括号/引号必须跳过，
-    否则 `{"task_description": "put an apple in {the} bowl"}` 会算错深度。
-
-    ★ 必须排除 `"arguments"` 的**内层对象**（单测抓出来的 bug）：
-    `{"name":"alfworld_tool","arguments":{"action_type":"look"}}` 里，内层
-    `{"action_type":"look"}` 自己也是配平的、也含 `"action_type"`。外层还没闭合时
-    （逐 token 增量判定下必然先出现这一幕），扫描会先命中内层对象就停下 ->
-    **工具调用被从中间的 `}` 截断**，解析出来的是半个 JSON。
-    所以：紧跟在 `"arguments":` 之后的对象要跳过，继续往外找。
-    """
+    """Return the first balanced JSON object that looks like an EZ action/declaration."""
     n = len(text)
     i = 0
-    while True:
-        i = text.find("{", i)
-        if i < 0:
-            return None
+    while (i := text.find("{", i)) >= 0:
         depth = 0
-        in_str = False
-        esc = False
+        in_string = False
+        escaped = False
         for j in range(i, n):
-            c = text[j]
-            if esc:
-                esc = False
-                continue
-            if c == "\\":
-                esc = True
-                continue
-            if c == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if c == "{":
+            ch = text[j]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = not in_string
+            elif not in_string and ch == "{":
                 depth += 1
-            elif c == "}":
+            elif not in_string and ch == "}":
                 depth -= 1
                 if depth == 0:
-                    cand = text[i:j + 1]
-                    if _looks_like_tool_call(cand) and \
-                            not re.search(r'"arguments"\s*:\s*$', text[:i].rstrip()):
+                    candidate = text[i:j + 1]
+                    if (any(key in candidate for key in ('"action_type"', '"task_description"',
+                                                          '"name"', '"action"'))
+                            and not re.search(r'"arguments"\s*:\s*$', text[:i].rstrip())):
                         return i, j + 1
-                    break          # 不是完整工具调用，从下一个 '{' 继续找
+                    break
         i += 1
-
-
-#: 严格模式下，只有这两个键才算"工具调用"（原始行为）
-_TOOL_KEYS_STRICT = ('"action_type"', '"task_description"')
-#: 容错模式下额外认这两个 —— 模型把动作类型写进 `name`/`action` 的实测占比 14.6%
-_TOOL_KEYS_TOLERANT = _TOOL_KEYS_STRICT + ('"name"', '"action"')
-
-
-def _looks_like_tool_call(cand: str) -> bool:
-    """候选对象是否"像一个工具调用"（决定 `scan_bare_json_call` 要不要把它切出来）。
-
-    ★★ 2026-10-14 实测抓到的**真根因**：这里原来硬编码只认
-       `'"action_type"'` / `'"task_description"'`。于是模型只要
-         * 把动作类型写进 `name`（`{"name":"alfworld_tool","arguments":{"name":"go_to",...}}`，
-           占 malformed 的 **14.6%**），或
-         * 写扁平形式 `{"name":"go_to","receptacle_name":"cabinet 2"}`（占 **62.0%**）
-       —— **在扫描阶段就返回 None**，`parse_tool_call` 后面那套容错解析**根本没机会执行**。
-       所以光改 `parse_tool_call` 不够，这道前置闸门必须一起放宽。
-
-    容错模式默认开；`EZ_PARSER_STRICT=1` 可恢复原始行为做对照。
-    """
-    keys = (_TOOL_KEYS_STRICT if os.environ.get("EZ_PARSER_STRICT", "0") == "1"
-            else _TOOL_KEYS_TOLERANT)
-    return any(k in cand for k in keys)
+    return None
 
 
 # --------------------------------------------------------------------------- gradient checkpointing 开关
 
 def gc_set(model, on: bool) -> bool:
-    """**幂等地**开/关 gradient_checkpointing，返回是否真的动了。
-
-    ⚠️ 为什么必须幂等：`gradient_checkpointing_enable(use_reentrant=False)` 内部会调
-    `enable_input_require_grads()`，后者每次都会往 input embeddings 上**再挂一个**
-    forward hook（`make_inputs_require_grad`）。而 rollout 每一步都要 generate 一次，
-    300 iter × 30 步 = 9000 次开关 -> 9000 个 hook，显存和耗时一起爆掉，
-    而且报错信息完全不会指向这里。所以只有状态真的不同才允许动作。
-    """
+    """Toggle gradient checkpointing only when its state changes."""
     cur = bool(getattr(model, "is_gradient_checkpointing", False))
     if cur == on:
         return False
@@ -600,16 +520,7 @@ def gc_set(model, on: bool) -> bool:
 
 @contextlib.contextmanager
 def generation_mode(model):
-    """进入"生成模式"：整段关掉 gradient_checkpointing，退出时按原样恢复。
-
-    ⚠️ GC 开着会让 Qwen3 的 generate 输出**乱码**（实测：'Thoughts = 1999999...'，
-    没有 Action: 行，一路顶到 max_new_tokens）—— 环境收到的动作 100% 非法，
-    奖励全在同一档 -> 组内 std=0 -> advantage=0 -> loss=0，
-    **训练看起来在跑、日志不报错、但一步都没学**。
-
-    把它做成上下文管理器、并在 `run_rollouts` 外面**一次性**开合，
-    是为了不让每一步 generate 都去 toggle（见 `gc_set` 的 hook 累积问题）。
-    """
+    """Temporarily disable gradient checkpointing while generating."""
     was = bool(getattr(model, "is_gradient_checkpointing", False))
     if was:
         gc_set(model, False)
@@ -618,127 +529,6 @@ def generation_mode(model):
     finally:
         if was:
             gc_set(model, True)
-
-
-# --------------------------------------------------------------------------- 动作清洗
-
-
-_WS_RE = re.compile(r"\s+")
-
-
-def sanitize_action(action: str, admissible: Sequence[str], cfg: RolloutConfig) -> Tuple[str, bool]:
-    """把模型输出的动作变成可以安全丢给 TextWorld 的字符串。
-
-    Returns: (executed_action, is_exact_match)
-    """
-    action = (action or "").strip()
-    action = action.split("\n")[0]
-    action = _WS_RE.sub(" ", action)
-    if len(action) > _ACTION_MAX_CHARS:
-        action = action[:_ACTION_MAX_CHARS]
-    if not action.isascii():
-        action = action.encode("ascii", "ignore").decode()
-
-    matched = match_admissible(action, admissible)
-    if matched is not None:
-        return matched, True
-    if cfg.invalid_action_mode == "best_match":
-        fuzzy = match_admissible(action, admissible, fuzzy_threshold=cfg.fuzzy_threshold)
-        if fuzzy is not None:
-            return fuzzy, False
-    if action:
-        return action, False
-    # 完全空输出：用一个总是合法的命令兜底，保证 episode 还能往前走
-    for cand in ("look", "inventory"):
-        if cand in admissible:
-            return cand, False
-    return (admissible[0] if admissible else "look"), False
-
-
-# --------------------------------------------------------------------------- 轨迹 → 词元
-
-
-def build_token_sequence(
-    messages: Sequence[Dict[str, str]],
-    gen_ids_per_assistant: Sequence[List[int]],
-    policy: HFPolicy,
-) -> Tuple[List[int], List[int], List[int]]:
-    """把一条（**已按上下文预算裁剪过的**）对话渲染成 (input_ids, loss_mask, turn_boundaries)。
-
-    * **assistant 段**：模型**真实生成**的 token id（mask=1）——不是把生成文本重新 tokenize
-      （那会引入 "解码→再编码" 的偏差，实测会多出 1 个 token 混进训练目标）；
-    * **模板收尾**：assistant 内容之后的 `<|im_end|>` 等，mask=0；只有采样器返回的真实 token 可训练；
-    * **其余段**（chat 模板骨架 + 环境观测）：模板重新渲染出来的 token，mask=0。
-
-    实现要点：维护两个游标 —— `ids` 是我们真正输出的序列，`rlen` 是**纯模板渲染序列**上的游标。
-    两者必须解耦，因为 assistant 段用的是真实 gen id，其长度通常 ≠ 同一段文本重新编码的长度。
-    """
-    ids: List[int] = []
-    mask: List[int] = []
-    boundaries: List[int] = []
-    assistant_idx = 0
-    rlen = 0
-    prev_render: List[int] = []
-
-    def _render_ids(msgs: Sequence[Dict[str, str]], gen_prompt: bool = False) -> List[int]:
-        return policy.tokenize_text(policy.render(msgs, add_generation_prompt=gen_prompt))
-
-    for i, msg in enumerate(messages):
-        if msg["role"] == "assistant" and assistant_idx < len(gen_ids_per_assistant):
-            gen = list(gen_ids_per_assistant[assistant_idx])
-            assistant_idx += 1
-            # 生成时模型真正看到的前缀（= render(messages[:i]) + 生成提示）
-            prefix_r = _render_ids(messages[:i], gen_prompt=True)
-            if prev_render and prefix_r[: len(prev_render)] != prev_render:
-                raise RuntimeError("chat 模板不是前缀稳定的（assistant 前缀不匹配）—— 检查 tokenizer 配置")
-            if len(prefix_r) < rlen:
-                raise RuntimeError("chat 模板不是前缀稳定的（渲染长度回退）")
-            gen_prompt_tokens = prefix_r[rlen:]          # `<|im_start|>assistant\n` 之类的骨架，mask=0
-            full_r = _render_ids(messages[:i + 1], gen_prompt=False)
-            if gen:
-                # 模板收尾 token：用「同一前缀 + 空 assistant 内容」渲染，prefix 之后就是纯模板尾。
-                # 这样拿到的是**精确**的收尾 token，不依赖"解码后再编码"的长度假设。
-                empty_full = _render_ids(
-                    list(messages[:i]) + [{"role": "assistant", "content": ""}], gen_prompt=False
-                )
-                if empty_full[: len(prefix_r)] != prefix_r:
-                    raise RuntimeError("chat 模板不是前缀稳定的（空 assistant 渲染不以前缀开头）")
-                tail = empty_full[len(prefix_r):]
-                ids.extend(gen_prompt_tokens)
-                mask.extend([0] * len(gen_prompt_tokens))
-                ids.extend(gen)
-                mask.extend([1] * len(gen))
-                ids.extend(tail)
-                mask.extend([0] * len(tail))
-                boundaries.append(len(ids))
-            else:
-                # 没有生成任何 token：整段按 mask=0 处理（不该训练空输出）
-                seq = gen_prompt_tokens + full_r[len(prefix_r):]
-                ids.extend(seq)
-                mask.extend([0] * len(seq))
-            prev_render = full_r
-            rlen = len(full_r)          # 渲染游标推进到该 assistant 消息在**纯模板**下的完整长度
-        else:
-            cur = _render_ids(messages[:i + 1], gen_prompt=False)
-            if prev_render and cur[:len(prev_render)] != prev_render:
-                raise RuntimeError(
-                    "chat template is not prefix-stable; legacy transcript builder cannot "
-                    "preserve the sampled token history. Use token-native EZ rollout or a "
-                    "prefix-stable template."
-                )
-            new = cur[rlen:]
-            if len(cur) < rlen:
-                raise RuntimeError("chat template render length regressed; refusing lossy sequence")
-            ids.extend(new)
-            mask.extend([0] * len(new))
-            prev_render = cur
-            rlen = len(cur)
-    if assistant_idx != len(gen_ids_per_assistant):
-        raise RuntimeError("gen_ids count does not match assistant messages")
-    return ids, mask, boundaries
-
-
-# --------------------------------------------------------------------------- 主 rollout
 
 
 def _align_slot_tasks(games: Sequence[str], used: Sequence[str], group_size: int) -> List[int]:
@@ -767,257 +557,3 @@ def _align_slot_tasks(games: Sequence[str], used: Sequence[str], group_size: int
             )
         slot_task.append(int(q.popleft()))
     return slot_task
-
-
-def run_rollouts(
-    env,
-    policy,
-    tasks: Sequence[Dict[str, Any]],
-    cfg: RolloutConfig,
-    reward_cfg: RewardConfig,
-    system_prompt: Optional[str] = None,
-    log_fn: Optional[Callable[[str], None]] = None,
-    tokenize: bool = True,
-) -> List[Trajectory]:
-    """跑一批 rollout。
-
-    Args:
-        env: `ALFWorldBatchEnv`，其 `batch_size` 必须等于 `len(tasks) * cfg.group_size`。
-        policy: 需实现 `generate(messages_list, cfg) -> (texts, gen_ids, stops)`。HFPolicy 满足；
-                走 HTTP API 的评测用策略把 `tokenize=False` 传入即可（不需要词元序列）。
-        tasks: [{"game_file":..., "task_id":..., "task_type":...}, ...]
-
-    Returns:
-        返回顺序保证是 **task-major / 组连续**：第 i 个 task 的 `group_size` 条轨迹占据
-        `[i*g, (i+1)*g)`。调用方可以直接用 `group_ids = [i // g for i in range(len(trajs))]`。
-        （env 内部会 shuffle slot，这里已经重排回请求顺序。）
-    """
-    n_tasks = len(tasks)
-    g = cfg.group_size
-    n_slots = n_tasks * g
-    if env.batch_size != n_slots:
-        raise ValueError(f"env.batch_size={env.batch_size} 与 tasks×group={n_slots} 不一致")
-
-    sys_prompt = system_prompt or build_system_prompt()
-    games = [t["game_file"] for t in tasks for _ in range(g)]
-
-    obs_list, views, admissible, used, _expert = env.reset(games)
-    slot_task = _align_slot_tasks(games, used, g)
-
-    max_steps = min(cfg.max_steps, env.max_episode_steps)
-
-    messages: List[List[Dict[str, str]]] = []
-    stats: List[TrajectoryStats] = []
-    gen_ids_log: List[List[List[int]]] = []
-    for s in range(n_slots):
-        t = tasks[slot_task[s]]
-        messages.append([{"role": "system", "content": sys_prompt}])
-        v = views[s]
-        messages[s].append({
-            "role": "user",
-            "content": format_observation(v.env_desc, admissible[s], first_turn=True, task_desc=v.task_desc),
-        })
-        stats.append(TrajectoryStats(task_type=t.get("task_type", "unknown"), task_id=t.get("task_id", "")))
-        gen_ids_log.append([])
-
-    active = [True] * n_slots
-    last_action = [""] * n_slots
-    t0 = time.time()
-
-    for step in range(max_steps):
-        if not any(active):
-            break
-        idxs = [s for s in range(n_slots) if active[s]]
-        gen_messages = [messages[s] for s in idxs]
-        texts, gen_ids, _ = policy.generate(gen_messages, cfg)
-
-        actions = []
-        for k, s in enumerate(idxs):
-            parsed: ParsedAction = parse_action(texts[k])
-            executed, exact = sanitize_action(parsed.action, admissible[s], cfg)
-            actions.append((s, parsed, executed, exact))
-
-        step_actions = ["look"] * n_slots
-        for s, _p, executed, _e in actions:
-            step_actions[s] = executed
-        bs = env.step(step_actions)
-
-        for k, (s, parsed, executed, exact) in enumerate(actions):
-            st = stats[s]
-            st.n_steps += 1
-            if not parsed.has_marker:
-                st.n_format_violation += 1
-            if exact:
-                st.n_valid_steps += 1
-            else:
-                st.n_invalid += 1
-            if executed and executed.lower() == last_action[s].lower():
-                st.n_repeat += 1
-            last_action[s] = executed
-
-            messages[s].append({"role": "assistant", "content": texts[k].strip()})
-            gen_ids_log[s].append(list(gen_ids[k]))
-
-            if bool(bs.dones[s]):
-                st.won = bool(bs.won[s])
-                active[s] = False
-            else:
-                messages[s].append({
-                    "role": "user",
-                    "content": format_turn_feedback(
-                        executed, bs.obs[s], bs.admissible[s], done=False, won=False
-                    ),
-                })
-        for s in range(n_slots):
-            if active[s]:
-                admissible[s] = bs.admissible[s]
-
-    # 收尾：没结束的算 truncated。
-    # ★ 关键：textworld 会打乱 slot，这里必须重排成 task-major（组连续）顺序，
-    #   否则 train_grpo.py 的 group_ids = [i // g ...] 会把不同 task 混进同一组。
-    order = sorted(range(n_slots), key=lambda s: (slot_task[s], s))
-    trajectories: List[Trajectory] = []
-    for s in order:
-        st = stats[s]
-        if active[s]:
-            st.truncated = True
-        t = tasks[slot_task[s]]
-        if tokenize:
-            # ★ 训练序列必须和「生成时实际看到的上下文」一致：生成时每轮都过
-            #   `truncate_messages`，所以这里也要先裁再拼，否则 30 步的完整历史会到 16k+ token，
-            #   而 per_token_logps 要物化 fp32 logits（R×W×vocab×4B）→ 直接 OOM。
-            tr_msgs = policy.truncate_messages(messages[s], cfg)
-            n_asst_kept = sum(1 for m in tr_msgs if m["role"] == "assistant")
-            # 裁剪保留的是「尾部窗口」，所以留下的 assistant 正好是最后 n_asst_kept 次生成
-            gen_kept = gen_ids_log[s][len(gen_ids_log[s]) - n_asst_kept:] if n_asst_kept else []
-            ids, mask, _ = build_token_sequence(tr_msgs, gen_kept, policy)
-            if not any(mask):
-                raise RuntimeError(
-                    f"训练序列里没有任何 mask=1 的 token（n_asst_kept={n_asst_kept}）"
-                    f" —— 检查 keep_recent_turns={cfg.keep_recent_turns} 是否过小"
-                )
-        else:
-            ids, mask = [], []
-        traj = Trajectory(
-            task_id=t.get("task_id", ""),
-            task_type=t.get("task_type", "unknown"),
-            game_file=used[s],          # ★ 用实际装载的那个，不是 games[s]
-            messages=messages[s],
-            input_ids=ids,
-            loss_mask=mask,
-            stats=st,
-            n_turns=len(gen_ids_log[s]),
-            n_tokens=len(ids),
-        )
-        traj.reward = compute_reward(st, reward_cfg, max_steps)
-        trajectories.append(traj)
-
-    if log_fn:
-        won = sum(1 for t in trajectories if t.stats.won)
-        log_fn(
-            f"[rollout] {n_tasks} tasks × {g} = {n_slots} trajs | won={won}/{n_slots} "
-            f"({won / max(1, n_slots):.1%}) | mean_steps={np.mean([t.stats.n_steps for t in trajectories]):.1f} "
-            f"| mean_tokens={int(np.mean([t.n_tokens for t in trajectories]))} | {time.time() - t0:.1f}s"
-        )
-    return trajectories
-
-
-# --------------------------------------------------------------------------- expert 参考点
-
-
-def run_expert(
-    env,
-    tasks: Sequence[Dict[str, Any]],
-    max_steps: int,
-    reward_cfg: Optional[RewardConfig] = None,
-    log_fn: Optional[Callable[[str], None]] = None,
-) -> List[Trajectory]:
-    """用 ALFWorld **官方 handcoded expert** 直接驱动环境，作为"环境可解性上界"参考点。
-
-    需要 `env` 是以 `with_expert=True` 构造的 `ALFWorldBatchEnv` —— 此时
-    `reset()/step()` 的 infos 里会带 `extra.expert_plan`（单元素 list）。动作直接取
-    expert 计划，拿不到时回退 `"look"`。
-
-    这里**不经过任何 policy 抽象**：expert 计划只存在于 env infos 里，不经过 chat
-    messages，所以 `messages`/`input_ids`/`loss_mask` 都留空，统计里 `n_invalid` /
-    `n_format_violation` 恒为 0（expert 计划始终是 admissible 动作）。
-
-    Args:
-        env: `with_expert=True` 的 `ALFWorldBatchEnv`，`batch_size` 必须等于 `len(tasks)`。
-        tasks: [{"game_file":..., "task_id":..., "task_type":...}, ...]
-        max_steps: 每局最多走多少步（与 `env.max_episode_steps` 取 min）。
-    """
-    reward_cfg = reward_cfg or RewardConfig()
-    n_slots = len(tasks)
-    if env.batch_size != n_slots:
-        raise ValueError(
-            f"env.batch_size={env.batch_size} 与 tasks={n_slots} 不一致（expert 评测 group_size=1）"
-        )
-    if not getattr(env, "with_expert", False):
-        raise ValueError("run_expert 需要以 with_expert=True 构造的 ALFWorldBatchEnv")
-
-    games = [t["game_file"] for t in tasks]
-    _obs_list, _views, _admissible, used, expert_plan = env.reset(games)
-    slot_task = _align_slot_tasks(games, used, 1)
-    max_steps = min(int(max_steps), env.max_episode_steps)
-
-    stats: List[TrajectoryStats] = [
-        TrajectoryStats(
-            task_type=tasks[slot_task[s]].get("task_type", "unknown"),
-            task_id=tasks[slot_task[s]].get("task_id", ""),
-        )
-        for s in range(n_slots)
-    ]
-    active = [True] * n_slots
-    last_action = [""] * n_slots
-    plan: List[Optional[str]] = list(expert_plan)
-    t0 = time.time()
-
-    for _step in range(max_steps):
-        if not any(active):
-            break
-        actions = [(plan[s] or "look") for s in range(n_slots)]
-        bs = env.step(actions)
-        for s in range(n_slots):
-            if not active[s]:
-                continue
-            st = stats[s]
-            st.n_steps += 1
-            st.n_valid_steps += 1        # expert 计划来自 admissible，始终算合法步
-            if actions[s].lower() == last_action[s].lower():
-                st.n_repeat += 1
-            last_action[s] = actions[s]
-            if bool(bs.dones[s]):
-                st.won = bool(bs.won[s])
-                active[s] = False
-        plan = list(bs.expert_plan) if bs.expert_plan else [None] * n_slots
-
-    # ★ 同 run_rollouts：env 会打乱 slot，这里重排回请求的 task-major 顺序，
-    #   并用实际装载的 used[s] 作为 game_file（不是请求的 games[s]）。
-    order = sorted(range(n_slots), key=lambda s: (slot_task[s], s))
-    trajectories: List[Trajectory] = []
-    for s in order:
-        st = stats[s]
-        if active[s]:
-            st.truncated = True
-        traj = Trajectory(
-            task_id=st.task_id,
-            task_type=st.task_type,
-            game_file=used[s],
-            messages=[],
-            input_ids=[],
-            loss_mask=[],
-            stats=st,
-            n_turns=st.n_steps,
-            n_tokens=0,
-        )
-        traj.reward = compute_reward(st, reward_cfg, max_steps)
-        trajectories.append(traj)
-
-    if log_fn:
-        won = sum(1 for t in trajectories if t.stats.won)
-        log_fn(
-            f"[expert] {n_slots} tasks | won={won}/{n_slots} ({won / max(1, n_slots):.1%}) "
-            f"| mean_steps={np.mean([t.stats.n_steps for t in trajectories]):.1f} | {time.time() - t0:.1f}s"
-        )
-    return trajectories

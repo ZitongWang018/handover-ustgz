@@ -18,7 +18,7 @@
     install()                       # 必须在 import textworld 之前
     from alfworld_env import ALFWorldBatchEnv, load_alfworld_config, collect_game_files
 
-    cfg = load_alfworld_config("configs/base_config.yaml")
+    cfg = load_alfworld_config("alfworld.yaml")
     env = ALFWorldBatchEnv(cfg, split="train", batch_size=16)
     obs, views, admissible, used, expert_plan = env.reset([g] * 16)
     step = env.step(["look", ...])   # step.won / step.admissible / step.expert_plan

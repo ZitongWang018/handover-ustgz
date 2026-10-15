@@ -1,27 +1,8 @@
-"""Explorer-Zero 交替训练主循环（论文 Algorithm 1 / Appendix C / Table 3）。
-
-    python src/ez_train.py --config configs/ez_qwen3_4b.yaml
-
-结构（对齐论文）：
-    for outer in 1..N:                     # N=4 外循环
-        proposer 相位 M_P 步：              # ALFWorld M_P=25
-            探索 → 提案 → 冻结 solver 估 solve rate（G_P=8）→ Eq.1 奖励
-            → 组归一化 GRPO 更新 proposer（同组共享 s0）
-        solver 相位 M_S 步：                # ALFWorld M_S=25
-            任务池采样 → G=16 rollout（Eq.7 奖励）→ 组归一化 GRPO 更新 solver
-
-⚠️ 与论文的**已知偏差**（复现计划 U5 + 工程取舍，全部可配置）：
-* `tasks_per_step` 是全局 task-group 数，`group_size` 是每个全局 GRPO 组的大小；
-  8 卡默认 TPS=1、G=16、每 rank 两条轨迹。
-* EZ 使用 raw PEFT model 和显式 bucketed LoRA gradient all-reduce，不依赖 DDP
-  对动态 adapter `requires_grad` 的注册；主线 DDP 训练路径保持独立。
-* KL β 默认为 0.001，通过 `disable_adapter()` 的冻结 base reference 计算。
-"""
+"""Explorer-Zero training loop under the shared SkillRise ALFWorld protocol."""
 from __future__ import annotations
 
 import argparse
 import atexit
-import hashlib
 import json
 import os
 import random
@@ -40,20 +21,17 @@ from alfworld_compat import install as install_alfworld_compat  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
-import yaml  # noqa: E402
 
 from alfworld_env import ALFWorldBatchEnv, collect_game_files, load_alfworld_config  # noqa: E402
 from ez_proposer import ProposerConfig, ProposerRollout, run_proposer_exploration  # noqa: E402
 from ez_solver import EzSolverTrajectory, run_ez_solver_rollouts  # noqa: E402
-from ez_prompts import solver_style  # noqa: E402
-from ez_swanlab import EzSwanLab  # noqa: E402
 from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
 from ez_dist import (broadcast_pool_indices, check_adapter_sync, gather_group_values,
                      broadcast_adapter_parameters, global_group_advantages, local_group_size, select_adapter,
                      sync_active_adapter_gradients)  # noqa: E402
 from rollout import HFPolicy, RolloutConfig  # noqa: E402
-from train_grpo import (build_model_and_tokenizer, grpo_loss, group_advantages,  # noqa: E402
+from grpo import (build_model_and_tokenizer, grpo_loss,  # noqa: E402
                         is_main, load_cfg, log0, make_batch, per_token_logps,
                         set_seed, setup_dist)
 
@@ -61,7 +39,7 @@ from train_grpo import (build_model_and_tokenizer, grpo_loss, group_advantages, 
 _LOG_FH = None    # 本 rank 的日志：train_log.rank{rank}.jsonl
 _LOG_FH0 = None   # 仅 rank0：额外的 train_log.jsonl（让现成的判读脚本不用改）
 RANK = 0
-_REPORTER: Any = None   # SwanLab 上报器（未启用时是 no-op 对象，见 ez_swanlab）
+_REPORTER: Any = None
 
 
 def log(msg: str) -> None:
@@ -80,23 +58,15 @@ def log(msg: str) -> None:
             fh.flush()
 
 
-class _V2MetricsReporter:
-    """Always persist rank-zero scalar metrics locally; opt into SwanLab by config only."""
+class _MetricsReporter:
+    """Write finite rank-zero scalar metrics to a local JSONL file."""
 
     def __init__(self, cfg: dict, run_dir: Path, rank: int) -> None:
         self._rank = rank
         self._fh = None
-        self._swan = None
         if rank != 0:
             return
         self._fh = open(Path(run_dir) / "metrics.jsonl", "a", encoding="utf-8", newline="\n")
-        telemetry = cfg.get("telemetry", {}) or {}
-        if telemetry.get("swanlab") is True:
-            mode = telemetry.get("swanlab_mode", "local")
-            if mode != "local":
-                raise ValueError("v3 permits SwanLab only in explicit local mode")
-            os.environ["EZ_SWANLAB_MODE"] = "local"
-            self._swan = EzSwanLab(cfg, run_dir=run_dir, rank=rank)
 
     def log(self, metrics: dict, step: int) -> None:
         if self._rank != 0:
@@ -113,16 +83,8 @@ class _V2MetricsReporter:
             self._fh.write(json.dumps({"step": int(step), "metrics": clean},
                                       sort_keys=True, allow_nan=False) + "\n")
             self._fh.flush()
-        if self._swan is not None:
-            self._swan.log(clean, step=step)
-
-    def alert(self, title: str, text: str) -> None:
-        if self._swan is not None:
-            self._swan.alert(title, text)
 
     def finish(self) -> None:
-        if self._swan is not None:
-            self._swan.finish()
         if self._fh is not None:
             self._fh.flush()
             self._fh.close()
@@ -207,7 +169,7 @@ def build_dual_lora(model, cfg: dict, resume_checkpoint: Optional[Path] = None):
 # --------------------------------------------------------------------------- proposer 训练序列
 
 
-def tokenize_proposer_rollout(ro: ProposerRollout, policy, gen_cfg) -> ProposerRollout:
+def tokenize_proposer_rollout(ro: ProposerRollout) -> ProposerRollout:
     """Use the exact token-native history on which each action was sampled."""
     ids = list(getattr(ro, "training_ids", ()))
     mask = list(getattr(ro, "training_mask", ()))
@@ -221,26 +183,7 @@ def tokenize_proposer_rollout(ro: ProposerRollout, policy, gen_cfg) -> ProposerR
 
 
 def update_probe(model, opt_params, optimizer, tag: str) -> float:
-    """'参数真的动了吗' probe（主线 train_grpo 同款准入门）。
-
-    ⚠️ 实测教训（job 12989450）：旧实现取"**第一个** numel>=4096 的 LoRA 张量"，
-    按 `named_parameters()` 顺序正好命中 `layers.0.self_attn.q_proj.lora_A.<adapter>`。
-    而 peft 把 **lora_B 初始化成全 0**：
-
-        y = W x + B(A x) · s      ⇒   ∂L/∂A = Bᵀ(∂L/∂y) xᵀ ≡ 0     （B == 0 时）
-
-    即该张量在第 0 步的梯度是**精确的 0**（不是"小"，是 0）。AdamW 里
-    exp_avg = 0 ⇒ Δp = 0 ⇒ 打印 `update_rel=0.000e+00`。于是日志出现
-    「真实 backward grad_norm=6.1474e+00（504 个张量有 grad）却 update_rel=0.000e+00」
-    这种自相矛盾的指纹 —— **梯度链是通的，是 probe 挑错了张量**。
-
-    新实现（三条都更硬）：
-      * 对**所有带 grad 的参数**逐个测位移，报 max，而不是只看某一个固定张量；
-      * 报"多少张量真的动了"（n_moved/n_total）—— 这才是"优化器到底动了没"的直接答案；
-      * rel 用**有界**形式 ‖Δp‖/(‖p‖+‖Δp‖) ∈ [0,1)：zero-init 的 lora_B 分母不为 0，
-        给 1.0 而不是 ∞，避免日志里冒出 1e8 这种没意义的数。
-      * 再打 top3 张量名，出问题能直接定位到具体层。
-    """
+    """Report displacement across active trainable adapter parameters."""
     probes = [p for p in opt_params if p.grad is not None and p.requires_grad]
     if not probes:
         log(f"[{tag}] update_rel=0（没有任何参数带 grad，优化器无事可做）")
@@ -266,110 +209,14 @@ def update_probe(model, opt_params, optimizer, tag: str) -> float:
     return rel
 
 
-def _resume_signature(cfg: dict, world: int) -> dict:
-    semantic = json.loads(json.dumps(cfg, sort_keys=True, default=str))
-    run = semantic.get("run", {})
-    run.pop("output_dir", None)
-    run.pop("name", None)
-    # These are operational checks/storage knobs, not training trajectory semantics.
-    train = semantic.get("train", {})
-    train.pop("check_adapter_sync_every", None)
-    train.pop("checkpoint_every", None)
-    model = semantic.get("model", {})
-    if "path" in model:
-        model["path"] = os.path.expandvars(str(model["path"]))
-    env_cfg = semantic.get("env", {}).get("config_path")
-    if env_cfg:
-        path = Path(os.path.expandvars(str(env_cfg))).expanduser()
-        if not path.is_absolute():
-            path = SRC_DIR.parent / path
-        if path.is_file():
-            semantic["env"]["config_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    canonical = json.dumps(semantic, sort_keys=True, separators=(",", ":"), default=str)
-    return {"world_size": int(world), "semantic_config_sha256": hashlib.sha256(
-        canonical.encode("utf-8")).hexdigest(), "semantic_config": semantic}
-
-
 def ez_save(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
             extra: dict, task_pool: list, rank: int, world: int,
-            uid_counter: int = 0, dry_run: bool = False, keep: int = 0,
+            uid_counter: int = 0, dry_run: bool = False,
             protocol_manifest: Optional[dict] = None) -> None:
-    """Write complete resume state, then atomically promote it while retaining old ckpt."""
-    if protocol_manifest is not None:
-        return ez_save_v3(model, tokenizer, optimizer, run_dir, tag, cfg, extra,
-                          task_pool, rank, world, uid_counter=uid_counter,
-                          dry_run=dry_run, protocol_manifest=protocol_manifest)
-    import shutil
-    ckpt_dir, tmp_dir, backup_dir = (run_dir / "ckpt", run_dir / "ckpt.tmp",
-                                     run_dir / "ckpt.previous")
-    if rank == 0:
-        if not ckpt_dir.exists() and backup_dir.exists():
-            os.replace(backup_dir, ckpt_dir)  # recover interruption between renames
-        elif ckpt_dir.exists() and backup_dir.exists():
-            ckpt_complete = (ckpt_dir / "train_state.json").is_file()
-            backup_complete = (backup_dir / "train_state.json").is_file()
-            if not ckpt_complete and backup_complete:
-                shutil.rmtree(ckpt_dir, ignore_errors=True)
-                os.replace(backup_dir, ckpt_dir)
-            else:
-                shutil.rmtree(backup_dir, ignore_errors=True)
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(tmp_dir)
-        tokenizer.save_pretrained(tmp_dir)
-        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
-        with open(tmp_dir / "task_pool.jsonl", "w", encoding="utf-8") as fh:
-            for task in task_pool:
-                fh.write(json.dumps(task.to_json(), ensure_ascii=False) + "\n")
-        state = {"checkpoint_schema_version": 2, "tag": tag, "config": cfg,
-                 "resume_signature": _resume_signature(cfg, world),
-                 "world_size": world, "dry_run": bool(dry_run), **extra}
-        with open(tmp_dir / "train_state.json", "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, default=str)
-        (tmp_dir / "rank_state").mkdir(parents=True, exist_ok=True)
-    if world > 1:
-        dist.barrier()
-    rng_state = {"python": random.getstate(), "numpy": np.random.get_state(),
-                 "torch_cpu": torch.get_rng_state(),
-                 "torch_cuda": (torch.cuda.get_rng_state(torch.cuda.current_device())
-                                if torch.cuda.is_available() else None),
-                 "uid_counter": int(uid_counter)}
-    torch.save(rng_state, tmp_dir / "rank_state" / f"rank{rank}.pt")
-    if world > 1:
-        dist.barrier()
-    if rank == 0:
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        if ckpt_dir.exists():
-            os.replace(ckpt_dir, backup_dir)
-        try:
-            os.replace(tmp_dir, ckpt_dir)
-        except Exception:
-            if backup_dir.exists() and not ckpt_dir.exists():
-                os.replace(backup_dir, ckpt_dir)
-            raise
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-    if world > 1:
-        dist.barrier()
-    if keep and keep > 0 and rank == 0:
-        snap_dir = run_dir / "checkpoints"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        dest = snap_dir / f"ckpt-{tag}"
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        try:
-            shutil.copytree(ckpt_dir, dest)
-        except Exception as exc:  # noqa: BLE001
-            log(f"[ckpt] 历史断点存档失败 {tag}: {exc}（继续训练，不影响最新断点）")
-        snaps = sorted([p for p in snap_dir.iterdir()
-                        if p.is_dir() and p.name.startswith("ckpt-")],
-                       key=lambda p: p.stat().st_mtime)
-        for old in snaps[:-keep]:
-            shutil.rmtree(old, ignore_errors=True)
-    if world > 1 and keep and keep > 0:
-        dist.barrier()
+    if protocol_manifest is None:
+        raise ValueError("a resolved training contract is required for every checkpoint")
+    ez_save_v3(model, tokenizer, optimizer, run_dir, tag, cfg, extra, task_pool,
+               rank, world, uid_counter, dry_run, protocol_manifest)
 
 
 def ez_save_v3(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
@@ -377,8 +224,8 @@ def ez_save_v3(model, tokenizer, optimizer, run_dir: Path, tag: str, cfg: dict,
                uid_counter: int, dry_run: bool, protocol_manifest: dict) -> None:
     """Seal a v3 checkpoint only after every rank has written its RNG state."""
     import shutil
-    from ez_train_v2_contract import (ContractError, seal_checkpoint,
-                                      validate_checkpoint_v3, validate_sealed_integrity)
+    from checkpoint import (ContractError, seal_checkpoint,
+                            validate_checkpoint_v3, validate_sealed_integrity)
 
     run_dir = Path(run_dir)
     ckpt_dir = run_dir / "ckpt"
@@ -490,22 +337,13 @@ def load_ez_resume(ckpt_dir: Path, cfg: dict, world: int, rank: int,
                    protocol_manifest: Optional[dict] = None):
     with open(ckpt_dir / "train_state.json", encoding="utf-8") as fh:
         state = json.load(fh)
-    if protocol_manifest is not None:
-        from ez_train_v2_contract import ContractError, validate_checkpoint_v3
-        try:
-            validate_checkpoint_v3(ckpt_dir, expected_contract=protocol_manifest, purpose="resume")
-        except ContractError as exc:
-            raise ValueError(str(exc)) from None
-        if state.get("checkpoint_schema_version") != 3:
-            raise ValueError("v2 training accepts only schema-v3 checkpoints")
-    elif int(state.get("checkpoint_schema_version", 0)) < 2:
-        raise ValueError("legacy checkpoint lacks complete optimizer/RNG/task-pool state; resume refused")
+    from checkpoint import ContractError, validate_checkpoint_v3
+    try:
+        validate_checkpoint_v3(ckpt_dir, expected_contract=protocol_manifest, purpose="resume")
+    except ContractError as exc:
+        raise ValueError(str(exc)) from None
     if state.get("dry_run", False):
         raise ValueError("smoke/dry-run checkpoints cannot be resumed as formal training")
-    if protocol_manifest is None:
-        expected = _resume_signature(cfg, world)
-        if state.get("resume_signature") != expected:
-            raise ValueError(f"resume config/world mismatch: saved={state.get('resume_signature')} current={expected}")
     pool_path = ckpt_dir / "task_pool.jsonl"
     if not pool_path.is_file():
         raise ValueError("resume checkpoint is missing task_pool.jsonl")
@@ -515,7 +353,7 @@ def load_ez_resume(ckpt_dir: Path, cfg: dict, world: int, rank: int,
             if line.strip():
                 row = json.loads(line)
                 if int(row.get("schema_version", 1)) < 2:
-                    raise ValueError("legacy task pool lost raw fact multiplicity/identity; formal resume refused")
+                    raise ValueError("task pool schema is missing raw fact identity; refusing resume")
                 task = ProposedTask.from_json(row)
                 for snap in (task.s0, task.ref_final, *(s.ref_snapshot for s in task.subtasks)):
                     if snap.mode == "facts" and snap.facts and not snap.raw_facts:
@@ -537,73 +375,6 @@ def restore_ez_optimizer_rng(optimizer, optimizer_path: Path, rng_path: Path) ->
     if torch.cuda.is_available() and rng_state.get("torch_cuda") is not None:
         torch.cuda.set_rng_state(rng_state["torch_cuda"], torch.cuda.current_device())
     return int(rng_state.get("uid_counter", 0))
-
-
-def resolve_resume_directory(path: Path, rank: int) -> Path:
-    """Use the last complete directory if a crash interrupted checkpoint promotion."""
-    candidates = [path, path.parent / "ckpt.previous"]
-    for candidate in candidates:
-        required = [candidate / "train_state.json", candidate / "optimizer.pt",
-                    candidate / "task_pool.jsonl", candidate / "proposer",
-                    candidate / "solver", candidate / "rank_state" / f"rank{rank}.pt"]
-        if all(p.exists() for p in required):
-            return candidate
-    raise ValueError(f"neither {path} nor its previous checkpoint is complete")
-
-
-def mid_eval_solver(raw, policy, alf_cfg, games, *, max_steps, temperature,
-                    max_new_tokens, max_context_tokens, batch_size, seed, log_fn,
-                    sync_fn=None):
-    """在 valid_unseen 上评测当前 solver adapter（只读，不改权重、不动优化器）。
-
-    判胜用官方 benchmark_done（ignore_benchmark_done=False），与训练内
-    verify.final_match（状态匹配）口径不同 —— 这才是论文/官方 valid_unseen 成功率。
-    rollout 复用 eval_ez._rollout_batch（已验证的官方评测链路）。
-
-    `sync_fn` = 采样后端权重刷新回调（vLLM 后端才需要；HF 后端传 None）。
-    """
-    from alfworld_env import task_instance_id, task_type_of
-    from eval_ez import _rollout_batch, stratified_games
-    select_adapter(raw, "solver")
-    if sync_fn:
-        sync_fn("solver")
-    raw.eval()
-    # ★ 调用方传进来的 games 可能已经是子集；这里再按类型轮转重排一次，
-    #   保证"取前 k 个做评测"永远覆盖全部任务类型（见 eval_game_files 处的注释）。
-    games = stratified_games(list(games), 0)
-    eval_style = solver_style()
-    eval_cfg = RolloutConfig(group_size=1, max_steps=max_steps,
-                             max_new_tokens=max_new_tokens, temperature=temperature,
-                             top_p=0.95, top_k=-1, repetition_penalty=1.05,
-                             max_context_tokens=max_context_tokens,
-                             stop_mode=("eos" if eval_style == "rich" else "tool_call"),
-                             max_batch_size=batch_size)
-    won_rows = []
-    for start in range(0, len(games), batch_size):
-        gb = games[start:start + batch_size]
-        records = [{"task_id": task_instance_id(g), "task_type": task_type_of(g),
-                    "sample": 0} for g in gb]
-        env = ALFWorldBatchEnv(alf_cfg, split="eval_out_of_distribution",
-                               batch_size=len(gb), seed=seed + start,
-                               max_episode_steps=max_steps,
-                               with_expert=False, with_facts=False,
-                               ignore_benchmark_done=False)
-        try:
-            won_rows.extend(_rollout_batch(
-                env, policy, gb, records, eval_cfg, max_steps, style=eval_style))
-        finally:
-            env.close()
-    select_adapter(raw, "proposer")
-    if sync_fn:
-        sync_fn("proposer")
-    from ez_eval_protocol import aggregate_complete_evaluation
-    from alfworld_env import task_instance_id, task_type_of
-    expected = {task_instance_id(g): task_type_of(g) for g in games}
-    if len(expected) != len(games):
-        raise RuntimeError("quick valid_unseen subset contains duplicate task ids")
-    summary = aggregate_complete_evaluation(won_rows, expected, 1)
-    won = [bool(r["won"]) for r in won_rows]
-    return summary["episode_weighted_sr"], won
 
 
 def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
@@ -652,11 +423,14 @@ def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
                           world: int, loss_norm: str, beta: float, dist_obj=None,
                           group_weight: float = 1.0):
     """Accumulate exact seq-mean gradients over all global task groups in one step."""
-    from train_grpo import per_token_logps
+    from grpo import BatchTensors, grpo_loss, make_batch, per_token_logps
     if loss_norm != "seq":
         raise ValueError("EZ microbatch accumulation currently requires train.loss_norm='seq'")
     mb = max(1, int(micro_batch_size))
-    local_valid = sum(1 for t in trajectories if any(t.loss_mask[1:]))
+    is_segmented = lambda t: bool(getattr(t, "segments", None))
+    local_valid = sum(1 for t in trajectories if (
+        bool(getattr(t, "has_trainable_tokens", False)) if is_segmented(t)
+        else any(t.loss_mask[1:])))
     global_valid = torch.tensor([local_valid], dtype=torch.float64, device=device)
     if world > 1:
         dist_obj.all_reduce(global_valid, op=dist_obj.ReduceOp.SUM)
@@ -664,21 +438,56 @@ def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
     loss_sum = 0.0
     stats = []
     for start in range(0, len(trajectories), mb):
-        bt = make_batch(trajectories[start:start + mb], pad_id, device)
-        with torch.no_grad():
-            old = per_token_logps(optimizer_model, bt.input_ids, bt.attention_mask,
-                                  loss_mask=bt.loss_mask)
-            ref = None
-            if beta:
-                with raw.disable_adapter():
-                    ref = per_token_logps(raw, bt.input_ids, bt.attention_mask,
+        for trajectory in trajectories[start:start + mb]:
+            if is_segmented(trajectory):
+                segments = list(getattr(trajectory, "segments", ()))
+                episode_tokens = sum(len(response) for _, response in segments)
+                row = {"pg_sequence_sum": 0.0, "kl_sequence_sum": 0.0,
+                       "objective_sequence_sum": 0.0, "valid_sequence_count": 0.0}
+                for prompt_ids, response_ids in segments:
+                    prompt_ids, response_ids = list(prompt_ids), list(response_ids)
+                    if not response_ids:
+                        continue
+                    ids = torch.tensor([prompt_ids + response_ids], dtype=torch.long, device=device)
+                    attention = torch.ones_like(ids)
+                    mask = torch.zeros_like(ids, dtype=torch.float32)
+                    mask[:, len(prompt_ids):] = 1.0
+                    bt = BatchTensors(ids, attention, mask,
+                                      torch.tensor([trajectory.advantage], dtype=torch.float32, device=device),
+                                      len(response_ids))
+                    with torch.no_grad():
+                        old = per_token_logps(optimizer_model, ids, attention, loss_mask=mask)
+                        ref = None
+                        if beta:
+                            with raw.disable_adapter():
+                                ref = per_token_logps(raw, ids, attention, loss_mask=mask)
+                    loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
+                                           ref_logps=ref, beta=beta, sequence_reduction="sum")
+                    weight = len(response_ids) / max(episode_tokens, 1)
+                    (loss * weight * (world / denom) * group_weight).backward()
+                    loss_sum += float(loss.detach().item()) * weight * group_weight
+                    for key in ("pg_sequence_sum", "kl_sequence_sum", "objective_sequence_sum"):
+                        row[key] += float(stat.get(key, 0.0)) * weight
+                    del old, ref, bt, loss
+                if episode_tokens:
+                    row["valid_sequence_count"] = 1.0
+                stats.append(row)
+            else:
+                bt = make_batch([trajectory], pad_id, device)
+                with torch.no_grad():
+                    old = per_token_logps(optimizer_model, bt.input_ids, bt.attention_mask,
                                           loss_mask=bt.loss_mask)
-        loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
-                               ref_logps=ref, beta=beta, sequence_reduction="sum")
-        (loss * (world / denom) * group_weight).backward()
-        loss_sum += float(loss.detach().item()) * group_weight
-        stats.append(stat)
-        del old, ref, bt, loss
+                    ref = None
+                    if beta:
+                        with raw.disable_adapter():
+                            ref = per_token_logps(raw, bt.input_ids, bt.attention_mask,
+                                                  loss_mask=bt.loss_mask)
+                loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
+                                       ref_logps=ref, beta=beta, sequence_reduction="sum")
+                (loss * (world / denom) * group_weight).backward()
+                loss_sum += float(loss.detach().item()) * group_weight
+                stats.append(stat)
+                del old, ref, bt, loss
     if not trajectories:
         raise RuntimeError("optimizer step requires at least one local trajectory")
     return loss_sum / denom, stats, int(global_valid.item())
@@ -698,7 +507,6 @@ def build_ez_rollout_configs(cfg: dict, local_group_size: int,
         max_context_tokens=p["max_context_tokens"],
         keep_recent_turns=p["keep_recent_turns"], seed=p["seed"],
         give_admissible=p["give_admissible"],
-        invalid_action_mode=p["invalid_action_mode"],
         finish_nudge=p["finish_nudge"],
         generation_max_batch_size=train["generation_max_batch_size"],
     )
@@ -712,80 +520,53 @@ def build_ez_rollout_configs(cfg: dict, local_group_size: int,
         keep_recent_turns=s["keep_recent_turns"], seed=s["seed"],
         stop_mode=s["stop_mode"], max_batch_size=train["generation_max_batch_size"],
     )
-    p_tok_cfg = RolloutConfig(
-        group_size=1, max_steps=p_cfg.max_turns,
-        max_new_tokens=p_cfg.max_new_tokens, temperature=p_cfg.temperature,
-        top_p=p_cfg.top_p, top_k=p_cfg.top_k, min_p=p_cfg.min_p,
-        repetition_penalty=p_cfg.repetition_penalty,
-        max_context_tokens=p_cfg.max_context_tokens,
-        keep_recent_turns=p_cfg.keep_recent_turns, seed=p_cfg.seed,
-        stop_mode="tool_call",
-    )
-    return p_cfg, s_cfg, p_tok_cfg
+    return p_cfg, s_cfg
 
 
-def v2_vllm_engine_kwargs(cfg: dict, rank: int) -> dict:
-    """Resolve only the v2 vLLM engine options, including rank-distinct seeding."""
+def vllm_engine_kwargs(cfg: dict, rank: int) -> dict:
+    """Build vLLM settings from the resolved shared protocol."""
     vcfg = cfg["runtime"]["vllm"]
-    return {
-        "max_model_len": int(vcfg["max_model_len"]),
-        "max_lora_rank": int(vcfg["max_lora_rank"]),
-        "max_num_seqs": int(vcfg["max_num_seqs"]),
-        "max_num_batched_tokens": int(vcfg["max_num_batched_tokens"]),
-        "gpu_memory_utilization": float(vcfg["gpu_memory_utilization"]),
-        "enable_prefix_caching": bool(vcfg["enable_prefix_caching"]),
-        "enforce_eager": bool(vcfg["enforce_eager"]),
-        "seed": int(vcfg["seed"]) + int(rank),
-        "trust_remote_code": False,
-    }
+    return {"max_model_len": int(vcfg["max_model_len"]),
+            "max_lora_rank": int(vcfg["max_lora_rank"]),
+            "max_num_seqs": int(vcfg["max_num_seqs"]),
+            "max_num_batched_tokens": int(vcfg["max_num_batched_tokens"]),
+            "gpu_memory_utilization": float(vcfg["gpu_memory_utilization"]),
+            "enable_prefix_caching": bool(vcfg["enable_prefix_caching"]),
+            "enforce_eager": bool(vcfg["enforce_eager"]),
+            "seed": int(vcfg["seed"]) + int(rank),
+            "trust_remote_code": False}
 
 
 # --------------------------------------------------------------------------- 主循环
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Explorer-Zero training runtime")
     ap.add_argument("--config", required=True)
-    ap.add_argument("--dry-run", action="store_true", help="只跑 1 步 proposer + 1 步 solver 冒烟")
-    ap.add_argument("--max-outer", type=int, default=None)
-    ap.add_argument("--resume", default=None, help="resume from a complete EZ ckpt directory")
-    ap.add_argument("--run-id", default=None)
-    ap.add_argument("--protocol-manifest", default=None)
+    ap.add_argument("--resume", default=None)
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--protocol-manifest", required=True)
     ap.add_argument("--protocol-smoke", action="store_true")
     args = ap.parse_args(argv)
-    protocol_manifest = None
-    if args.protocol_manifest:
-        with open(args.protocol_manifest, encoding="utf-8") as fh:
-            protocol_manifest = json.load(fh)
-        from ez_train_v2_contract import ContractError, contract_signature
-        if protocol_manifest.get("contract_sha256") != contract_signature(protocol_manifest):
-            ap.error("v3 training manifest contract checksum is invalid")
-        if protocol_manifest.get("schema_version") != 3 or \
-                protocol_manifest.get("protocol_name") != "explorer_zero_training_v2":
-            ap.error("--protocol-manifest must be a schema-v3 training contract")
-        if args.dry_run or args.max_outer is not None:
-            ap.error("v3 schedule can only be changed by the explicit ez_train_v2 --smoke contract")
-    elif args.protocol_smoke:
-        ap.error("--protocol-smoke requires --protocol-manifest")
-    if args.resume and args.dry_run:
-        ap.error("--resume cannot be combined with --dry-run; resume a formal run without changing its schedule")
-
     cfg = load_cfg(args.config)
-    if cfg.get("protocol_version") == 3 and protocol_manifest is None:
-        ap.error("schema-v3 config requires the strict ez_train_v2.py launcher; refusing legacy training path")
-    if protocol_manifest is None:
-        install_alfworld_compat()
-    if protocol_manifest is not None:
-        if cfg != protocol_manifest.get("resolved_config"):
-            ap.error("runtime config differs from the v3 resolved manifest")
-        if bool(args.protocol_smoke) != (protocol_manifest.get("checkpoint_eligibility") == "smoke_only"):
-            ap.error("smoke flag differs from manifest checkpoint eligibility")
-        if not args.run_id:
-            ap.error("v3 training requires --run-id")
-        from ez_train_v2 import _install_resolved_prompt_environment
-        _install_resolved_prompt_environment(cfg)
-    if protocol_manifest is None and os.environ.get("EZ_RUN_OUTPUT_DIR"):
-        cfg.setdefault("run", {})["output_dir"] = os.environ["EZ_RUN_OUTPUT_DIR"]
+    with open(args.protocol_manifest, encoding="utf-8") as fh:
+        protocol_manifest = json.load(fh)
+    from checkpoint import ContractError, contract_signature
+    if protocol_manifest.get("contract_sha256") != contract_signature(protocol_manifest):
+        ap.error("training manifest checksum is invalid")
+    if protocol_manifest.get("schema_version") != 3 or \
+            protocol_manifest.get("protocol_name") != "explorer_zero_skillrise":
+        ap.error("manifest must use the shared SkillRise schema-v3 contract")
+    if cfg != protocol_manifest.get("resolved_config"):
+        ap.error("runtime config differs from the resolved manifest")
+    if bool(args.protocol_smoke) != (protocol_manifest.get("checkpoint_eligibility") == "smoke_only"):
+        ap.error("smoke flag differs from manifest checkpoint eligibility")
+    if args.resume and args.protocol_smoke:
+        ap.error("smoke training cannot resume")
+    install_alfworld_compat()
+    os.environ["ALFWORLD_DATA"] = str(cfg["env"]["data_root"])
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     seed = cfg["run"].get("seed", 42)
     # ★ 必须用 setup_dist()（会 init_process_group），不能用 dist_info()：
     #   dist_info() 只读环境变量，从不建进程组 —— 8 进程照跑，但 all_reduce /
@@ -795,28 +576,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     _RANK = rank
     set_seed(seed, rank)
 
-    if protocol_manifest is not None:
-        hashes = [None] * world
-        if world > 1:
-            dist.all_gather_object(hashes, protocol_manifest.get("contract_sha256"))
-        else:
-            hashes = [protocol_manifest.get("contract_sha256")]
-        if any(item != protocol_manifest.get("contract_sha256") for item in hashes):
-            raise ValueError("rank-local v3 manifests disagree before model load")
+    hashes = [None] * world
+    if world > 1:
+        dist.all_gather_object(hashes, protocol_manifest.get("contract_sha256"))
+    else:
+        hashes = [protocol_manifest.get("contract_sha256")]
+    if any(item != protocol_manifest.get("contract_sha256") for item in hashes):
+        raise ValueError("rank-local training manifests disagree before model load")
 
     resume_ckpt = Path(args.resume).expanduser().resolve() if args.resume else None
     if resume_ckpt is not None:
-        if protocol_manifest is None:
-            resume_ckpt = resolve_resume_directory(resume_ckpt, rank)
         run_dir = resume_ckpt.parent
     elif is_main(rank):
-        if protocol_manifest is not None:
-            if not args.run_id:
-                raise ValueError("v3 training requires --run-id")
-            run_dir = Path(cfg["run"]["output_dir"]) / f"{cfg['run']['name']}-{args.run_id}"
-        else:
-            run_dir = Path(cfg["run"]["output_dir"]) / \
-                f"{cfg['run']['name']}-{time.strftime('%m%d-%H%M')}"
+        run_dir = Path(cfg["run"]["output_dir"]) / f"{cfg['run']['name']}-{args.run_id}"
     else:
         run_dir = Path(".")          # 占位，马上被广播覆盖
     if world > 1:
@@ -826,15 +598,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         dist.broadcast_object_list(_rd, src=0)
         run_dir = Path(_rd[0])
     run_dir.mkdir(parents=True, exist_ok=True)
-    if protocol_manifest is not None:
-        protocol_file = run_dir / "run_protocol.json"
-        if not protocol_file.is_file():
-            raise ValueError("v3 run directory is missing its immutable run_protocol.json")
-        with protocol_file.open(encoding="utf-8") as fh:
-            run_protocol = json.load(fh)
-        if run_protocol.get("contract_sha256") != protocol_manifest.get("contract_sha256") or \
-                run_protocol.get("run_id") != args.run_id:
-            raise ValueError("v3 run id/contract does not match immutable run_protocol.json")
+    protocol_file = run_dir / "run_protocol.json"
+    if not protocol_file.is_file():
+        raise ValueError("run directory is missing its immutable run_protocol.json")
+    with protocol_file.open(encoding="utf-8") as fh:
+        run_protocol = json.load(fh)
+    if run_protocol.get("contract_sha256") != protocol_manifest.get("contract_sha256") or \
+            run_protocol.get("run_id") != args.run_id:
+        raise ValueError("run id/contract does not match immutable run_protocol.json")
     task_pool_path = run_dir / "task_pool.jsonl"
     resume_info = None
     resume_pool: List[ProposedTask] = []
@@ -842,16 +613,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if resume_ckpt is not None:
         resume_info, resume_pool, resume_rng_path = load_ez_resume(
             resume_ckpt, cfg, world, rank, protocol_manifest=protocol_manifest)
-        if protocol_manifest is not None and resume_info.get("run_id") != args.run_id:
+        if resume_info.get("run_id") != args.run_id:
             raise ValueError("v3 resume --run-id differs from sealed checkpoint")
         log(f"[resume] checkpoint={resume_ckpt} next={resume_info.get('next_outer')} "
             f"{resume_info.get('next_phase')}:{resume_info.get('next_step')} pool={len(resume_pool)}")
-    # ★ SwanLab 上报在这里起：放后面是因为 `run_dir` 必须已经由 rank0 广播出去了，
-    #   否则 8 个 rank 会各自开出 8 个不同名的 run。
-    #   ⚠️ 上报失败不影响训练（ez_swanlab 全吞异常），所以直接挂着不管也行。
     global _REPORTER
-    _REPORTER = (_V2MetricsReporter(cfg, run_dir=run_dir, rank=rank)
-                 if protocol_manifest is not None else EzSwanLab(cfg, run_dir=run_dir, rank=rank))
+    _REPORTER = _MetricsReporter(cfg, run_dir=run_dir, rank=rank)
     global _LOG_FH, _LOG_FH0
     _log_mode = "a" if resume_ckpt is not None else "w"
     _LOG_FH = open(run_dir / f"train_log.rank{rank}.jsonl", _log_mode)
@@ -866,7 +633,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     tcfg = cfg["train"]
     # 用 is not None 而不是 or：--max-outer 0（只跑构建自检）不会被 falsy 吃掉
-    N = args.max_outer if args.max_outer is not None else tcfg.get("outer_loops", 4)
+    N = tcfg.get("outer_loops", 4)
     M_P, M_S = tcfg.get("proposer_steps", 25), tcfg.get("solver_steps", 25)
     G = tcfg.get("group_size", 16)           # GRPO 组
     G_P = tcfg.get("solve_rate_rollouts", 8)  # 估 p̂(x) 用
@@ -874,12 +641,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     G_local = local_group_size(int(G), world)
     w_sub = tcfg.get("w_sub", 0.3)
     w_div = tcfg.get("w_div", 0.3)
-    # ★「断点留多个」+「训练中间评测」开关（见 ez_save 的 keep 与 mid_eval_solver）
-    checkpoint_keep = int(tcfg.get("checkpoint_keep", 4))
-    eval_every_outer = int(tcfg.get("eval_every_outer", 1)) if protocol_manifest is None else 0
-    eval_n_tasks = int(tcfg.get("eval_n_tasks", 16))
-    eval_batch = int(tcfg.get("eval_batch", 2))
-    eval_max_steps = int(tcfg.get("eval_max_steps", cfg["solver"].get("max_turns", 30)))
     # ★ solve rate 每批并行处理的任务数（与 TPS 取 min：TPS=1 时退化为逐任务，避免补齐浪费）
     sr_tasks = max(1, min(int(tcfg.get("solve_rate_batch_tasks", 4)), TPS))
 
@@ -905,30 +666,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 yield _sub, list(_sub) + [_sub[0]] * (max_per_call - len(_sub))
             _ri += 1
 
-    # ★ --dry-run 只把"步数"降到 1 是**不够**的：G=16 × 30 turns 在 A40 debug 分区
-    #   （30 min 上限）根本跑不完，会卡到超时。这里把 group / turns / tasks 一并压到
-    #   最小，冒烟只验证三件事：链路能通、facts 通道存在、参数真的动了。
-    #
-    #   ⚠️ turns 不能压到 3！prompt 要求"探索 10-20 个动作后才 finish"，turns=3 时
-    #   proposer 必然在 finish 之前就把回合用光 -> accept 恒为 0 -> 任务池空 ->
-    #   solver 相位整个跳过 -> 冒烟"看起来通过"但其实一条真链路都没走。
-    #   实测证据（job 12989069）：fmt_bad=0（解析已修好）但 accept=0/2、mean_turns=3.0。
-    #   12 轮足够让 Qwen3-4B 走到 finish，同时 2 slot × 12 轮在 A40 上约 40s。
-    if args.dry_run:
-        _smoke_default_g = int(tcfg.get("group_size", 16))
-        G = int(os.environ.get("EZ_SMOKE_G", str(_smoke_default_g)))
-        G_P = int(os.environ.get("EZ_SMOKE_G_P", str(max(2, world))))
-        # ★ 显式默认 1：冒烟必须最小规模。**不能**再用 str(TPS) 兜底 —— 正式配置
-        #   TPS 一旦调大（如 8），兜底会把冒烟也一起放大 8 倍，违背本节"压到最小"的初衷。
-        TPS = int(os.environ.get("EZ_SMOKE_TPS", "1"))
-        G_local = local_group_size(int(G), world)
+    # Smoke runs reduce update count and remain ineligible for formal resume or evaluation.
+    if args.protocol_smoke:
         M_P = M_S = 1
-        _smoke_turns = int(os.environ.get("EZ_SMOKE_TURNS", "12"))
-        p_max_turns = s_max_turns = _smoke_turns
-        log(f"[dry-run] 缩规模：G={G} G_P={G_P} TPS={TPS} turns={_smoke_turns}")
-    else:
-        p_max_turns = cfg["proposer"].get("max_turns", 30)
-        s_max_turns = cfg["solver"].get("max_turns", 30)
+    p_max_turns = cfg["proposer"].get("max_turns", 30)
+    s_max_turns = cfg["solver"].get("max_turns", 30)
 
     if TPS < 1:
         raise ValueError("train.tasks_per_step must be positive")
@@ -941,17 +683,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         else str((SRC_DIR.parent / cfg["env"]["config_path"]).resolve()))
     game_files = collect_game_files(alf_cfg, split=cfg["env"].get("split", "train"))
     log(f"[data] {len(game_files)} train games")
-    # 中间评测用 valid_unseen（官方口径）。排序保证各次评测/各 rank 一致可比。
-    #
-    # ★★ 但**不能**用 `sorted(...)[:n]` 取子集：valid_unseen 的 134 个任务在 sorted()
-    #    之后是按类型聚簇的（目录名以类型开头），而 look_at_obj_in_light 因为
-    #    `l < p` 排在最前 —— 实测**前 16 个 100% 是 look_at_obj_in_light**。
-    #    旧写法等于 6 类任务只测 1 类（18/134），"中间评测"的曲线会严重失真。
-    #    统一改成按类型轮转取样（`eval_ez.stratified_games`），与独立评测脚本同一份逻辑。
-    eval_game_files = (sorted(collect_game_files(alf_cfg, "eval_out_of_distribution"))
-                       if protocol_manifest is None else [])
 
-    p_cfg, s_cfg, p_tok_cfg = build_ez_rollout_configs(
+    p_cfg, s_cfg = build_ez_rollout_configs(
         cfg, G_local, proposer_turns=p_max_turns, solver_turns=s_max_turns)
 
     # ★ 批量探索规模：proposer 相位每次把 n_groups 个 game **一次性**交给
@@ -1025,7 +758,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _lora_tr = [p for p in _lora_all if p.requires_grad]
     log(f"[selfcheck] base dtype={_p0.dtype} | lora参数样例={_adapters} | "
         f"gc={getattr(raw, 'is_gradient_checkpointing', '?')} | "
-        f"stop_mode=tool_call | 基座冻结={not any(p.requires_grad for n, p in raw.named_parameters() if 'lora_' not in n)} "
+        f"stop_mode=action_tag | base_frozen={not any(p.requires_grad for n, p in raw.named_parameters() if 'lora_' not in n)} "
         f"| LoRA 可训练 {len(_lora_tr)}/{len(_lora_all)} | lora dtype={_lora_all[0].dtype if _lora_all else '?'}")
     # facts 预检：EZ 没有 facts 就是废的，早炸比跑一半炸好
     from ez_state import assert_facts_mode as _afm
@@ -1093,9 +826,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     #       proposer 步内（每步权重都变）/ solve rate 前（→solver）/ 恢复（→proposer）
     #       solver 步内（每步权重都变）
     #   ⚠️ 漏刷 = 采样策略 ≠ 训练策略 = on-policy 静默破坏，所以刷完都打日志。
-    rollout_backend = (str(cfg["runtime"]["backend"]).strip().lower()
-                       if protocol_manifest is not None else
-                       os.environ.get("ZTWANG_ROLLOUT_BACKEND", "hf").strip().lower())
+    rollout_backend = str(cfg["runtime"]["backend"]).strip().lower()
     vllm_policy = None
     _vllm_ver: Dict[str, int] = {"proposer": 0, "solver": 0}
     if rollout_backend == "vllm":
@@ -1103,22 +834,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     export_lora_adapter, lora_workdir)
 
         _base_path = os.path.expandvars(os.path.expanduser(str(cfg["model"]["path"])))
-        if protocol_manifest is not None:
-            engine_kwargs = v2_vllm_engine_kwargs(cfg, rank)
-        else:
-            engine_kwargs = {
-                "max_model_len": int(cfg["solver"].get("max_context_tokens", 40960)),
-                "max_num_seqs": int(cfg["runtime"].get("vllm", {}).get("max_num_seqs", 64)
-                                     if protocol_manifest is not None else os.environ.get("ZTWANG_VLLM_MAX_SEQS", "64")),
-                "max_num_batched_tokens": int(cfg["runtime"].get("vllm", {}).get("max_num_batched_tokens", 16384)
-                                               if protocol_manifest is not None else os.environ.get("ZTWANG_VLLM_BATCHED", "16384")),
-                "gpu_memory_utilization": float(cfg["runtime"].get("vllm", {}).get("gpu_memory_utilization", 0.40)
-                                                 if protocol_manifest is not None else os.environ.get("ZTWANG_VLLM_GMEM", "0.40")),
-                "enable_prefix_caching": bool(cfg["runtime"].get("vllm", {}).get("enable_prefix_caching", True)),
-                "enforce_eager": bool(cfg["runtime"].get("vllm", {}).get("enforce_eager", False)),
-                "seed": int(cfg["runtime"].get("vllm", {}).get("seed", 0)),
-                "trust_remote_code": True,
-            }
+        engine_kwargs = vllm_engine_kwargs(cfg, rank)
         vllm_policy = VLLMPolicy(
             build_vllm_engine(
                 _base_path, **engine_kwargs),
@@ -1141,7 +857,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         #    export_lora_adapter 负责探测出真正含 adapter_config.json 的那一层。
         #    这里丢掉返回值 = 把父目录交给 vLLM ⇒ 第一次采样就
         #        ValueError: Loading lora ... failed: No adapter found for <dir>
-        #    而且 EngineCore 会直接死，整个训练作业报废（实测 job 13009731）。
+        #    而且 EngineCore 会直接死，整个训练作业报废（engine failures）。
         _d = export_lora_adapter(raw, adapter, _d)
         vllm_policy.set_lora(adapter, _d)
         log(f"[vllm] 刷新 {adapter} adapter v{_vllm_ver[adapter]} | "
@@ -1207,40 +923,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             for t in task_pool:
                 fh.write(json.dumps(t.to_json(), ensure_ascii=False) + "\n")
 
-    # ★ 评测链路自测（EZ_EVAL_PRETEST=1 时）：训练前先在 valid_unseen 上评一次，
-    #   确保 mid_eval_solver 不炸。评测是本次新增，正式 8 卡作业里第一次触发在
-    #   第一个 outer 结束（30-60min 后）——提前 3 分钟验证，把「评测 bug 烧 8 卡 1 小时」
-    #   降成「烧 8 卡 3 分钟」。
-    if os.environ.get("EZ_EVAL_PRETEST") == "1" and not args.dry_run:
-        if world > 1:
-            dist.barrier()
-        if is_main(rank):
-            _pt0 = time.time()
-            from eval_ez import stratified_games
-            _pt_n = max(1, min(eval_n_tasks, 4))
-            _sr0, _won0 = mid_eval_solver(
-                raw, policy, alf_cfg, stratified_games(eval_game_files, _pt_n),
-                max_steps=eval_max_steps,
-                temperature=cfg["solver"].get("temperature", 1.0),
-                max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
-                max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
-                batch_size=eval_batch, seed=seed,
-                log_fn=log, sync_fn=sync_rollout_adapter)
-            log(f"[eval-pretest] quick subset/single-sample check (not paper-final): SR={_sr0:.4f} "
-                f"({int(sum(_won0))}/{len(_won0)}，{(time.time() - _pt0) / 60:.1f}min)")
-        if world > 1:
-            dist.barrier()
-
     t_start = time.time()
     for outer in range(start_outer, N):
         # ⚠️ 冒烟只跑 1 个 outer 的判据必须放在**循环开头**。
         #    之前写在循环结尾（ez_save 之后），但 solver 空池那条路径会 `continue`
         #    直接跳到下一轮，把 break 绕过去 —— 实测日志里出现了 outer 0/1/2/3 各跑一遍。
-        if args.dry_run and outer > 0:
+        if args.protocol_smoke and outer > 0:
             break
         # ================= proposer 相位 =================
         model.eval()
-        p_steps = M_P if not args.dry_run else 1
+        p_steps = M_P if not args.protocol_smoke else 1
         p_start = resume_step if outer == start_outer and resume_phase == "proposer" else 0
         p_range = range(p_start, p_steps) if not (outer == start_outer and resume_phase == "solver") else range(0)
         for step in p_range:
@@ -1289,7 +981,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if _mg == 0 or not groups:
                 raise SystemExit(
                     f"[EZ][红线B] 存在空的 GRPO 组（全局最小 {_mg}，本 rank {len(groups)} 组）——"
-                    f" 各 rank 的 backward 次数会不一致，DDP 必然死锁。"
+                    f" 各 rank 的 backward 次数会不一致，rank gradient synchronization would stall。"
                     f" 检查 run_proposer_exploration 是否有静默丢样本的路径")
             accepted = [c for c in cand if c.accepted and c.task is not None]
             # 2) 冻结 solver 估 solve rate —— **批量并行**（原为逐任务串行，TPS>1 时成主瓶颈）。
@@ -1344,7 +1036,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _backward_t0 = time.time()
             for group_idx, groll in enumerate(groups):
                 for c in groll:
-                    tokenize_proposer_rollout(c, policy, p_tok_cfg)
+                    tokenize_proposer_rollout(c)
                     _tokens_local += int(sum(c.__dict__["loss_mask"][1:]))
                 full_rewards = gather_group_values([c.reward for c in groll], rank, world, dist)
                 full_advs = global_group_advantages(full_rewards, ddof=adv_ddof)
@@ -1390,10 +1082,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _sync_s = time.time() - _sync_t0
             _act = [p for p in opt_params if p.grad is not None and p.requires_grad]
             _gn = float(sum(p.grad.detach().float().norm() for p in _act)) if _act else 0.0
-            # ★ A/B 分开报：peft 把 lora_B 初始化成全 0 ⇒ ∂L/∂A = Bᵀ(...) ≡ 0
-            #   ⇒ **第 0 步 lora_A 的梯度必然是精确的 0**（这是 LoRA 的正常性质，
-            #   不是 bug）。旧 probe 恰好挑中 lora_A，才打出 update_rel=0.000e+00 的假警报。
-            #   把两条分开打，这个性质就永远看得见。
+            # LoRA B starts at zero, so report A and B gradient norms separately.
             _gnA = float(sum(p.grad.detach().float().norm() for p in _act
                              if ".lora_A." in _nof.get(id(p), "")))
             _gnB = float(sum(p.grad.detach().float().norm() for p in _act
@@ -1407,16 +1096,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             optimizer.zero_grad(set_to_none=True)
             _cuda_sync()
             _optimizer_s = time.time() - _step_t0
-            # ★ 组奖励必须进日志：只有这样，"update_rel=0" 才能被判成
-            #   「奖励同分（=没信号，正常）」还是「奖励有区分度却不动（=梯度链断，必修）」。
-            #   实测教训（job 12989143 outer 2）：accept=1/2 却 update_rel=0，
-            #   当时日志里连组奖励都没有，完全无法判断 —— 这就是补它的原因。
+            # Record group rewards to distinguish flat feedback from a broken gradient path.
             _rw = [round(float(c.reward), 3) for c in cand]
-            # ★ 拒绝原因分布必须汇总进日志（`EZ_EXPERIMENT_PLAN.md` E0）：
-            #   光有 `accept=1/4` 只能知道"合格率低"，看不出**是哪条规则在杀题**。
-            #   `ez_proposer` 已把 reason 存在每条 rollout 的 `reject_reason` 上，
-            #   这里只差汇总。看分布才能决定该放宽过滤规则（U1/U3）
-            #   还是该做 base 模型的格式冷启动（U7）。
+            # Summarize rejection reasons alongside the acceptance count.
             _rej = Counter(getattr(c, "reject_reason", "unknown") or "accepted"
                            for c in cand)
             log(f"[outer {outer}][P{step}] rank={rank} global_games={len(games)} local_G={G_local} "
@@ -1455,7 +1137,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dist.all_reduce(_p_aux, op=dist.ReduceOp.SUM)
             _p_reward_std_mean, _p_nonzero_adv_group_fraction = map(float, _p_aux.tolist())
             del _p_aux
-            # ---- SwanLab 上报：proposer 相位 ----
+            # ---- Local metrics: proposer phase ----
             # step 必须是**全局单调递增**的，否则 P/S 两条曲线会叠在同一 x 上。
             # 只有 rank0 真的会发（其它 rank 的 _REPORTER 是 no-op 对象）。
             _REPORTER.log({
@@ -1484,9 +1166,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-P{step}", cfg,
                         {"next_outer": next_outer, "next_phase": next_phase,
                          "next_step": next_step}, task_pool, rank, world,
-                        uid_counter=uid_counter, dry_run=(args.dry_run or args.protocol_smoke),
+                        uid_counter=uid_counter, dry_run=args.protocol_smoke,
                         protocol_manifest=protocol_manifest)
-            if args.dry_run:
+            if args.protocol_smoke:
                 break
 
         # ================= solver 相位 =================
@@ -1513,10 +1195,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-empty-S", cfg,
                     {"next_outer": outer + 1, "next_phase": "proposer", "next_step": 0},
                     task_pool, rank, world, uid_counter=uid_counter,
-                    dry_run=(args.dry_run or args.protocol_smoke),
+                    dry_run=args.protocol_smoke,
                     protocol_manifest=protocol_manifest)
             continue
-        s_steps = M_S if not args.dry_run else 1
+        s_steps = M_S if not args.protocol_smoke else 1
         s_start = resume_step if outer == start_outer and resume_phase == "solver" else 0
         for step in range(s_start, s_steps):
             st0 = time.time()
@@ -1524,17 +1206,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             model.eval()
             # ★ vLLM 后端：solver 相位**每步都更新 solver 权重**，所以每步采样前都要刷。
             sync_rollout_adapter("solver")
-            # ★★ 采样改为**按 rank 分片**，不用 `rng.sample`（多卡下是真 bug，见下）
-            #   旧写法 `rng.sample(outer_pool, k)`：rng 是 `random.Random(seed)`，
-            #   各 rank 的 seed **完全相同**，而池子经 all_gather 后也完全一致 ——
-            #   于是所有 rank 采到**同一批任务**。实测 8 卡 + k=1 时
-            #   rank1..rank7 全部采到同一个任务，全局只用到 2 个不同任务
-            #   （有效 batch 缩水到 25%，8 卡的算力白扔 6/8）。
-            #   改成分片后：跨 rank **天然不重复**，也不再依赖 rng 状态同步。
-            #
-            # 无放回：有放回会让同 uid 的组被合并、loss 双计（review P1-2）
-            # ★ k 必须**各 rank 相同**（=min(TPS//world, 池子大小)）：条数不同则
-            #   backward 次数不同，DDP 死锁。池子已跨 rank 一致，所以这个 k 天然一致。
+            # Draw the same-sized, non-overlapping task slice on each rank.
             n_tasks = min(TPS, len(outer_pool))
             chosen = broadcast_pool_indices(len(outer_pool), n_tasks,
                                             outer * max(M_S, 1) + step,
@@ -1589,7 +1261,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _s_components_local[3] += _stats_local["objective_sequence_sum"] * _group_weight
                 _s_components_local[4] += _stats_local["valid_sequence_count"]
                 all_roll.extend(grp)
-                _tokens_local += sum(int(sum(r.traj.loss_mask[1:])) for r in grp)
+                _tokens_local += sum(int(r.traj.n_trainable_tokens) for r in grp)
             _cuda_sync()
             _backward_s = time.time() - _backward_t0
             # ★ S 相位也打一行同款诊断：判读脚本要靠「真实 backward grad_norm」把
@@ -1635,10 +1307,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 float(sum(1 for r in all_roll if r.verify.final_match)),
                 float(sum(1 for r in all_roll if not r.verify.final_match and r.traj.reward > 0)),
                 float(sum(1 for r in all_roll if r.traj.stats is not None and r.traj.stats.truncated)),
+                float(sum(len(r.traj.segments) for r in all_roll)),
+                float(sum(r.traj.stats.n_valid_steps for r in all_roll if r.traj.stats is not None)),
             ], device=device, dtype=torch.float64)
             if world > 1:
                 dist.all_reduce(_s_outcomes, op=dist.ReduceOp.SUM)
-            _s_n_global, _s_final_global, _s_partial_global, _s_truncated_global = map(float, _s_outcomes.tolist())
+            (_s_n_global, _s_final_global, _s_partial_global, _s_truncated_global,
+             _s_segments_global, _s_valid_actions_global) = map(float, _s_outcomes.tolist())
             del _s_outcomes
             log(f"[outer {outer}][S{step}] rank={rank} global_tasks={len(batch)} local_G={G_local} "
                 f"| reward mean={np.mean(rw):.3f} "
@@ -1659,7 +1334,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"effective_global_batch={len(batch) * G} "
                 f"cuda_peak_allocated_gib={_mem_alloc:.3f} cuda_peak_reserved_gib={_mem_reserved:.3f} "
                 f"attention={_attention_backend(raw, cfg)}")
-            # ---- SwanLab 上报：solver 相位 ----
+            # ---- Local metrics: solver phase ----
             # step 要排在同 outer 的 P 相位**之后**（+M_P），否则两条曲线会撞车。
             _sanity = {
                 "train/loss": _s_loss_sum_global,
@@ -1679,17 +1354,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "solver/nonzero_adv_group_fraction": _s_nonzero_adv_group_fraction,
                 "solver/partial_reward_rate": _s_partial_global / max(_s_n_global, 1.0),
                 "solver/truncation_rate": _s_truncated_global / max(_s_n_global, 1.0),
+                "solver/generated_responses": _s_segments_global,
+                "solver/action_tag_valid_actions": _s_valid_actions_global,
+                "solver/action_tag_valid_rate": _s_valid_actions_global / max(_s_segments_global, 1.0),
+                "solver/response_tokens": _tokens_global,
                 "solver/final_match_rate_global": _s_final_global / max(_s_n_global, 1.0),
                 "solver/n_rollouts": len(all_roll),
                 "solver/sec_per_step": time.time() - st0,
             }
             _REPORTER.log(_sanity, step=outer * (M_P + M_S) + M_P + step)
-            # solver 一步都没解出来 —— 这条要能在手机端看到，而不是等回来看日志
-            if rw and max(rw) == 0.0:
-                _REPORTER.alert(
-                    title="solver 奖励全 0",
-                    text=f"outer {outer} S{step}：{len(all_roll)} 条 rollout 奖励全为 0，"
-                         f"本轮可能发生了 reward collapse，去看 train_log.rank0.jsonl")
             s_done = step + 1 == s_steps
             if s_done or (step + 1) % 5 == 0:
                 next_outer, next_phase, next_step = ((outer + 1, "proposer", 0) if s_done
@@ -1697,61 +1370,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-S{step}", cfg,
                         {"next_outer": next_outer, "next_phase": next_phase,
                          "next_step": next_step}, task_pool, rank, world,
-                        uid_counter=uid_counter, dry_run=(args.dry_run or args.protocol_smoke),
-                        keep=(checkpoint_keep if s_done else 0),
+                        uid_counter=uid_counter, dry_run=args.protocol_smoke,
                         protocol_manifest=protocol_manifest)
-                # ★ 中间评测：每个 outer 完成时，rank0 在 valid_unseen 上评一次 solver，
-                #   其余 rank 在 barrier 等待。结果进日志 + SwanLab，用户能实时看进展。
-                #   EZ_SMOKE_EVAL=1 时 dry-run 也评测（冒烟顺带验证评测链路，task 数压到 4）。
-                _force_eval = bool(int(os.environ.get("EZ_SMOKE_EVAL", "0")))
-                if s_done and (not args.dry_run or _force_eval) and eval_every_outer > 0 \
-                        and (outer + 1) % eval_every_outer == 0:
-                    if world > 1:
-                        dist.barrier()
-                    if is_main(rank):
-                        from eval_ez import stratified_games
-                        _n = min(eval_n_tasks, 4) if args.dry_run else eval_n_tasks
-                        # ★ 必须按类型轮转取子集：`eval_game_files[:_n]` 会全落在一个类型上
-                        _eg = (stratified_games(eval_game_files, _n) if _n > 0
-                               else eval_game_files)
-                        _t0 = time.time()
-                        # ★★ 评测必须**被包住**：评测是"只读旁路"，它挂了不该拖垮训练。
-                        #   实测教训（job 13026569）：评测里一个 `top_k=0` 让 rank0 抛异常，
-                        #   rank0 直接退出 ⇒ 其余 7 个 rank 卡在 dist.barrier() 上等 NCCL
-                        #   超时 ⇒ **1.4 小时的训练（outer 0 全 50 步）整个报废**。
-                        #   而且 rank0 之外的人只看到"卡住"，看不到真正的报错。
-                        #   注意 `mid_eval_solver` 内部会切 adapter，异常时必须切回来，
-                        #   否则后续采样会用错 adapter（静默的 on-policy 破坏）。
-                        try:
-                            _sr, _won = mid_eval_solver(
-                                raw, policy, alf_cfg, _eg,
-                                max_steps=eval_max_steps,
-                                temperature=cfg["solver"].get("temperature", 1.0),
-                                max_new_tokens=cfg["solver"].get("max_new_tokens", 96),
-                                max_context_tokens=cfg["solver"].get("max_context_tokens", 40960),
-                                batch_size=eval_batch, seed=seed + outer + 1,
-                                log_fn=log, sync_fn=sync_rollout_adapter)
-                        except Exception as _eev:  # noqa: BLE001
-                            log(f"[eval][FATAL-BUT-IGNORED] outer {outer} 评测失败，"
-                                f"**训练继续**（评测是只读旁路，不该拖垮训练）："
-                                f"{type(_eev).__name__}: {_eev}")
-                            import traceback as _tb
-                            log("[eval][FATAL-BUT-IGNORED] " +
-                                _tb.format_exc().replace("\n", " | ")[:1500])
-                            select_adapter(raw, "proposer")
-                            sync_rollout_adapter("proposer")
-                        else:
-                            log(f"[eval] outer {outer} quick subset/single-sample valid_unseen SR={_sr:.4f} "
-                                f"({int(sum(_won))}/{len(_won)}，{len(_eg)} tasks，"
-                                f"{(time.time() - _t0) / 60:.1f}min)")
-                            _REPORTER.log({
-                                "eval/valid_unseen_sr": _sr,
-                                "eval/n_won": int(sum(_won)),
-                                "eval/n_tasks": len(_eg),
-                            }, step=(outer + 1) * (M_P + M_S))
-                    if world > 1:
-                        dist.barrier()
-            if args.dry_run:
+            if args.protocol_smoke:
                 break
 
         # ★ 只在 rank0 存档：peft 保存的是 adapter（几百 MB），8 个 rank 各存一份
@@ -1760,11 +1381,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     close_all()
     persist_pool()
     # ★ dry-run 只跑 outer 0，但 N 仍是配置里的 4 —— 直接打 N 会让人以为跑了 4 轮
-    _n_done = 1 if (args.dry_run and N > 0) else N
+    _n_done = 1 if args.protocol_smoke and N > 0 else N
     log(f"[done] rank={rank} {_n_done} outer loops in {(time.time()-t_start)/60:.1f} min -> {run_dir}")
-    # ⚠️ finish 必须在**关日志文件之后、destroy_process_group 之前**：
-    #    SwanLab 收尾会把缓存的指标 flush 到云端/本地，放在 barrier 后面
-    #    可能因为进程组已销毁而卡住（别的 rank 还在等它参与集合通信）。
     if _REPORTER is not None:
         _REPORTER.finish()
     for _fh in (_LOG_FH, _LOG_FH0):

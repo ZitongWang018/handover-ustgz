@@ -1,34 +1,4 @@
-"""EZ 的 vLLM 采样后端：与 `rollout.HFPolicy` **同接口、同分词、同停止语义**。
-
-设计铁律（改这个文件前先读完）
-===========================================================================
-1. **只换采样器，不换算法。**
-   `VLLMPolicy` 继承 `HFPolicy`，`initial_prompt_ids` / `append_feedback_ids` /
-   `assistant_end_ids` / `next_generation_prefix_ids` / `truncate_messages` /
-   `render` / `tokenize_text` **一行都不重写** —— 两个后端给出的 prompt token
-   序列逐字节相同。被换掉的只有 `_generate_batch` 那一层（HF 的逐 token
-   Python 循环 → vLLM 的连续批处理）。
-
-2. **停止条件不放进 vLLM，改成"生成满 + 事后精确截断"。**
-   为什么可以这样：
-     * 自回归采样**逐行独立** —— 第 i 行第 k 个 token 只取决于它自己的 logits，
-       与"这一行在哪一步被判停"无关（HF 的 per-row StoppingCriteria 只是把
-       已经写完的行**提前冻结**，不会改变它已经吐出来的 token）。
-     * 所以「HF 边生成边判停」与「vLLM 生成满 max_new_tokens 后在同样位置截断」
-       得到的 `gen_ids` **完全一致**。
-   为什么不去 vLLM 里复刻 `StoppingCriteria`：
-     * EZ 的停止判据是"括号配平的裸 JSON 对象"（`scan_bare_json_call`），不是固定
-       字符串，vLLM 的 `stop=` 表达不了；
-     * 事后截断用的是**同一个** `_ToolCallStopCriteria` 判定式，语义 100% 对齐，
-       且有 `scripts/ez_vllm_stop_equiv.py` 的逐条等价单测兜底。
-   代价：会多生成一些"本来会提前停掉"的 token（实测填充浪费 ≈1.4x），
-   换来的是 10x 级的吞吐提升 —— 划算，且**不影响任何训练 token**。
-
-3. **LoRA 热同步走"落盘 + 新 int_id 强刷"。**
-   训练侧每次刷新 adapter 权重后把该 adapter 单独导出成 PEFT 目录，再用一个
-   自增的 `lora_int_id` 构造 `LoRARequest`。vLLM 按 int_id 做缓存，int_id 变了
-   就强制重载，不会出现"以为换了其实没换"的静默 on-policy 破坏。
-"""
+"""vLLM sampler using the same token IDs and stop semantics as HFPolicy."""
 from __future__ import annotations
 
 import json
@@ -36,6 +6,7 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from protocol import action_tag_stop_len
 from rollout import HFPolicy, RolloutConfig, scan_bare_json_call
 
 _TC_CLOSE = "</tool_call>"
@@ -141,26 +112,7 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
 
 
 def normalize_sampling(cfg: RolloutConfig) -> Dict[str, Any]:
-    """把 `RolloutConfig` 的采样参数翻译成 **vLLM 能接受的**取值。
-
-    ⚠️ 为什么必须显式归一（实测踩坑，job 13026569，作业直接报废）：
-        HF 侧的写法是"**只在参数 > 0 时才生效**"——见 `rollout._generate_batch`：
-            if cfg.top_k and cfg.top_k > 0: gen_kwargs["top_k"] = cfg.top_k
-        所以 `top_k=0` 在 HF 路径里等价于"不启用"，**完全无害**；
-        于是 `ez_train.mid_eval_solver` 里那句 `top_k=0` 一直没人发现。
-        但 vLLM 把 0 当**非法值**直接抛：
-            ValueError: top_k must be -1 (disable), or at least 1, got 0.
-        而它发生在 **rank0 的评测**里 ⇒ rank0 死 ⇒ 其余 7 个 rank 卡在 NCCL
-        集合通信上等到超时 ⇒ **1.4 小时的训练全部报废**。
-
-    所以这里统一做一次"HF 无害写法 → vLLM 合法写法"的翻译，一处封死；
-    返回的字典直接喂 `SamplingParams`。翻译规则与 HF 的语义一一对应：
-        top_k <= 0   → -1（禁用）      （HF: 只有 > 0 才加）
-        top_p         → clamp 到 (0,1] （HF: 只有 < 1.0 才加；1.0 等价于不加）
-        min_p <= 0    → 0.0（禁用）    （HF: 只有 > 0 才加）
-        temperature   → >= 0           （0 表示 greedy）
-        rep. penalty  → > 0
-    """
+    """Map shared rollout sampling settings to valid vLLM arguments."""
     top_k = int(cfg.top_k)
     top_k = top_k if top_k >= 1 else -1
     top_p = float(cfg.top_p)
@@ -218,8 +170,9 @@ class VLLMPolicy(HFPolicy):
                                 ) -> Tuple[List[str], List[List[int]], List[int]]:
         if not prompt_ids_list:
             return [], [], []
-        if cfg.stop_mode not in ("tool_call", "eos"):
-            raise ValueError(f"VLLMPolicy supports stop_mode='tool_call' or 'eos', got {cfg.stop_mode!r}")
+        if cfg.stop_mode not in ("tool_call", "action_tag", "eos"):
+            raise ValueError(
+                f"VLLMPolicy supports stop_mode='tool_call', 'action_tag' or 'eos', got {cfg.stop_mode!r}")
 
         budget = int(cfg.max_context_tokens)
         # ★ 与 HF 版**同一道闸门**：绝不做"截断 prompt 重采样"这种 off-policy 操作。
@@ -247,6 +200,11 @@ class VLLMPolicy(HFPolicy):
             logprobs=None,
             **normalize_sampling(cfg),
         )
+        if cfg.stop_mode == "action_tag":
+            # Match the quick evaluator: stop at the closing action tag and retain it.
+            # vLLM needs text output enabled to match a stop string spanning tokens.
+            base_params.update(stop=["</action>"], include_stop_str_in_output=True)
+            base_params["detokenize"] = True
         sp = ([SamplingParams(**base_params, seed=int(seed)) for seed in request_seeds]
               if request_seeds is not None else SamplingParams(**base_params))
         prompts = [{"prompt_token_ids": [int(t) for t in ids]} for ids in prompt_ids_list]
@@ -259,10 +217,15 @@ class VLLMPolicy(HFPolicy):
         stops: List[int] = []
         for o in outs:
             raw = list(o.outputs[0].token_ids)
-            # Tool-call mode removes any spill after the closing tool call. EOS mode
-            # relies only on the model's EOS stop and retains all returned tokens.
-            stop = (toolcall_stop_len(self.tokenizer, raw, _TC_START_AFTER)
-                    if cfg.stop_mode == "tool_call" else len(raw))
+            # Keep the protocol's complete closing tag in returned text and IDs.
+            if cfg.stop_mode == "tool_call":
+                stop = toolcall_stop_len(self.tokenizer, raw, _TC_START_AFTER)
+            elif cfg.stop_mode == "action_tag":
+                # Native vLLM stop prevents spill generation; this guard trims any
+                # backend-specific suffix while preserving the sampled close-tag IDs.
+                stop = action_tag_stop_len(self.tokenizer, raw)
+            else:
+                stop = len(raw)
             ids = [int(t) for t in raw[:stop] if int(t) != pad_id]
             gen_ids.append(ids)
             stops.append(len(ids))

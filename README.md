@@ -1,85 +1,88 @@
-# ztwang — HPC 工作区
+# 在 SkillRise ReAct 设定下检验 Explorer-Zero
 
-HKUST-GZ HPC **二期 + 三期** 的个人工作区。代码、文档、作业模板统一放在这里。
+本仓库复现 EZ 的交替自博弈训练，其中 solver 训练与评估统一采用 SkillRise 风格 ReAct 协议。训练交替更新 proposer 和 solver adapter，基座模型保持冻结；评估只加载训练得到的 solver adapter。基线是未训练的基座模型。比较时两臂使用同一 valid_seen 全量任务池、提示、动作投影、解码参数和五个评估种子。
 
-> 远程仓库：**https://github.com/ZitongWang018/handover-ustgz**（Private）
-> 集群副本：二期 `~/ztwang/`（有 git remote）、三期 `~/ztwang/`（无外网，靠 SFTP 同步）
-> 协作流程见 `docs/GITHUB.md`
+这里采用 SkillRise 最近一次 quick prompting 实测的 ReAct 设置，不声称复现 SkillRise 全部系统，也不声称达到 Explorer-Zero 原论文的绝对分数。任何提示、tokenizer、数据池或解码协议变化，都需要重新评估基线；旧 quick 数值不能直接沿用。
 
-## ⛔ 两条铁律（先看这个）
+## 共享 solver 设置
 
-1. **只能在 `ztwang/` 里创建和编辑文件**。外部 ckpt / 模型 / 他人目录一律**只读**。
-2. **训练必须存断点，且只保留一个**。不允许堆积 `ckpt-1000`、`ckpt-2000`…
+- 评估使用完整 valid_seen 任务池和种子 0、1、2、3、4；每局最多 30 步。
+- 每轮用原始纯文本提示重新构造输入，不套 chat template；tokenizer 按 `add_special_tokens=True` 编码。
+- 提示展示当前可用动作，排除 `help`；历史只保留最近 15 组已执行动作和环境观测。
+- 模型输出使用 `<action>...</action>` 投影，生成在 `</action>` 处停止并保留闭合标签。
+- 训练和评估统一使用 temperature 0.7、top_p 0.95、max_new_tokens 1024、上下文上限 32768。
+- solver 训练在 ALFWorld train split 和 proposer 生成的任务上使用同一提示、动作与 tokenization 规则。每轮实际提示和生成 token 分开保存，按整条轨迹的 response token 数加权。
 
-详见 `docs/CLUSTER_GUIDE.md` 第 0 节。
+训练配置采用 4 个 outer loops，每轮 proposer 和 solver 各 25 步；GRPO group size 16、每步 1 个任务、solve-rate 采样 8 次。LoRA rank 32，学习率 1e-4，clip epsilon 0.3，KL 系数 0.001，子任务和多样性权重各 0.3。上下文上限 32768，低于 EZ 原设置的 40960，因此这是明确的协议差异。
 
-## 结构
+Proposer 内部使用 JSON、`finish` 和 `sub_finish` 生成可验证任务；这些控制标记不属于 solver 的评估动作协议。
 
-```
-ztwang/
-├── docs/                    集群规范与速查
-│   ├── CLUSTER_GUIDE.md     ★ 使用规范与规则（主文档，必读）
-│   ├── HPC3_GUIDE.md        ★ 三期 ACD (H100) 专项指南
-│   ├── ENVIRONMENT.md       环境事实清单（路径/命令/模型，机器可读）
-│   ├── CLUSTER_SNAPSHOT.md  两集群状态快照与对比
-│   └── GITHUB.md            GitHub 协作与提交流程
-├── tools/                   工具
-│   ├── hpc.py               远程控制脚本（从本机跑远端命令）
-│   ├── check_cluster.sh     一键巡检（自动识别二期/三期）
-│   ├── sync_ztwang.py       本机 → 集群 目录镜像（--host hpc2|hpc3）
-│   ├── push_github.py       建库/推送（token 走环境变量）
-│   ├── gh_cluster_setup.py  二期接 remote + 同步
-│   └── sbatch/              作业模板
-│       ├── gpu_h100x8.sbatch   H100 × 8 整机（三期 acd_u）
-│       ├── gpu_a800x8.sbatch   A800 × 8 整机（二期 8ka 队列）
-│       ├── gpu_a800.sbatch     A800 单卡/多卡
-│       ├── cpu_job.sbatch      CPU 多核
-│       └── test_debug.sbatch   30 秒自检
-├── selfplay/                selfplay 项目工作区
-│   ├── src/                 源码
-│   ├── configs/             实验配置
-│   └── scripts/             启动脚本
-└── logs/                    运行日志（不入库）
-```
+## 运行
 
-## 30 秒上手
+训练需要本地模型目录、ALFWorld 数据目录和 8 张 GPU。配置默认值见 `selfplay/config.yaml`；训练脚本不下载模型或数据。
 
 ```bash
-ssh hpc2        # 二期（A800/A40，可上外网）
-ssh hpc3        # 三期（H100，无外网）
-
-export PATH=/opt/slurm/bin:$PATH    # 仅二期需要
-
-bash ~/ztwang/tools/check_cluster.sh              # 看集群忙不忙
-sbatch --test-only -p acd_u --gres=gpu:8 \
-       --time=1:00:00 --wrap true                 # 预测三期 8 卡起算时间
-sbatch ~/ztwang/tools/sbatch/gpu_h100x8.sbatch    # 提交
-squeue -u xyu608                                  # 看队列
+bash selfplay/scripts/run_train.sh \
+  --base /path/to/local/model \
+  --alfworld-data /path/to/alfworld/data \
+  --backend vllm \
+  --run-id experiment-001
 ```
 
-## 怎么选集群
+继续训练时提供已封存 checkpoint：
 
-| | 二期（hpc2） | 三期 ACD（hpc3） |
-|---|---|---|
-| GPU | A800 80GB / A40 | **H100 80GB** |
-| 可见卡数 | 232 | **328** |
-| 外网 | ✅ | ❌ **完全隔离** |
-| 8 卡等待 | ~26 小时 | **~15 小时** |
-| 最长时限 | 14 天 | 7 天 |
+```bash
+bash selfplay/scripts/run_train.sh \
+  --base /path/to/local/model \
+  --alfworld-data /path/to/alfworld/data \
+  --backend vllm \
+  --run-id experiment-001 \
+  --resume /path/to/repo/selfplay/runs/explorer-zero-experiment-001/ckpt
+```
 
-- **需要 `git clone` / `pip install`** → 二期
-- **环境已备好、纯训练跑量** → 三期（H100 更快，排队更短）
+`--resume` 指向该 run 的封存 `ckpt` 目录；`--run-id` 必须与原训练 run 相同。
 
-## 三条最重要的事
+先为未训练基座准备固定评估合同，再运行完整评估：
 
-1. **只在 `~/ztwang/` 里写文件**，外部 ckpt 只读。
-2. **训练必须存断点且只留一个**（三期 `~/output` 已堆到 406G 是反面教材）。
-3. **8 卡作业**：二期只能提交到 `i64m1tga800u8ka` / `i64m1tga40u8ka`；三期用 `acd_u`。
+```bash
+python selfplay/evaluate.py prepare \
+  --config selfplay/config.yaml \
+  --alfworld-data /path/to/alfworld/data \
+  --base /path/to/local/model \
+  --base-only \
+  --results-dir results/base \
+  --output results/base/contract.json
+bash selfplay/scripts/run_eval.sh results/base/contract.json
+```
 
-详见 `docs/CLUSTER_GUIDE.md`。
+`--alfworld-data` 是 ALFWorld 数据根目录，必须在 `prepare` 时显式提供；合同会固定该路径，评估 rank 启动时按合同恢复。ALFWorld YAML 路径从配置中的 `env.config_path` 解析。
 
-## Self-play: mainline and Explorer-Zero
+对训练 checkpoint 使用相同配置准备另一份合同，将 `--base-only` 换成 `--checkpoint /path/to/checkpoint`，并使用单独的 `--results-dir` 和 `--output`。随后比较两份合并结果：
 
-The ordinary self-play trainer remains the mainline path (`selfplay/src/train_grpo.py`) and keeps its existing DDP/evaluation protocol. Explorer-Zero is a separate alternating proposer/solver implementation (`selfplay/src/ez_train.py`) with global GRPO group sharding and explicit LoRA gradient synchronization. Its base model path must be supplied as `ZTWANG_MODEL_PATH`; do not substitute an instruct checkpoint implicitly.
+```bash
+python selfplay/evaluate.py compare \
+  --baseline results/base/contract.merged.json \
+  --trained results/trained/contract.merged.json \
+  --output results/comparison.json
+```
 
-Read [`docs/EZ_REPAIR_PLAN.md`](docs/EZ_REPAIR_PLAN.md) for the current implementation boundary and acceptance checklist. The hpc2 eight-A800 smoke and formal launch templates are [`selfplay/scripts/ez_smoke_8gpu.sbatch`](selfplay/scripts/ez_smoke_8gpu.sbatch) and [`selfplay/scripts/ez_train_a800x8.sbatch`](selfplay/scripts/ez_train_a800x8.sbatch). EZ valid-unseen adapter and base-control evaluation uses [`selfplay/src/eval_ez.py`](selfplay/src/eval_ez.py); the existing `eval_alfworld.py` remains the mainline evaluator.
+评估合同固定任务池、配置、基座文件、协议源码和软件版本。checkpoint 必须由当前协议训练；协议源码变化后需重新训练或重新评估，不能把旧基线当作匹配对照。
+
+## 训练与评估记录
+
+训练 checkpoint 保存封存配置、proposer task pool、优化器状态、随机数状态、双 adapter 和续训游标。学习率保持常量，没有 scheduler 状态。vLLM 的重启不承诺逐位复现。
+
+本仓库当前没有 GPU 训练或完整五种子评估结果，因此不报告训练提升、绝对分数或吞吐结论。代码路径、设置和命令提供了可复核实验协议；结果需在目标环境实际运行后再填写。
+
+## 目录
+
+```text
+selfplay/train.py                 训练入口
+selfplay/evaluate.py              固定协议的评估与比较入口
+selfplay/config.yaml              训练和评估配置
+selfplay/src/protocol.py          共享提示、tokenization 与动作投影
+selfplay/src/ez_solver.py         生成任务上的 solver rollout
+selfplay/src/ez_proposer.py       可验证任务生成
+selfplay/tests/                   训练、协议和评估测试
+selfplay/vendor/skillrise/        SkillRise 许可与来源说明
+```

@@ -1,192 +1,0 @@
-[alfworld_compat] libdownward.so -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libdownward.so
-[alfworld_compat] shim            -> /hpc2hdd/home/xyu608/ztwang/selfplay/third_party/glibc232/libglibc_single_threaded_shim.so
-/hpc2hdd/home/xyu608/miniconda3/envs/thinktool/lib/python3.10/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s]  1%|          | 2/341 [00:00<00:19, 17.74it/s]  1%|▏         | 5/341 [00:00<00:13, 24.25it/s]  3%|▎         | 9/341 [00:00<00:10, 30.35it/s]  4%|▍         | 13/341 [00:00<00:11, 29.42it/s]  5%|▍         | 16/341 [00:00<00:11, 29.47it/s]  6%|▌         | 19/341 [00:00<00:11, 27.89it/s]  7%|▋         | 23/341 [00:00<00:11, 28.37it/s]  8%|▊         | 27/341 [00:00<00:10, 30.31it/s]  9%|▉         | 31/341 [00:01<00:10, 28.19it/s] 11%|█         | 37/341 [00:01<00:08, 35.68it/s] 12%|█▏        | 41/341 [00:01<00:08, 36.38it/s] 13%|█▎        | 45/341 [00:01<00:08, 35.13it/s] 15%|█▍        | 51/341 [00:01<00:07, 39.63it/s] 19%|█▉        | 65/341 [00:01<00:04, 63.36it/s] 21%|██        | 72/341 [00:01<00:04, 55.67it/s] 24%|██▍       | 81/341 [00:01<00:04, 59.89it/s] 26%|██▌       | 88/341 [00:02<00:04, 55.24it/s] 28%|██▊       | 94/341 [00:02<00:04, 50.63it/s] 29%|██▉       | 100/341 [00:02<00:04, 51.35it/s] 31%|███       | 106/341 [00:02<00:05, 44.80it/s] 33%|███▎      | 111/341 [00:02<00:05, 41.75it/s] 35%|███▌      | 121/341 [00:02<00:04, 52.84it/s] 37%|███▋      | 127/341 [00:02<00:04, 51.61it/s] 39%|███▉      | 133/341 [00:03<00:04, 44.45it/s] 40%|████      | 138/341 [00:03<00:04, 43.35it/s] 46%|████▌     | 157/341 [00:03<00:02, 74.25it/s] 48%|████▊     | 165/341 [00:03<00:02, 61.33it/s] 50%|█████     | 172/341 [00:03<00:02, 57.06it/s] 53%|█████▎    | 181/341 [00:03<00:02, 63.82it/s] 57%|█████▋    | 194/341 [00:03<00:01, 75.45it/s] 62%|██████▏   | 213/341 [00:04<00:01, 101.00it/s] 66%|██████▌   | 224/341 [00:04<00:01, 93.34it/s]  69%|██████▊   | 234/341 [00:04<00:01, 94.65it/s] 73%|███████▎  | 250/341 [00:04<00:00, 109.60it/s] 77%|███████▋  | 262/341 [00:04<00:00, 92.85it/s]  80%|███████▉  | 272/341 [00:04<00:00, 87.18it/s] 83%|████████▎ | 282/341 [00:04<00:00, 82.87it/s] 87%|████████▋ | 297/341 [00:04<00:00, 97.60it/s] 90%|█████████ | 308/341 [00:05<00:00, 90.63it/s] 93%|█████████▎| 318/341 [00:05<00:00, 81.65it/s] 97%|█████████▋| 330/341 [00:05<00:00, 89.53it/s]100%|██████████| 341/341 [00:05<00:00, 63.26it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-INFO 10-14 21:25:21 [importing.py:53] Triton module has been replaced with a placeholder.
-INFO 10-14 21:25:23 [__init__.py:239] Automatically detected platform cuda.
-`torch_dtype` is deprecated! Use `dtype` instead!
-INFO 10-14 21:25:52 [config.py:717] This model supports multiple tasks: {'score', 'classify', 'generate', 'embed', 'reward'}. Defaulting to 'generate'.
-INFO 10-14 21:25:52 [config.py:2003] Chunked prefill is enabled with max_num_batched_tokens=16384.
-WARNING 10-14 21:25:55 [utils.py:2382] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/getting_started/troubleshooting.html#python-multiprocessing for more information. Reason: CUDA is initialized
-/hpc2hdd/home/xyu608/miniconda3/envs/thinktool/lib/python3.10/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
-  import pynvml  # type: ignore[import]
-INFO 10-14 21:26:02 [__init__.py:239] Automatically detected platform cuda.
-INFO 10-14 21:26:06 [core.py:58] Initializing a V1 LLM engine (v0.8.5.post1) with config: model='/hpc2hdd/home/xyu608/thinktool/models/qwen3_4b', speculative_config=None, tokenizer='/hpc2hdd/home/xyu608/thinktool/models/qwen3_4b', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=40960, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='auto', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=42, served_model_name=/hpc2hdd/home/xyu608/thinktool/models/qwen3_4b, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=True, chunked_prefill_enabled=True, use_async_output_proc=True, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"level":3,"custom_ops":["none"],"splitting_ops":["vllm.unified_attention","vllm.unified_attention_with_output"],"use_inductor":true,"compile_sizes":[],"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[512,504,496,488,480,472,464,456,448,440,432,424,416,408,400,392,384,376,368,360,352,344,336,328,320,312,304,296,288,280,272,264,256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1],"max_capture_size":512}
-WARNING 10-14 21:26:11 [utils.py:2522] Methods determine_num_available_blocks,device_config,get_cache_block_size_bytes,initialize_cache not implemented in <vllm.v1.worker.gpu_worker.Worker object at 0x7f29449f5c30>
-INFO 10-14 21:26:12 [parallel_state.py:1004] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
-INFO 10-14 21:26:12 [cuda.py:221] Using Flash Attention backend on V1 engine.
-INFO 10-14 21:26:12 [topk_topp_sampler.py:59] Using FlashInfer for top-p & top-k sampling.
-INFO 10-14 21:26:12 [gpu_model_runner.py:1329] Starting to load model /hpc2hdd/home/xyu608/thinktool/models/qwen3_4b...
-Loading safetensors checkpoint shards:   0% Completed | 0/3 [00:00<?, ?it/s]
-Loading safetensors checkpoint shards:  33% Completed | 1/3 [00:12<00:24, 12.32s/it]
-Loading safetensors checkpoint shards:  67% Completed | 2/3 [00:12<00:05,  5.37s/it]
-Loading safetensors checkpoint shards: 100% Completed | 3/3 [00:24<00:00,  8.47s/it]
-Loading safetensors checkpoint shards: 100% Completed | 3/3 [00:24<00:00,  8.33s/it]
-
-INFO 10-14 21:26:39 [loader.py:458] Loading weights took 25.09 seconds
-INFO 10-14 21:26:39 [punica_selector.py:18] Using PunicaWrapperGPU.
-INFO 10-14 21:26:39 [gpu_model_runner.py:1347] Model loading took 7.8080 GiB and 26.597420 seconds
-INFO 10-14 21:27:17 [backends.py:420] Using cache directory: /hpc2hdd/home/xyu608/.cache/vllm/torch_compile_cache/bb4d846e16/rank_0_0 for vLLM's torch.compile
-INFO 10-14 21:27:17 [backends.py:430] Dynamo bytecode transform time: 36.39 s
-INFO 10-14 21:27:32 [backends.py:118] Directly load the compiled graph(s) for shape None from the cache, took 13.882 s
-INFO 10-14 21:27:41 [monitor.py:33] torch.compile takes 36.39 s in total
-INFO 10-14 21:27:42 [kv_cache_utils.py:634] GPU KV cache size: 420,064 tokens
-INFO 10-14 21:27:42 [kv_cache_utils.py:637] Maximum concurrency for 40,960 tokens per request: 10.26x
-INFO 10-14 21:28:32 [gpu_model_runner.py:1686] Graph capturing finished in 49 secs, took 0.84 GiB
-INFO 10-14 21:28:32 [core.py:159] init engine (profile, create kv cache, warmup model) took 112.24 seconds
-INFO 10-14 21:28:32 [core_client.py:439] Core engine process 0 ready.
-[eval-ez] backend=vllm 实际采样参数={'temperature': 1.0, 'top_p': 0.95, 'top_k': -1, 'min_p': 0.0, 'repetition_penalty': 1.05}
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s]  6%|▌         | 19/341 [00:00<00:01, 176.31it/s] 11%|█         | 37/341 [00:00<00:02, 150.08it/s] 20%|█▉        | 67/341 [00:00<00:01, 209.88it/s] 26%|██▌       | 89/341 [00:00<00:01, 179.83it/s] 32%|███▏      | 109/341 [00:00<00:01, 175.42it/s] 40%|████      | 137/341 [00:00<00:00, 204.76it/s] 48%|████▊     | 163/341 [00:00<00:00, 209.12it/s] 54%|█████▍    | 185/341 [00:01<00:00, 168.93it/s] 68%|██████▊   | 233/341 [00:01<00:00, 243.70it/s] 77%|███████▋  | 261/341 [00:01<00:00, 238.43it/s] 84%|████████▍ | 287/341 [00:01<00:00, 190.35it/s] 92%|█████████▏| 313/341 [00:01<00:00, 200.44it/s]100%|██████████| 341/341 [00:01<00:00, 206.40it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-3:
-[eval-ez] 2/68 samples
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 40%|████      | 137/341 [00:00<00:00, 1365.04it/s] 92%|█████████▏| 314/341 [00:00<00:00, 1598.89it/s]100%|██████████| 341/341 [00:00<00:00, 1630.91it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 143/341 [00:00<00:00, 1428.56it/s] 97%|█████████▋| 330/341 [00:00<00:00, 1683.59it/s]100%|██████████| 341/341 [00:00<00:00, 1689.18it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 143/341 [00:00<00:00, 1427.27it/s] 84%|████████▍ | 286/341 [00:00<00:00, 491.80it/s] 100%|██████████| 341/341 [00:00<00:00, 626.61it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1565.13it/s]100%|██████████| 341/341 [00:00<00:00, 1728.64it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1567.77it/s]100%|██████████| 341/341 [00:00<00:00, 1729.93it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 142/341 [00:00<00:00, 1408.79it/s]100%|██████████| 341/341 [00:00<00:00, 1698.86it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 142/341 [00:00<00:00, 1414.64it/s] 93%|█████████▎| 317/341 [00:00<00:00, 516.77it/s] 100%|██████████| 341/341 [00:00<00:00, 600.24it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1550.93it/s]100%|██████████| 341/341 [00:00<00:00, 1722.69it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1544.21it/s] 97%|█████████▋| 330/341 [00:00<00:00, 1650.85it/s]100%|██████████| 341/341 [00:00<00:00, 1678.24it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-21:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1545.45it/s]100%|██████████| 341/341 [00:00<00:00, 1712.94it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1568.04it/s]100%|██████████| 341/341 [00:00<00:00, 1726.42it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 143/341 [00:00<00:00, 1415.36it/s] 84%|████████▎ | 285/341 [00:00<00:00, 438.89it/s] 100%|██████████| 341/341 [00:00<00:00, 566.11it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▋     | 158/341 [00:00<00:00, 1578.86it/s]100%|██████████| 341/341 [00:00<00:00, 1749.72it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 142/341 [00:00<00:00, 1415.11it/s] 97%|█████████▋| 330/341 [00:00<00:00, 1687.84it/s]100%|██████████| 341/341 [00:00<00:00, 1690.25it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-31:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1555.32it/s]100%|██████████| 341/341 [00:00<00:00, 1717.54it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-33:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 142/341 [00:00<00:00, 1408.65it/s] 96%|█████████▋| 329/341 [00:00<00:00, 1677.81it/s]100%|██████████| 341/341 [00:00<00:00, 1676.95it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 10%|▉         | 34/341 [00:00<00:03, 88.04it/s] 60%|█████▉    | 203/341 [00:00<00:00, 518.82it/s]100%|██████████| 341/341 [00:00<00:00, 612.34it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-37:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1569.70it/s]100%|██████████| 341/341 [00:00<00:00, 1738.40it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 143/341 [00:00<00:00, 1421.63it/s] 96%|█████████▋| 329/341 [00:00<00:00, 1669.33it/s]100%|██████████| 341/341 [00:00<00:00, 1671.63it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-41:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1545.97it/s]100%|██████████| 341/341 [00:00<00:00, 1704.97it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 19%|█▉        | 66/341 [00:00<00:00, 653.73it/s] 39%|███▊      | 132/341 [00:00<00:00, 245.27it/s] 92%|█████████▏| 315/341 [00:00<00:00, 621.82it/s]100%|██████████| 341/341 [00:00<00:00, 572.75it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1553.24it/s]100%|██████████| 341/341 [00:00<00:00, 1721.56it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 143/341 [00:00<00:00, 1422.93it/s]100%|██████████| 341/341 [00:00<00:00, 1700.63it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▋     | 158/341 [00:00<00:00, 1560.40it/s]100%|██████████| 341/341 [00:00<00:00, 1743.50it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-[eval-ez] 50/68 samples
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▋     | 158/341 [00:00<00:00, 1562.90it/s] 92%|█████████▏| 315/341 [00:00<00:00, 575.05it/s] 100%|██████████| 341/341 [00:00<00:00, 677.94it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1555.02it/s]100%|██████████| 341/341 [00:00<00:00, 1715.11it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1566.02it/s]100%|██████████| 341/341 [00:00<00:00, 1729.51it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-57:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1555.07it/s]100%|██████████| 341/341 [00:00<00:00, 1714.40it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1562.61it/s]100%|██████████| 341/341 [00:00<00:00, 1718.91it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 42%|████▏     | 142/341 [00:00<00:00, 1406.14it/s] 83%|████████▎ | 283/341 [00:00<00:00, 505.69it/s] 100%|██████████| 341/341 [00:00<00:00, 647.31it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-63:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1569.28it/s]100%|██████████| 341/341 [00:00<00:00, 1728.71it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-65:
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1557.50it/s]100%|██████████| 341/341 [00:00<00:00, 1709.13it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Initializing AlfredTWEnv...
-  0%|          | 0/341 [00:00<?, ?it/s] 46%|████▌     | 157/341 [00:00<00:00, 1551.62it/s]100%|██████████| 341/341 [00:00<00:00, 1709.36it/s]
-Overall we have 134 games in split=eval_out_of_distribution
-Evaluating with 134 games
-Process Process-69:
-[eval-ez] episode-weighted SR=0.2794; per-sample whole-suite SR=[0.17647058823529413, 0.29411764705882354, 0.35294117647058826, 0.29411764705882354] population SD=0.0641; wrote eval_out/full_paper-approx-base-only-job13044670/shard_01.json
-[rank0]:[W1014 21:35:22.856253595 ProcessGroupNCCL.cpp:1496] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

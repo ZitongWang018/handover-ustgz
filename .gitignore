@@ -52,7 +52,3 @@ env/
 Thumbs.db
 *~
 *.swp
-# handover 包里的日志与 tar 是**交付物本体**（供外部模型审核），不受上面的通用忽略规则影响
-!handover/**/logs/
-!handover/**/logs/**
-!handover/**/*.tar.gz

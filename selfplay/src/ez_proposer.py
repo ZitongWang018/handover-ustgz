@@ -40,10 +40,9 @@ class ProposerConfig:
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.05
-    max_context_tokens: int = 40960  # Table 3 context length
-    keep_recent_turns: int = 40     # 补全: 40960 token 大约能留 40 轮
+    max_context_tokens: int = 32768
+    keep_recent_turns: int = 15
     give_admissible: bool = False   # U3 决策点：默认不给 admissible_commands
-    invalid_action_mode: str = "raw" # EZ 默认执行模型原始动作，不做模糊纠正
     finish_nudge: bool = True
     generation_max_batch_size: int = 2
     seed: Optional[int] = None
@@ -114,9 +113,6 @@ def _repair_json(obj_text: str):
     修复手法：扫描一遍算括号欠账（**跳过字符串字面量内部的括号**，并处理 `\\` 转义），
     然后补上缺的 `]` / `}`；若扫描结束时仍在字符串里，先补一个 `"`。
     """
-    import os
-    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
-        return None
     t = obj_text.strip()
     try:
         return json.loads(t)
@@ -175,7 +171,6 @@ def _action_type_of(args: dict) -> str:
     即模型**语义正确**，只是把动作类型放进了 `name` / `action` 字段。
     所以这里按 `action_type → name → action → tool → command` 依次取，并做别名归一。
     """
-    import os
     raw = ""
     for k in ("action_type", "action", "name", "tool", "command", "task"):
         v = args.get(k)
@@ -185,8 +180,6 @@ def _action_type_of(args: dict) -> str:
     if not raw:
         return ""
     at = raw.lower()
-    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
-        return at
     at = _ACTION_ALIASES.get(at, at.replace(" ", "_").replace("-", "_"))
     return at
 
@@ -198,11 +191,7 @@ def _scan_truncated_call(obj_src: str):
       * "只差最后一个 `}`" —— 实测占 malformed 的 **2.5%**
       * 被 `max_new_tokens` 截断的一批（"JSON 非法/截断" 11.8% 里的一部分）
     会被整条丢掉。这里把没闭合的那段整块交给 `_repair_json` 补括号。
-    `EZ_PARSER_STRICT=1` 时直接返回 None（保持原始行为）。
     """
-    import os
-    if os.environ.get("EZ_PARSER_STRICT", "0") == "1":
-        return None
     n = len(obj_src)
     i = 0
     while True:
@@ -296,24 +285,14 @@ def parse_tool_call(text: str) -> ParsedToolCall:
     return ParsedToolCall(kind="action", action=action, raw=obj_text, end_idx=end_idx)
 
 
-def sanitize_explore_action(action: str, admissible: Sequence[str],
-                            mode: str = "best_match") -> Tuple[str, bool]:
-    """探索动作送给环境前的清洗。
-
-    与 solver 的 `invalid_action_mode=raw` 不同：proposer 是出题人，动作失败只会
-    浪费探索预算，所以默认 best_match 模糊对齐（论文未规定，复现决策点）。
-    """
+def sanitize_explore_action(action: str, admissible: Sequence[str]) -> Tuple[str, bool]:
+    """Keep proposer actions raw; only report exact legal-action matches."""
     if not admissible:
         return action, True
     low = action.strip().lower()
-    for a in admissible:
-        if a.strip().lower() == low:
-            return a.strip(), True
-    if mode == "best_match":
-        from prompts import match_admissible
-        hit = match_admissible(action, admissible, fuzzy_threshold=0.6)
-        if hit:
-            return hit, True
+    for candidate in admissible:
+        if candidate.strip().lower() == low:
+            return candidate.strip(), True
     return action.strip(), False
 
 
@@ -463,11 +442,7 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
             token_buffers[s].extend(gen_ids[k])
             token_masks[s].extend([1] * len(gen_ids[k]))
             stats[s]["turns"] += 1
-            # ★ 工具调用之后还有多余内容？说明"一轮一动作"没被停止条件拦住。
-            #   这里**只统计不裁剪**：build_token_sequence 要求 assistant 段用模型真实
-            #   生成的 token id（见其 docstring：重新 tokenize 会引入 1 token 偏差、
-            #   污染训练目标），事后裁文本会让 gen_ids 与消息长度失配。
-            #   真正的拦截点放在 rollout._ToolCallStopCriteria（停在第一个完整动作对象）。
+            # Keep sampled token IDs intact for the proposer loss.
             if parsed.end_idx > 0 and parsed.end_idx < len(texts[k].rstrip()):
                 stats[s]["extra"] = stats[s].get("extra", 0) + 1
 
@@ -477,8 +452,7 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
             elif parsed.kind in ("declare", "sub_finish", "finish"):
                 todo.append((s, parsed, ""))
             else:
-                executed, exact = sanitize_explore_action(parsed.action, admissible[s],
-                                                          mode=cfg.invalid_action_mode)
+                executed, exact = sanitize_explore_action(parsed.action, admissible[s])
                 if not exact:
                     stats[s]["inv"] += 1
                 action_bufs[s].append(executed)
