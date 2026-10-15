@@ -1,5 +1,7 @@
 # 在 SkillRise ReAct 设定下检验 Explorer-Zero
 
+服务器执行代理（包括 DeepSeek）必须先读 [AGENTS.md](AGENTS.md)：仅在已确认的 `ztwang` 目录内执行明确批准的任务，默认不得修改实现；问题通过独立 GitHub 反馈分支完整交接。
+
 本仓库复现 EZ 的交替自博弈训练，其中 solver 训练与评估统一采用 SkillRise 风格 ReAct 协议。训练交替更新 proposer 和 solver adapter，基座模型保持冻结；评估只加载训练得到的 solver adapter。基线是未训练的基座模型。比较时两臂使用同一 valid_seen 全量任务池、提示、动作投影、解码参数和五个评估种子。
 
 这里采用 SkillRise 最近一次 quick prompting 实测的 ReAct 设置，不声称复现 SkillRise 全部系统，也不声称达到 Explorer-Zero 原论文的绝对分数。任何提示、tokenizer、数据池或解码协议变化，都需要重新评估基线；旧 quick 数值不能直接沿用。
