@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "status": "planning_matrix_not_a_run_manifest",
+  "paper": {
+    "title": "Explorer-Zero: Improving Self-Play for Long-Horizon Tasks with Decomposable Verifiable Rewards",
+    "arxiv": null,
+    "public_identifier": "Not verified in this audit; identify the paper by its audited local PDF hash and title.",
+    "pdf_sha256": "05e75e1cea1bca2c408764297595099964d97da08ee49924f9b38004a221fad1",
+    "local_extraction": "paper_verified_20261015.txt",
+    "under_review_notice": "ICLR 2027 under review in the locally audited paper copy"
+  },
+  "source_code": {
+    "repository": "Within-yao/SkillRise",
+    "commit": "2b38da3ad7b64414305d39609484803b07d3b9b0",
+    "active_validation_path": "agent_system/multi_turn_rollout/__init__.py exports TrajectoryCollector from skillrise_rollout_loop.py",
+    "source_snapshot": "skillrise/upstream/SOURCE_MANIFEST.json",
+    "remote_status": "The handover repository was fetched through local HEAD 72f07f93a6d54a321844d131f96e5bfa2be0c194. The vendored upstream source is pinned to 2b38da3ad7b64414305d39609484803b07d3b9b0 and was not refreshed from GitHub during this task. No target-server check was performed."
+  },
+  "paper_explicit": [
+    {
+      "topic": "main_evaluation",
+      "statement": "Explorer-Zero evaluates ALFWorld on the unseen validation split using benchmark task success; Section 4.1 says table metrics are means and standard deviations over four sampled evaluations per task.",
+      "reference": "Section 4.1, paper PDF p.6",
+      "value": {
+        "split": "valid_unseen",
+        "samples_per_task": 4,
+        "success_rule": "benchmark task success"
+      },
+      "limits": [
+        "The exact local task-file list, order, hash, and runtime count are not provided by this statement.",
+        "The paper does not identify whether the reported standard deviation uses ddof=0 or ddof=1."
+      ]
+    },
+    {
+      "topic": "table_1_al_fworld",
+      "statement": "Explorer-Zero Table 1 reports ALFWorld Qwen3-4B Baseline n=0 as 17.14±5.7 and Ours as 85.07±1.6.",
+      "reference": "Table 1, paper PDF p.7",
+      "limits": ["Keep the paper's displayed values; do not infer unique sampling parameters or recompute its aggregation from rounded values."]
+    },
+    {
+      "topic": "table_2_ablation",
+      "statement": "The ALFWorld valid-seen ablation reports one-shot proposer 59.29±9.4, interactive proposer 65.71±2.3, and +subtask 84.29±1.5.",
+      "reference": "Table 2 and caption, paper PDF p.7",
+      "limits": ["This is a trained self-play ablation, not the Table 1 zero-shot baseline or the SkillRise ReAct diagnostic."]
+    },
+    {
+      "topic": "proposer_reward_and_filter",
+      "statement": "Eq.1 assigns valid proposals R_difficulty + w_sub K + w_div |A| and invalid proposals reward 0. Rule-based validity filtering controls whether an example enters the solver training pool; rejected proposals are not solver examples.",
+      "reference": "Sections 3.1–3.2, paper PDF pp.4–6",
+      "implementation_implication": "Invalid proposals remain zero-reward entries in the proposer reward group. Do not remove them from proposer GRPO normalization. Test that zero-reward invalid samples cannot gain a positive reward-relative advantage when all valid rewards are nonnegative; preserve valid samples with negative advantages."
+    },
+    {
+      "topic": "solver_reward",
+      "statement": "Eq.5 gives final-state match reward 1/0; Eq.6 averages whether each reference subgoal was reached in any visited solver state and is set to zero when K=0; Eq.7 gives reward 1 for final success and otherwise the subgoal fraction.",
+      "reference": "Section 3.2, paper PDF pp.5–6",
+      "implementation_implication": "w_sub=0.3 is the proposer Eq.3 coefficient for subtask count. It is not an extra multiplier on the solver's Eq.7 subgoal fraction."
+    },
+    {
+      "topic": "training_hyperparameters",
+      "statement": "For ALFWorld/ScienceWorld: four outer loops; 25 proposer and 25 solver steps per loop; proposer exploration budget 30 turns; max solver turns 30; context length 40,960; GRPO group size 16; G_P=8 solver rollouts per proposed task; 16 rollouts per training step; batch size 16; LoRA r=32, alpha=32; AdamW lr 1e-4; clip 0.3; KL 0.001; w_sub=0.3; w_div=0.3; 8×H100.",
+      "reference": "Appendix D / Table 3, paper PDF p.15",
+      "limits": [
+        "The precise runtime meaning of batch size 16 and gradient accumulation is not fully operationalized in the table.",
+        "The table does not uniquely fix training temperature, max generated tokens, decode stop semantics, or all RNG details.",
+        "8×A800 is not performance-equivalent to 8×H100 by assertion."
+      ]
+    },
+    {
+      "topic": "solver_prompt",
+      "statement": "Figure 14 shows an empty think-tag prefix and JSON alfworld_tool calls inside tool_call tags; the user message contains '# Example Omitted'.",
+      "reference": "Appendix G, Figure 14, paper PDF p.24",
+      "limits": [
+        "The omitted example's content is unknown.",
+        "Do not infer a hidden one-shot demonstration or assert that a hand-written example is equivalent to n=0."
+      ]
+    }
+  ],
+  "code_verifiable_or_handover_observed": [
+    {
+      "topic": "skillrise_validation_dispatch",
+      "statement": "The pinned SkillRise package exports the specialized skillrise_rollout_loop TrajectoryCollector; the generic rollout_loop source is not the selected active path.",
+      "source": "skillrise/upstream/SOURCE_MANIFEST.json and vendored dispatcher/rollout files"
+    },
+    {
+      "topic": "skillrise_raw_integrity",
+      "statement": "Both archived styles contain seeds 0–4 × 128 game rows; each seed's game-file multiset matches selection_128.json. The selection has 91 unique games, 31 repeated games, maximum multiplicity 3.",
+      "source": "handover/skillrise_prompting_20261015/raw/*.json; SHA256 values are in audit_current_evidence.json"
+    },
+    {
+      "topic": "skillrise_measurements",
+      "statement": "ReAct is 195/640 (30.46875%) episode-weighted and zero-shot is 125/640 (19.53125%). The archived six-type macro seed mean±sample SD (ddof=1) is 30.7570±2.5676 and 20.2696±3.8791 respectively. These are SkillRise valid-seen custom quick diagnostics, not EZ results.",
+      "source": "audit_current_evidence.json"
+    },
+    {
+      "topic": "archived_training_line_evidence",
+      "statement": "Four JSONL files are classified by line categories only. Three contain explicit dry-run configuration and a one-outer completion marker; 1013-0320 lacks a completion marker in the archived snapshot and includes a TPS auto-adjustment warning plus three zero-mean solver-reward lines.",
+      "source": "handover/skillrise_prompting_20261015/ez_training_evidence/*.jsonl and audit_current_evidence.json",
+      "limits": ["This does not identify the user's intended complete run or prove all non-logged execution state."]
+    },
+    {
+      "topic": "checkpoint_error_candidate",
+      "statement": "Local Git commit c3a83e026cfea8f41505fc4ff47dbd249ed9ae46 records job 13026569 failing in outer-0 mid-eval because vLLM rejected top_k=0. Its parent source saved checkpoints before the eval branch; current source also calls ez_save before mid_eval. Thus the eval error alone does not show training state was lost. Historical output root was $HOME/jhspoolers/ez_runs; ckpt-outer0-S24 is a search candidate, not a verified file.",
+      "references": [
+        "Git commit c3a83e026cfea8f41505fc4ff47dbd249ed9ae46 and its parent ez_train.py",
+        "docs/EZ_VLLM_ACCEL_PLAN.md",
+        "selfplay/src/ez_train.py current save-before-mid_eval order"
+      ],
+      "status": "not checked on server; run-directory mapping and file existence unknown"
+    }
+  ],
+  "not_disclosed_or_not_proven": [
+    "Complete Figure 14 prompt content and the omitted example",
+    "Whether every baseline run receives admissible actions/menu and exact parser/action fallback behavior",
+    "Exact full valid_unseen task IDs, filesystem order, per-file hashes, and task count in this install",
+    "Temperature, top-p, per-request seed policy, max generated tokens, exact stop/EOS semantics, backend implementation, and tokenizer/model checkpoint file hashes",
+    "Whether paper sample SD is population or sample SD, and the exact per-task-to-suite aggregation implementation",
+    "Exact gradient accumulation/meaning of Table 3 batch size 16 and all environment reward/runtime edge cases",
+    "Whether the local qwen3_4b checkpoint bytes correspond to the paper's Qwen3-4B; no model replacement is authorized by score or directory alias"
+  ],
+  "our_protocol_choices": {
+    "main_eval": {
+      "label": "paper-approx",
+      "split": "discover and hash actual valid_unseen pool; 134 is an expected count to verify, not hard-coded truth",
+      "model": "the already-present explicit qwen3_4b local path; audit metadata and weight inventory, do not auto-replace",
+      "prompt": "paper Figure 14 JSON tool-call/empty-think scaffold with no human demonstrations; full example remains unknown",
+      "turn_budget": {
+        "value": 30,
+        "status": "our paper-approx choice borrowed from the Table 3 training solver cap; the paper does not fully specify final evaluation turn budget"
+      },
+      "samples": 4,
+      "success": "official environment won",
+      "statistics": "four complete suite SRs, mean plus both ddof=0 and ddof=1 SD; no pass@4 and no macro substitution for the primary metric",
+      "prior_exposure": "valid_unseen has been used by historical mid-eval subsets; it is not a pristine never-seen test for this project"
+    },
+    "training": {
+      "global_group_semantics": "global G=16 is one group; with 8 ranks shard 2 trajectories/rank. TPS remains 1; never increase it to world size as an implicit fallback.",
+      "solve_rate_rollouts": "G_P=8 per proposed task",
+      "verifier_acceptance": [
+        "exact initial-state reset checks",
+        "typed entity matching ignores instance suffix only while preserving cross-fact entity binding",
+        "final-state success, partial subgoal fraction, K=0 and no-finish/rejected-task branches",
+        "visited-state matching and conservative task-relevance/object-mention filters with counterexamples"
+      ],
+      "learning_signal": "Record group rewards/advantages, finite policy-gradient and KL components separately, active-adapter parameter delta and cross-rank equality. Equal group rewards imply zero reward-normalized policy-gradient advantage, but a nonzero KL gradient can remain if policy differs from reference.",
+      "invalid_proposer": "Zero reward stays in proposer GRPO group; validity filter excludes rejected proposal from solver pool. No winner-only data selection."
+    },
+    "checkpoint_classification": ["evaluatable_only", "continuable", "not_verified"],
+    "performance": "Measure same-budget valid trajectories/sec, GPU-hours, generation/environment/backward/sync/update durations, CPU-worker peak and LoRA refresh. Do not predict speedup; Table 3 per-step estimates imply about 19.4 node-hours by direct multiplication while Appendix D says roughly 15, and A800 differs from H100.",
+    "execution": "Plans and audit tools only; no automatic job submission, installation, download, training, or evaluation."
+  }
+}

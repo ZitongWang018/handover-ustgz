@@ -1,3 +1,5 @@
+> **历史计划提示（2026-10-15）**：本文保留 2026-10-12 的原始评估，不代表当前审计结论；其中“可以复现”、运行成本和基础设施就绪等断言未经本轮验证。旧 smoke 通过不证明训练信号有效或论文结果已复现。当前复现边界、证据审计和分阶段验收见[新计划](../handover/explorer_zero_repro_plan_20261015/README.md)。
+
 # Explorer-Zero 复现评估与计划
 
 > 论文：*Explorer-Zero: Improving Self-Play for Long-Horizon Tasks with Decomposable Verifiable Rewards*（ICLR 2027 在审，用户提供 PDF，29 页含附录）
