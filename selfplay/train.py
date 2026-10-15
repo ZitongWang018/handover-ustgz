@@ -38,6 +38,7 @@ SOURCE_PATHS = (
     "selfplay/alfworld.yaml",
     "selfplay/scripts/run_train.sh",
     "selfplay/src/checkpoint.py",
+    "selfplay/src/training_contract.py",
     "selfplay/src/ez_train.py",
     "selfplay/src/grpo.py",
     "selfplay/src/grpo_norm.py",
@@ -255,7 +256,8 @@ def _validate_solver_sampling(solver_cfg: dict[str, Any]) -> None:
 
 
 def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Path,
-                              backend: str, world_size: int, *, smoke: bool = False
+                              backend: str, world_size: int, *, baseline_contract_path: Path,
+                              smoke: bool = False
                               ) -> tuple[dict[str, Any], dict[str, Any]]:
     cfg = _load_config(config_path)
     if cfg.get("protocol_version") != 3 or cfg.get("protocol_name") != "explorer_zero_skillrise":
@@ -268,13 +270,42 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
         raise ContractError("--base must be an existing local model directory with config.json")
     if not data.is_dir():
         raise ContractError("--alfworld-data must be an existing local data directory")
-    if isinstance(world_size, bool) or world_size != int(cfg.get("runtime", {}).get("world_size", -1)):
-        raise ContractError("requested world size differs from explicit runtime.world_size")
+    if isinstance(world_size, bool) or world_size < 1:
+        raise ContractError("world size must be a positive integer")
+    if not smoke and world_size != 8:
+        raise ContractError("formal Explorer-Zero training requires the paper's 8-GPU world")
+    if not smoke and world_size != int(cfg.get("runtime", {}).get("world_size", -1)):
+        raise ContractError("formal world size differs from the frozen training config")
+    if int(cfg.get("runtime", {}).get("world_size", -1)) != 8:
+        raise ContractError("frozen training config must declare the paper's 8-GPU world")
+    if 16 % world_size:
+        raise ContractError("world size must evenly shard the global GRPO group of 16")
     _check_environment(cfg, base, data, backend, world_size)
+    expected_train = {
+        "outer_loops": 4, "proposer_steps": 25, "solver_steps": 25,
+        "group_size": 16, "tasks_per_step": 1, "solve_rate_rollouts": 8,
+        "lr": 1e-4, "clip_eps": 0.3, "kl_beta": 0.001,
+        "w_sub": 0.3, "w_div": 0.3,
+    }
+    for key, wanted in expected_train.items():
+        if cfg.get("train", {}).get(key) != wanted:
+            raise ContractError(f"paper-aligned training requires train.{key}={wanted!r}")
+    if cfg.get("model", {}).get("lora_r") != 32 or cfg.get("model", {}).get("lora_alpha") != 32:
+        raise ContractError("paper-aligned training requires LoRA rank=32 and alpha=32")
+    if cfg.get("solver", {}).get("max_turns") != 30 or cfg.get("proposer", {}).get("max_turns") != 30:
+        raise ContractError("ALFWorld Table 3 requires 30 proposer and solver turns")
+    if cfg.get("proposer", {}).get("max_context_tokens") != 32768:
+        raise ContractError("frozen config proposer context must be the legacy 32768-token value")
+    if int(cfg.get("runtime", {}).get("vllm", {}).get("max_model_len", -1)) != 32768:
+        raise ContractError("frozen config vLLM max_model_len must be 32768 before training override")
     cfg.setdefault("model", {})["path"] = str(base)
     cfg.setdefault("env", {})["data_root"] = str(data)
     cfg["runtime"]["backend"] = backend
     cfg["runtime"]["world_size"] = int(world_size)
+    # Paper Table 3 uses 40,960 context. Keep the shared ReAct solver context
+    # at 32,768 and widen only the training proposer / generation engine.
+    cfg["proposer"]["max_context_tokens"] = 40960
+    cfg["runtime"].setdefault("vllm", {})["max_model_len"] = 40960
     if smoke:
         cfg["train"]["outer_loops"] = 1
         cfg["train"]["proposer_steps"] = 1
@@ -289,8 +320,8 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
     if solver_cfg.get("keep_recent_turns") != 15 or solver_cfg.get("max_turns") != 30:
         raise ContractError("solver must use the shared 15-turn history and 30-turn budget")
     _validate_solver_sampling(solver_cfg)
-    if cfg["proposer"].get("max_context_tokens") != 32768:
-        raise ContractError("proposer must use the shared 32768-token context")
+    if cfg["proposer"].get("max_context_tokens") != 40960:
+        raise ContractError("training proposer must use the paper's 40960-token context")
     if cfg["proposer"].get("max_new_tokens", 0) < 1 or cfg["solver"].get("max_new_tokens", 0) < 1:
         raise ContractError("generation limits must be explicit positive integers")
     if cfg["train"].get("group_size") != 16 or cfg["train"].get("tasks_per_step") != 1 \
@@ -298,8 +329,10 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
         raise ContractError("shared setting requires global G=16, TPS=1, GP=8")
     vllm_cfg = cfg["runtime"].get("vllm", {})
     if backend == "vllm":
-        if int(vllm_cfg.get("max_model_len", -1)) != int(cfg["solver"]["max_context_tokens"]):
-            raise ContractError("vLLM max_model_len must cover proposer and solver context limits")
+        if int(vllm_cfg.get("max_model_len", -1)) != max(
+                int(cfg["proposer"]["max_context_tokens"]),
+                int(cfg["solver"]["max_context_tokens"])):
+            raise ContractError("vLLM max_model_len must cover the 40960 proposer context")
         if int(vllm_cfg.get("max_lora_rank", -1)) < int(cfg["model"]["lora_r"]):
             raise ContractError("vLLM max_lora_rank must cover the configured adapter rank")
         if isinstance(vllm_cfg.get("seed"), bool) or not isinstance(vllm_cfg.get("seed"), int) or vllm_cfg["seed"] < 0:
@@ -310,12 +343,26 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
     compat = _resolve_compat()
     pool = _pool_manifest(data, env_config, str(cfg["env"]["split"]))
     base_files = base_file_inventory(base)
+    try:
+        from training_contract import validate_baseline_contract
+        baseline_binding = validate_baseline_contract(
+            baseline_contract_path, config_path=config_path.resolve(),
+            base_inventory=base_files, data_root=data,
+            solver_config=cfg["solver"])
+    except (ValueError, OSError) as exc:
+        raise ContractError(f"baseline contract validation failed: {exc}") from None
     tokenizer_files = {name: record for name, record in base_files.items()
                        if Path(name).name in TOKENIZER_BASENAMES
                        or Path(name).name in {"config.json", "generation_config.json"}}
     if not any(Path(name).name in TOKENIZER_BASENAMES for name in tokenizer_files):
         raise ContractError("local base has no recognizable tokenizer files")
     model_config = _json_load(base / "config.json")
+    max_positions = model_config.get("max_position_embeddings")
+    rope_scaling = model_config.get("rope_scaling")
+    if (isinstance(max_positions, int) and not isinstance(max_positions, bool)
+            and max_positions < 40960 and not (isinstance(rope_scaling, dict) and rope_scaling)):
+        raise ContractError(
+            "base model declares fewer than 40960 positions without an explicit rope_scaling config")
     gen_config_path = base / "generation_config.json"
     gen_config = _json_load(gen_config_path) if gen_config_path.is_file() else None
     versions = _package_versions()
@@ -333,6 +380,15 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
         "comparison_scope": "local Explorer-Zero method under the shared solver and evaluation protocol",
         "checkpoint_eligibility": "smoke_only" if smoke else "formal_training",
         "resolved_config": config_resolved,
+        "baseline_binding": baseline_binding,
+        "effective_overrides": {
+            "proposer.max_context_tokens": {
+                "value": 40960, "source": "Explorer-Zero paper Table 3; proposer training only"},
+            "runtime.vllm.max_model_len": {
+                "value": 40960, "source": "covers paper proposer context; solver remains 32768"},
+            "runtime.world_size": {
+                "value": int(world_size), "source": "formal=8 paper GPUs; smoke may use a legal shard count"},
+        },
         "identity": {
             "base_path": str(base),
             "base_inventory_sha256": _sha_obj(base_files),
@@ -345,6 +401,9 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
                 "generation_config": gen_config,
                 "weights_verified_by_content_hash": True,
                 "model_semantics_verified_by_hash": False,
+                "base_identity_scope": "local checkpoint bytes; official model origin is unverified",
+                "max_position_embeddings": max_positions,
+                "rope_scaling": rope_scaling,
             },
             "tokenizer_inventory_sha256": _sha_obj(tokenizer_files),
             "tokenizer_file_inventory": tokenizer_files,
@@ -418,7 +477,8 @@ def _dist_preflight(manifest: dict[str, Any], run_dir: Path, run_id: str,
             # CPU/Gloo is useful for preflight and checkpoint-contract tests; the
             # actual EZ model loader still requires the configured model device.
             pg_backend = "gloo"
-        dist.init_process_group(backend=pg_backend, rank=rank, world_size=world)
+        dist.init_process_group(backend=pg_backend, rank=rank, world_size=world,
+                                timeout=_dt.timedelta(minutes=30))
     signatures: list[Any] = [None] * world
     if world > 1:
         dist.all_gather_object(signatures, manifest["contract_sha256"])
@@ -514,7 +574,8 @@ def _agree_preflight(manifest: dict[str, Any] | None, error: str | None,
             pg_backend = "nccl"
         else:
             pg_backend = "gloo"
-        dist.init_process_group(backend=pg_backend, rank=rank, world_size=env_world)
+        dist.init_process_group(backend=pg_backend, rank=rank, world_size=env_world,
+                                timeout=_dt.timedelta(minutes=30))
     if env_world != expected_world:
         error = error or f"WORLD_SIZE={env_world} does not match expected {expected_world}"
     payload = {"error": error, "contract_sha256": (manifest or {}).get("contract_sha256"),
@@ -549,6 +610,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=SELFPLAY_ROOT / "config.yaml")
     parser.add_argument("--base", type=Path, required=True, help="existing local model directory; no Hub fallback")
     parser.add_argument("--alfworld-data", type=Path, required=True, help="existing local ALFWorld data root")
+    parser.add_argument("--baseline-contract", type=Path, required=True,
+                        help="existing base-only evaluation contract for the frozen shared protocol")
     parser.add_argument("--backend", choices=("hf", "vllm"), default=None)
     parser.add_argument("--run-id", required=True, help="shared id passed identically to every torchrun rank")
     parser.add_argument("--world-size", type=int, default=None)
@@ -568,7 +631,8 @@ def main(argv: list[str] | None = None) -> int:
                               else int(raw_cfg["runtime"]["world_size"]))
             cfg, manifest = resolve_training_manifest(
                 args.config.resolve(), args.base, args.alfworld_data, backend,
-                expected_world, smoke=args.smoke)
+                expected_world, baseline_contract_path=args.baseline_contract.resolve(),
+                smoke=args.smoke)
             if args.smoke and args.resume is not None:
                 raise ContractError("--smoke cannot resume a checkpoint")
         except Exception as exc:  # join distributed preflight and broadcast a uniform failure

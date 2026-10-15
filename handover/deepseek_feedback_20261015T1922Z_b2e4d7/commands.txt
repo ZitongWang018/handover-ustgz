@@ -1,0 +1,35 @@
+# 会话 b2e4d7 —— 关键命令
+
+# [1] 同步 main(9851991) 到集群（集群无外网，走本地 git archive）
+cd ztwang && git archive origin/main -o /tmp/nt.tar
+scp /tmp/nt.tar hpc2:/tmp/nt.tar
+ssh hpc2 'cd ~/ztwang && tar xf /tmp/nt.tar -C ~/ztwang && rm -f /tmp/nt.tar'
+
+# [2] 基线评测（成功）
+ssh hpc2 'cd ~/ztwang
+export SKR_PYTHON=$HOME/miniconda3/envs/thinktool/bin/python
+export PYTHONPATH=$PWD/selfplay/src:$PWD/selfplay/third_party/py310deps
+$SKR_PYTHON selfplay/evaluate.py prepare --config selfplay/config.yaml \
+  --alfworld-data $HOME/.cache/alfworld --base $HOME/thinktool/models/qwen3_4b \
+  --base-only --results-dir results/base --output results/base/contract.json'
+# → prepared 140 tasks x 5 seeds; contract=7dd8e2e4...c7768
+
+ssh hpc2 'sbatch --wrap="cd .../ztwang && ... && bash selfplay/scripts/run_eval.sh results/base/contract.json"'
+# → 13097438 COMPLETED 38:03 exit=0; merged 700 episodes; SR=0.3200
+
+# [3] 训练提交（第一次失败：漏 --baseline-contract）
+sbatch --wrap="... bash selfplay/scripts/run_train.sh --base .../qwen3_4b \
+  --alfworld-data .../.cache/alfworld --backend vllm --run-id explorer-zero-1016-0255"
+# → 13098227 FAILED 5s exitcode 2: "the following arguments are required: --baseline-contract"
+
+# [4] 训练提交（第二次，补上 baseline-contract）
+sbatch --wrap="... bash selfplay/scripts/run_train.sh --base .../qwen3_4b \
+  --alfworld-data .../.cache/alfworld \
+  --baseline-contract .../results/base/contract.json \
+  --backend vllm --run-id explorer-zero-1016-0255"
+# → 13098262 FAILED 22:44 exit=1（vLLM EngineCore failed to start）
+
+# [5] 失败诊断（本次全部为只读）
+ssh hpc2 'grep -an "EngineCore failed to start" ~/ztwang/logs/ez-train-13098262.out'
+ssh hpc2 'grep -aoE "DistNetworkError.*|throwTimeoutError.*" ~/ztwang/logs/ez-train-13098262.err'
+ssh hpc2 'sacct -j 13098262 --format=JobID%12,State%12,Elapsed,ExitCode'

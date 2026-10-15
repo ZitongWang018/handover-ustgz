@@ -27,23 +27,23 @@ from ez_state import (StateDelta, StateSnapshot, assert_facts_mode, snapshot_fro
                       state_delta)
 from ez_verify import (ProposedTask, SubtaskRef, action_type, validity_filter)
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*\})\s*</tool_call>\s*$", re.DOTALL)
 
 
 @dataclass
 class ProposerConfig:
     group_size: int = 16            # G（Table 3）
     max_turns: int = 30             # T_P（Table 3）
-    max_new_tokens: int = 160       # 补全: 附录未给，探索动作+理由预留比 solver(96) 多
+    max_new_tokens: int = 1024
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = -1
     min_p: float = 0.0
-    repetition_penalty: float = 1.05
-    max_context_tokens: int = 32768
+    repetition_penalty: float = 1.0
+    max_context_tokens: int = 40960
     keep_recent_turns: int = 15
-    give_admissible: bool = False   # U3 决策点：默认不给 admissible_commands
-    finish_nudge: bool = True
+    give_admissible: bool = False
+    finish_nudge: bool = False
     generation_max_batch_size: int = 2
     seed: Optional[int] = None
 
@@ -103,180 +103,58 @@ class ParsedToolCall:
     end_idx: int = -1                            # 工具调用在原文中的结束下标（开区间）；-1 = 未知
 
 
-def _repair_json(obj_text: str):
-    """尽力把"缺右括号 / 多尾巴"的 JSON 修成可解析对象；修不了返回 None。
-
-    实测动机（2026-10-14，7550 条真实 malformed 原文的分类）：
-      * `{...,"receptacle_name": "cabinet 1"` —— **只差最后一个 `}`**，占 malformed 的 2.5%
-      * 另有 11.8% 是"JSON 非法/截断"
-
-    修复手法：扫描一遍算括号欠账（**跳过字符串字面量内部的括号**，并处理 `\\` 转义），
-    然后补上缺的 `]` / `}`；若扫描结束时仍在字符串里，先补一个 `"`。
-    """
-    t = obj_text.strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        pass
-    depth_c = depth_b = 0
-    in_str = esc = False
-    for ch in t:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth_c += 1
-        elif ch == "}":
-            depth_c -= 1
-        elif ch == "[":
-            depth_b += 1
-        elif ch == "]":
-            depth_b -= 1
-    if in_str:
-        t += '"'
-    t = t + ("]" * max(0, depth_b)) + ("}" * max(0, depth_c))
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        return None
-
-
-#: 动作类型写的常见别名 → 规范名（模型会写 "go to" / "goto" / "pick" 等）
-_ACTION_ALIASES = {
-    "go to": "go_to", "goto": "go_to", "move to": "go_to",
-    "navigate": "go_to", "walk to": "go_to",
-    "pick": "take", "pick up": "take", "grab": "take",
-    "put": "move", "place": "move", "put in": "move", "put on": "move",
-    "look at": "examine", "inspect": "examine", "check": "examine",
-    "use": "use", "turn on": "use", "activate": "use",
-    "clean with": "clean", "wash": "clean", "heat with": "heat",
-    "cook": "heat", "cool with": "cool", "chill": "cool",
-    "open it": "open", "close it": "close", "list": "inventory",
-}
-
-
-def _action_type_of(args: dict) -> str:
-    """从参数对象里取动作类型，**带容错**。
-
-    实测动机（7550 条 malformed 分类，占 76.6%）：
-      * `{"name": "go_to", "receptacle_name": "cabinet 2"}`         —— 扁平写法、缺 arguments 包裹
-      * `{"name":"alfworld_tool","arguments":{"name":"go_to",...}}` —— 包裹层对，内层该叫 action_type
-    即模型**语义正确**，只是把动作类型放进了 `name` / `action` 字段。
-    所以这里按 `action_type → name → action → tool → command` 依次取，并做别名归一。
-    """
-    raw = ""
-    for k in ("action_type", "action", "name", "tool", "command", "task"):
-        v = args.get(k)
-        if isinstance(v, str) and v.strip():
-            raw = v.strip()
-            break
-    if not raw:
-        return ""
-    at = raw.lower()
-    at = _ACTION_ALIASES.get(at, at.replace(" ", "_").replace("-", "_"))
-    return at
-
-
-def _scan_truncated_call(obj_src: str):
-    """兜底扫描：找一个"扫到文本结尾都没闭合"的工具调用起点，返回 `(start, len)`。
-
-    `scan_bare_json_call` 要求括号**配平**，于是：
-      * "只差最后一个 `}`" —— 实测占 malformed 的 **2.5%**
-      * 被 `max_new_tokens` 截断的一批（"JSON 非法/截断" 11.8% 里的一部分）
-    会被整条丢掉。这里把没闭合的那段整块交给 `_repair_json` 补括号。
-    """
-    n = len(obj_src)
-    i = 0
-    while True:
-        i = obj_src.find("{", i)
-        if i < 0:
-            return None
-        depth, in_str, esc, closed = 0, False, False, False
-        for j in range(i, n):
-            c = obj_src[j]
-            if esc:
-                esc = False
-                continue
-            if c == "\\":
-                esc = True
-                continue
-            if c == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    closed = True
-                    break
-        if not closed:
-            cand = obj_src[i:]
-            if ('"action_type"' in cand or '"name"' in cand
-                    or '"task_description"' in cand or '"action"' in cand):
-                return i, n
-        i += 1
-
-
 def parse_tool_call(text: str) -> ParsedToolCall:
-    """从模型输出解析工具调用。
-
-    ★ 两种形态都要认（2026-10-12 冒烟实测，见 ez_prompts.PROPOSER_SYSTEM 的说明）：
-    1. 附录 G 的 `{"name":"alfworld_tool","arguments":{...}}` 包在 `<tool_call>` 标签里；
-    2. **裸 JSON**（不包标签）—— Qwen3-4B-Instruct-2507 实际就吐这种，而且一轮连写多个。
-       只认形态 1 的话解析 100% 失败（smoke: fmt_bad=6/6 -> accept=0/2）。
-
-    `end_idx` 一并返回，调用方可以据此把 assistant 消息裁到"这一个动作"为止，
-    避免消息历史里留着没被环境执行的动作。
-    """
-    m = _TOOL_CALL_RE.search(text)
-    if m:
-        obj_text, end_idx = m.group(1), m.end()
+    """Accept one complete tagged call or complete bare tool JSON; never repair truncation."""
+    source = text.strip() if isinstance(text, str) else ""
+    tagged = list(_TOOL_CALL_RE.finditer(source))
+    if tagged:
+        if len(tagged) != 1:
+            return ParsedToolCall(kind="malformed", raw=source[-200:])
+        match = tagged[0]
+        obj_text, end_idx = match.group(1), match.end()
     else:
-        # 延迟 import 避免 rollout <-> ez_proposer 的模块级循环依赖
-        from rollout import scan_bare_json_call
-        span = scan_bare_json_call(text)
-        if span is None:
-            span = _scan_truncated_call(text)   # ★ 兜底：没闭合/被截断的也算
-        if span is None:
-            return ParsedToolCall(kind="malformed", raw=text[-200:])
-        end_idx = span[1]
-        obj_text = text[span[0]:span[1]]
+        start = source.find("{")
+        if start < 0:
+            return ParsedToolCall(kind="malformed", raw=source[-200:])
+        obj_text, end_idx = source[start:].strip(), len(source)
     try:
         obj = json.loads(obj_text)
     except json.JSONDecodeError:
-        obj = _repair_json(obj_text)      # ★ 容错：缺右括号/截断也能救回来
-        if obj is None:
-            return ParsedToolCall(kind="malformed", raw=obj_text[:200])
-    if not isinstance(obj, dict):
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
-    args = obj.get("arguments", obj)
-    if not isinstance(args, dict):
+    if (not isinstance(obj, dict) or obj.get("name") != "alfworld_tool"
+            or not isinstance(obj.get("arguments"), dict)):
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
-    at = _action_type_of(args)            # ★ 容错：name/action/别名都对上
-    desc = str(args.get("task_description", "")).strip()
+    args = obj["arguments"]
+    at, desc_value = args.get("action_type"), args.get("task_description", "")
+    if not isinstance(at, str) or not isinstance(desc_value, str):
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
+    at, desc = at.strip().lower(), desc_value.strip()
     if at in ("declare", "declare_task"):
         return ParsedToolCall(kind="declare", task_description=desc, raw=obj_text,
                               end_idx=end_idx)
     if at in ("sub_finish", "subtask"):
         return ParsedToolCall(kind="sub_finish", task_description=desc, raw=obj_text,
                               end_idx=end_idx)
-    if at in ("finish", "finish_task"):
-        return ParsedToolCall(kind="finish", task_description=desc, raw=obj_text, end_idx=end_idx)
+    if at == "finish":
+        return ParsedToolCall(kind="finish", task_description=desc, raw=obj_text,
+                              end_idx=end_idx)
     tpl = _ACTION_TYPE_COMMANDS.get(at)
     if tpl is None:
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
+    required = {
+        "go_to": ("receptacle_name",), "take": ("object_name", "receptacle_name"),
+        "put": ("object_name", "receptacle_name"), "move": ("object_name", "receptacle_name"),
+        "open": ("receptacle_name",), "close": ("receptacle_name",),
+        "look": (), "inventory": (), "examine": ("object_name",),
+        "use": ("object_name",), "heat": ("object_name", "receptacle_name"),
+        "clean": ("object_name", "receptacle_name"),
+        "cool": ("object_name", "receptacle_name"),
+        "slice": ("object_name", "receptacle_name"),
+    }[at]
+    if any(not isinstance(args.get(key), str) or not args[key].strip() for key in required):
+        return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     try:
-        action = tpl.format(**{k: str(v) for k, v in args.items() if k != "action_type"})
+        action = tpl.format(**args)
     except KeyError:
         return ParsedToolCall(kind="malformed", raw=obj_text[:200])
     action = " ".join(action.split())
@@ -305,7 +183,8 @@ def _slot_snapshot(facts_slot: Any, obs_text: str) -> StateSnapshot:
 
 
 def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: ProposerConfig,
-                             log_fn: Optional[Callable[[str], None]] = None) -> List[List[ProposerRollout]]:
+                             log_fn: Optional[Callable[[str], None]] = None, *,
+                             synchronize_initial_state: bool = True) -> List[List[ProposerRollout]]:
     """多个 GRPO 组的 proposer 探索：每个 game 一个组，组内 G 条轨迹共享初始状态 s0。
 
     `env.batch_size` 必须等于 `cfg.group_size * len(game_files)`。
@@ -378,7 +257,8 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
     except ImportError:
         _dist = None
     cross_rank_same = True
-    if _dist is not None and _dist.is_available() and _dist.is_initialized():
+    if (synchronize_initial_state and _dist is not None and _dist.is_available()
+            and _dist.is_initialized()):
         all_group_fps = [None] * _dist.get_world_size()
         _dist.all_gather_object(all_group_fps, group_fingerprints)
         ref_fps = all_group_fps[0]
@@ -398,7 +278,8 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
     subtask_bufs: List[List[SubtaskRef]] = [[] for _ in range(n_slots)]
     action_bufs: List[List[str]] = [[] for _ in range(n_slots)]
     active = [True] * n_slots
-    stats = [{"fmt": 0, "inv": 0, "turns": 0} for _ in range(n_slots)]
+    stats = [{"fmt": 0, "inv": 0, "turns": 0, "phase": "exploration"}
+             for _ in range(n_slots)]
 
     for s in range(n_slots):
         v = views[s]
@@ -487,6 +368,13 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
                 add_feedback_tokens(s, messages[s][-1]["content"])
                 continue
             if parsed.kind == "sub_finish":
+                stats[s]["phase"] = "task_execution"
+                if not parsed.task_description:
+                    stats[s]["dropped_sub"] = stats[s].get("dropped_sub", 0) + 1
+                    messages[s].append({"role": "user", "content":
+                        "sub_finish ignored: task_description must be a non-empty imperative."})
+                    add_feedback_tokens(s, messages[s][-1]["content"])
+                    continue
                 # 快照当前状态（子任务由**上一步动作**完成，此刻状态即参考状态）
                 delta = state_delta(s0_snaps[s], cur_snaps[s], parsed.task_description)
                 if not delta.is_empty():
@@ -506,11 +394,16 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
                     add_feedback_tokens(s, messages[s][-1]["content"])
                 continue
             if parsed.kind == "declare":
-                # Phase metadata only: a declaration has no achieved state and cannot
-                # count as a subtask or reward component.
+                if not parsed.task_description:
+                    messages[s].append({"role": "user", "content":
+                        "declare ignored: task_description must be non-empty."})
+                    add_feedback_tokens(s, messages[s][-1]["content"])
+                    continue
                 stats[s]["declared_task"] = parsed.task_description
+                stats[s]["phase"] = "task_execution"
                 messages[s].append({"role": "user", "content":
-                    f"Task intent recorded: {parsed.task_description}. Continue with actions."})
+                    f"Task intent recorded: {parsed.task_description}. Continue executing this "
+                    "task, declaring completed subtasks with sub_finish and the completed task with finish."})
                 add_feedback_tokens(s, messages[s][-1]["content"])
                 continue
             if parsed.kind == "finish":
@@ -525,7 +418,8 @@ def run_proposer_exploration(env, policy, game_files: Sequence[str], cfg: Propos
                     proposer_actions=action_bufs[s],
                     proposer_action_types=[action_type(a) for a in action_bufs[s]],
                     meta={"proposer_turns": stats[s]["turns"],
-                          "declared_intent": stats[s].get("declared_task", "")},
+                          "declared_intent": stats[s].get("declared_task", ""),
+                          "phase_at_finish": stats[s]["phase"]},
                 )
                 ok, reason = validity_filter(task)
                 stats[s]["_task"] = task

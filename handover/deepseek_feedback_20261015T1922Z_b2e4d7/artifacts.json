@@ -1,0 +1,64 @@
+{
+  "session_id": "b2e4d7",
+  "utc": "2026-10-15T19:22Z",
+  "implementation_modified": true,
+  "modification": {
+    "file": "selfplay/src/ez_train.py",
+    "scope": "ez_save_v3 内断点落盘命名（用户明确授权）",
+    "diff_lines": "10 insertions, 0 deletions",
+    "executed_this_run": false,
+    "reason_not_executed": "训练未完成任何一步，未到达任何保存点",
+    "verified": "本地 py_compile 通过；集群端 ast.parse 通过"
+  },
+  "failed_run": {
+    "job_id": "13098262",
+    "name": "ez-train",
+    "state": "FAILED",
+    "elapsed": "00:22:44",
+    "exit_code": "1:0",
+    "run_id": "explorer-zero-1016-0255",
+    "command": "bash selfplay/scripts/run_train.sh --base .../qwen3_4b --alfworld-data .../.cache/alfworld --baseline-contract .../results/base/contract.json --backend vllm --run-id explorer-zero-1016-0255",
+    "partition": "i64m1tga800u8ka",
+    "gres": "gpu:8",
+    "logs": ["~/ztwang/logs/ez-train-13098262.out", "~/ztwang/logs/ez-train-13098262.err"],
+    "first_error_line": "ERROR 10-16 03:17:58 [core.py:396] EngineCore failed to start.",
+    "exception": "torch.distributed.DistNetworkError: The client socket has timed out after 600000ms while trying to connect to (10.1...)",
+    "stack_marker": "Exception raised from throwTimeoutError at /pytorch/torch/csrc/distributed/c10d/socket.cpp:1025",
+    "selfchecks_passed": [
+      "base dtype=torch.bfloat16 / lora params ok / gc=True",
+      "facts 通道 OK（152 条事实）",
+      "env slots: env_p=2 env_s=2 env_sr=8(lazy) → 本 rank 4，懒建后 12；8 rank 全局 96",
+      "梯度链 proposer grad_norm=1.6301e+02 | solver grad_norm=1.6354e+02（504 张量有 grad）"
+    ],
+    "retried": false,
+    "config_changed": false
+  },
+  "superseded_run": {
+    "job_id": "13098227",
+    "state": "FAILED",
+    "exit_code": "1:0",
+    "elapsed": "00:00:05",
+    "cause": "missing required argument --baseline-contract",
+    "note": "即时修正后重提一次，属同一授权内的参数修正，非重试失败运行"
+  },
+  "successful_run": {
+    "job_id": "13097438",
+    "name": "ez-base-eval",
+    "state": "COMPLETED",
+    "elapsed": "00:38:03",
+    "exit_code": "0:0",
+    "contract_sha256_prefix": "7dd8e2e4",
+    "episodes": 700,
+    "episode_weighted_sr": 0.32,
+    "macro_6type_sr": 0.291,
+    "per_seed_episode_sr": [0.3929, 0.3429, 0.2929, 0.3071, 0.2643],
+    "per_seed_macro_sr": [0.3805, 0.3117, 0.2724, 0.2505, 0.2405],
+    "artifacts": "~/ztwang/results/base/{contract.json,contract.merged.json,rank0..7.json}"
+  },
+  "boundary_check": {
+    "authorized_root": "/hpc2hdd/home/xyu608/ztwang",
+    "other_user_dirs_touched": false,
+    "home_dir_today_modified": ["ztwang"]
+  },
+  "not_done": ["未重试失败训练", "未修改任何配置", "未修改训练/奖励/rollout 逻辑", "未推 main"]
+}

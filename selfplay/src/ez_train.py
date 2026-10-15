@@ -9,6 +9,7 @@ import random
 import sys
 import time
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +30,8 @@ from ez_state import StateSnapshot  # noqa: E402
 from ez_verify import ProposedTask, proposer_reward, validity_filter  # noqa: E402
 from ez_dist import (broadcast_pool_indices, check_adapter_sync, gather_group_values,
                      broadcast_adapter_parameters, global_group_advantages, local_group_size, select_adapter,
-                     sync_active_adapter_gradients)  # noqa: E402
+                     sync_active_adapter_gradients, require_all_ranks_finite,
+                     require_adapter_finite)  # noqa: E402
 from rollout import HFPolicy, RolloutConfig  # noqa: E402
 from grpo import (build_model_and_tokenizer, grpo_loss,  # noqa: E402
                         is_main, load_cfg, log0, make_batch, per_token_logps,
@@ -38,8 +40,59 @@ from grpo import (build_model_and_tokenizer, grpo_loss,  # noqa: E402
 
 _LOG_FH = None    # 本 rank 的日志：train_log.rank{rank}.jsonl
 _LOG_FH0 = None   # 仅 rank0：额外的 train_log.jsonl（让现成的判读脚本不用改）
-RANK = 0
+_RANK = 0
 _REPORTER: Any = None
+
+
+def activate_rollout_adapter(model, adapter: str, sync_adapter) -> None:
+    """Route both the train model and sampler to one adapter in that order."""
+    select_adapter(model, adapter)
+    sync_adapter(adapter)
+
+
+def sample_fresh_task_distributed(*, rank: int, world: int, dist_obj,
+                                  game_files: List[str], outer: int, step: int,
+                                  max_attempts: int, sample_candidate) -> ProposedTask:
+    """Rank zero proposes one fresh solver task; all ranks receive the same object.
+
+    ``sample_candidate(game_file, attempt)`` returns an accepted ProposedTask or
+    ``None`` for a rejected proposal. Exceptions are converted into one broadcast
+    failure packet so non-root ranks never hang waiting at a later collective.
+    """
+    packet = None
+    if rank == 0:
+        try:
+            if not game_files:
+                raise ValueError("training game pool is empty")
+            if max_attempts < 1:
+                raise ValueError("fresh-task retry budget must be positive")
+            last_reason = "proposal_rejected"
+            for attempt in range(max_attempts):
+                game_file = random.choice(game_files)
+                task = sample_candidate(game_file, attempt)
+                if task is None:
+                    last_reason = "proposal_rejected"
+                    continue
+                task.meta["uid"] = f"solverfresh-o{outer}-s{step}-a{attempt}"
+                task.meta["source_phase"] = "solver_fresh_proposer"
+                task.meta["source_outer"] = int(outer)
+                task.meta["source_step"] = int(step)
+                task.meta["source_attempt"] = int(attempt)
+                packet = {"ok": True, "task": task.to_json()}
+                break
+            if packet is None:
+                packet = {"ok": False, "error":
+                          f"fresh proposer rejected {max_attempts} consecutive candidates ({last_reason})"}
+        except Exception as exc:  # propagate rank-zero failures before later collectives
+            packet = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if world > 1:
+        holder = [packet]
+        dist_obj.broadcast_object_list(holder, src=0)
+        packet = holder[0]
+    if not isinstance(packet, dict) or not packet.get("ok"):
+        message = packet.get("error", "rank zero did not provide a fresh task") if isinstance(packet, dict) else "invalid fresh-task broadcast"
+        raise RuntimeError(f"[fresh-task] outer={outer} step={step}: {message}")
+    return ProposedTask.from_json(packet["task"])
 
 
 def log(msg: str) -> None:
@@ -69,16 +122,18 @@ class _MetricsReporter:
         self._fh = open(Path(run_dir) / "metrics.jsonl", "a", encoding="utf-8", newline="\n")
 
     def log(self, metrics: dict, step: int) -> None:
-        if self._rank != 0:
-            return
         clean = {}
         for key, value in metrics.items():
             try:
                 scalar = float(value)
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"training metric {key!r} is not numeric") from exc
             if np.isfinite(scalar):
                 clean[str(key)] = scalar
+            else:
+                raise FloatingPointError(f"training metric {key!r} is non-finite")
+        if self._rank != 0:
+            return
         if self._fh is not None:
             self._fh.write(json.dumps({"step": int(step), "metrics": clean},
                                       sort_keys=True, allow_nan=False) + "\n")
@@ -421,7 +476,8 @@ def grad_chain_selfcheck(model, tokenizer, device) -> Dict[str, float]:
 def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
                           adapter: str, clip_eps: float, micro_batch_size: int,
                           world: int, loss_norm: str, beta: float, dist_obj=None,
-                          group_weight: float = 1.0):
+                          group_weight: float = 1.0,
+                          loss_finite: Optional[List[bool]] = None):
     """Accumulate exact seq-mean gradients over all global task groups in one step."""
     from grpo import BatchTensors, grpo_loss, make_batch, per_token_logps
     if loss_norm != "seq":
@@ -464,7 +520,12 @@ def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
                     loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
                                            ref_logps=ref, beta=beta, sequence_reduction="sum")
                     weight = len(response_ids) / max(episode_tokens, 1)
-                    (loss * weight * (world / denom) * group_weight).backward()
+                    if not bool(torch.isfinite(loss.detach()).all()):
+                        if loss_finite is None:
+                            raise FloatingPointError(f"non-finite {adapter} loss")
+                        loss_finite[0] = False
+                    else:
+                        (loss * weight * (world / denom) * group_weight).backward()
                     loss_sum += float(loss.detach().item()) * weight * group_weight
                     for key in ("pg_sequence_sum", "kl_sequence_sum", "objective_sequence_sum"):
                         row[key] += float(stat.get(key, 0.0)) * weight
@@ -484,7 +545,12 @@ def backward_microbatches(raw, optimizer_model, trajectories, pad_id, device, *,
                                                   loss_mask=bt.loss_mask)
                 loss, stat = grpo_loss(optimizer_model, bt, old, clip_eps, loss_norm="seq",
                                        ref_logps=ref, beta=beta, sequence_reduction="sum")
-                (loss * (world / denom) * group_weight).backward()
+                if not bool(torch.isfinite(loss.detach()).all()):
+                    if loss_finite is None:
+                        raise FloatingPointError(f"non-finite {adapter} loss")
+                    loss_finite[0] = False
+                else:
+                    (loss * (world / denom) * group_weight).backward()
                 loss_sum += float(loss.detach().item()) * group_weight
                 stats.append(stat)
                 del old, ref, bt, loss
@@ -717,6 +783,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     #   懒建只影响 env 对象是否存在，不影响任何 rank 的 backward 次数
     #   （backward 次数由 len(batch) 决定，与 env 无关），因此不违反红线 B。
     env_sr = None
+    env_fresh = None
     _envs_closed = False
 
     def _ensure_env_sr():
@@ -734,11 +801,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     def close_all():
         # 统一收尾：判空再 close，并把 env_sr 清空标记已关闭，
         # 避免收尾之后又被懒建出一个没人管的 env（子进程泄漏）
-        nonlocal env_sr, _envs_closed
-        for _e in (env_p, env_s, env_sr):
+        nonlocal env_sr, env_fresh, _envs_closed
+        for _e in (env_p, env_s, env_sr, env_fresh):
             if _e is not None:
                 _e.close()
         env_sr = None
+        env_fresh = None
         _envs_closed = True
 
     # 异常退出也释放子进程/句柄（review P1-4）
@@ -748,6 +816,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- 模型（共享基座 + 双 LoRA adapter：proposer / solver）----
     # EZ explicitly synchronizes LoRA gradients and never wraps its raw PEFT model in DDP.
     raw, tokenizer = build_model_and_tokenizer(cfg, local, world, wrap_ddp=False)
+    expected_tokenizer_class = protocol_manifest.get("baseline_binding", {}).get(
+        "common_identity", {}).get("tokenizer_class")
+    actual_tokenizer_class = type(tokenizer).__qualname__
+    if not expected_tokenizer_class or actual_tokenizer_class != expected_tokenizer_class:
+        raise ValueError(
+            "loaded tokenizer class differs from the bound base-only evaluation contract: "
+            f"expected={expected_tokenizer_class!r}, actual={actual_tokenizer_class!r}")
+    log(f"[identity] tokenizer_class={actual_tokenizer_class} matches baseline contract")
     raw = build_dual_lora(raw, cfg, resume_checkpoint=resume_ckpt)
     broadcast_adapter_parameters(raw, world, dist)
 
@@ -844,6 +920,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         log("[selfcheck] rollout backend=hf（默认）")
 
+    def _fresh_candidate(game_file: str, attempt: int):
+        """Generate a single task from the current frozen proposer checkpoint."""
+        nonlocal env_fresh
+        if rank != 0:
+            raise RuntimeError("only rank zero may generate solver-training tasks")
+        activate_rollout_adapter(raw, "proposer", sync_rollout_adapter)
+        if env_fresh is None:
+            env_fresh = ALFWorldBatchEnv(
+                alf_cfg, split=cfg["env"].get("split", "train"), batch_size=1,
+                max_episode_steps=p_cfg.max_turns, with_facts=True,
+                ignore_benchmark_done=True)
+            atexit.register(env_fresh.close)
+        one_cfg = replace(p_cfg, group_size=1)
+        grouped = run_proposer_exploration(
+            env_fresh, policy, [game_file], one_cfg, log_fn=log,
+            synchronize_initial_state=False)
+        if len(grouped) != 1 or len(grouped[0]) != 1:
+            raise RuntimeError("fresh proposer must return exactly one candidate")
+        candidate = grouped[0][0]
+        if not candidate.accepted or candidate.task is None:
+            log(f"[fresh-task] attempt={attempt + 1} rejected: {candidate.reject_reason}")
+            return None
+        return candidate.task
+
     def sync_rollout_adapter(adapter: str) -> None:
         """把指定 adapter 的**当前**权重刷进采样后端。HF 后端下是 no-op。"""
         if vllm_policy is None:
@@ -939,10 +1039,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             st0 = time.time()
             _cuda_sync_and_reset_peak()
             model.eval()
-            select_adapter(raw, "proposer")
             # ★ vLLM 后端：上一步 optimizer.step() 之后 proposer 权重已变，
             #   采样前必须刷一次，否则本轮探索用的是**旧策略**（on-policy 静默破坏）。
-            sync_rollout_adapter("proposer")
+            activate_rollout_adapter(raw, "proposer", sync_rollout_adapter)
             # All ranks process the same global task groups. Each group is sharded
             # rank-strided inside run_proposer_exploration.
             games: List[str] = []
@@ -994,8 +1093,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 c.task.meta["uid"] = f"o{outer}s{step}-r{rank}-{uid_counter}"
                 uid_counter += 1
             if accepted:
-                select_adapter(raw, "solver")
-                sync_rollout_adapter("solver")
+                activate_rollout_adapter(raw, "solver", sync_rollout_adapter)
                 for _sub, _fill in _game_unique_calls(accepted, lambda c: c.task.game_file, sr_tasks):
                     _input: List[ProposedTask] = []
                     for c in _fill:
@@ -1010,8 +1108,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         c.__dict__["reward_parts"] = _parts
                         c.task.meta["solve_rate"] = _p_hat
                         new_tasks.append(c.task)
-                select_adapter(raw, "proposer")
-                sync_rollout_adapter("proposer")
+                activate_rollout_adapter(raw, "proposer", sync_rollout_adapter)
             if world > 1:
                 # ★ 任务池必须**每个 rank 完全一致**：solver 相位要从池里采样，
                 #   各 rank 池子不同则采出的任务数/内容不同 → backward 次数不同 → 死锁。
@@ -1032,6 +1129,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _p_components_local = np.zeros(5, dtype=np.float64)
             _p_reward_std_sum = 0.0
             _p_nonzero_adv_groups = 0.0
+            _p_loss_finite = [True]
             _tokens_local = 0
             _backward_t0 = time.time()
             for group_idx, groll in enumerate(groups):
@@ -1061,7 +1159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raw, model, trajs_like, pad_id, device, adapter="proposer",
                     clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
                     loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
-                    group_weight=_group_weight)
+                    group_weight=_group_weight, loss_finite=_p_loss_finite)
                 _p_loss_sum += _g_loss
                 _stats_local = {key: sum(float(row.get(key, 0.0)) for row in _g_stats)
                                 for key in ("pg_sequence_sum", "kl_sequence_sum",
@@ -1074,6 +1172,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _p_components_local[4] += _stats_local["valid_sequence_count"]
             _cuda_sync()
             _backward_s = time.time() - _backward_t0
+            require_all_ranks_finite(_p_loss_finite[0], device, world, dist,
+                                     label="proposer loss")
             _nof = {id(p): n for n, p in raw.named_parameters()}
             _sync_t0 = time.time()
             _cuda_sync()
@@ -1088,8 +1188,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             _gnB = float(sum(p.grad.detach().float().norm() for p in _act
                              if ".lora_B." in _nof.get(id(p), "")))
             _step_t0 = time.time()
-            torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
+            _clip_norm_p = torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
+            require_all_ranks_finite(bool(torch.isfinite(_clip_norm_p).all()), device,
+                                     world, dist, label="proposer gradient clip norm")
             _update_rel_p = update_probe(raw, opt_params, optimizer, f"outer {outer} P{step}")
+            require_adapter_finite(raw, "proposer", world, dist)
             if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
                 _sync_max = check_adapter_sync(raw, "proposer", world, dist)
                 log(f"[adapter-sync] phase=proposer step={step} status=PASS max_abs={_sync_max:.3e}")
@@ -1174,44 +1277,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         # ================= solver 相位 =================
         model.eval()
         select_adapter(raw, "solver")
-        # 任务来源对齐论文 Appendix C：solver 只练**本 outer proposer 相位产出的任务**
-        # （论文是每迭代用冻结 proposer 重新采样；跨 outer 抽旧题会让任务分布与
-        #   当前 proposer 脱节 —— review #2）。池子仍全量持久化供分析。
-        outer_pool = [t for t in task_pool if str(t.meta.get("uid", "")).startswith(f"o{outer}")]
-        # ★ "跳不跳"必须是**全局决定**：某个 rank 空池就 continue，而别的 rank 继续
-        #   backward —— 空池那个 rank 直接卡死在 NCCL barrier（红线 B）。
-        #   池子经 all_gather 后本来就一致，这里再加一道 MIN all_reduce 兜底。
-        _nlocal = len(outer_pool)
-        if world > 1:
-            _t = torch.tensor([_nlocal], device=device)
-            dist.all_reduce(_t, op=dist.ReduceOp.MIN)
-            _nglob = int(_t.item())
-            del _t
-        else:
-            _nglob = _nlocal
-        if _nglob == 0:
-            log(f"[solver] 本 outer 任务池为空（rank{rank} 本地 {_nlocal} 条，全局最少 {_nglob} 条），"
-                f"所有 rank 一起跳过 solver 相位")
-            ez_save(raw, tokenizer, optimizer, run_dir, f"outer{outer}-empty-S", cfg,
-                    {"next_outer": outer + 1, "next_phase": "proposer", "next_step": 0},
-                    task_pool, rank, world, uid_counter=uid_counter,
-                    dry_run=args.protocol_smoke,
-                    protocol_manifest=protocol_manifest)
-            continue
         s_steps = M_S if not args.protocol_smoke else 1
         s_start = resume_step if outer == start_outer and resume_phase == "solver" else 0
         for step in range(s_start, s_steps):
             st0 = time.time()
             _cuda_sync_and_reset_peak()
             model.eval()
-            # ★ vLLM 后端：solver 相位**每步都更新 solver 权重**，所以每步采样前都要刷。
-            sync_rollout_adapter("solver")
-            # Draw the same-sized, non-overlapping task slice on each rank.
-            n_tasks = min(TPS, len(outer_pool))
-            chosen = broadcast_pool_indices(len(outer_pool), n_tasks,
-                                            outer * max(M_S, 1) + step,
-                                            seed + 104729, rank, world, dist)
-            batch = [outer_pool[i] for i in chosen]
+            # Appendix C draws a fresh task from the frozen proposer at each S
+            # iteration. Only rank zero owns this extra environment and proposes;
+            # the accepted task (or bounded failure) is broadcast to every rank.
+            fresh_task = sample_fresh_task_distributed(
+                rank=rank, world=world, dist_obj=dist, game_files=game_files,
+                outer=outer, step=step, max_attempts=8,
+                sample_candidate=_fresh_candidate if rank == 0 else None)
+            task_pool.append(fresh_task)
+            persist_pool()
+            # Fresh-task sampling leaves the vLLM sampler routed to proposer;
+            # restore solver after the broadcast on every rank before rollouts.
+            activate_rollout_adapter(raw, "solver", sync_rollout_adapter)
+            batch = [fresh_task]
             # ★ 批量并行：本步**所有任务**的 rollout 合并成一次调用（原逐任务串行，是 TPS>1
             #   时的第二个瓶颈）。按 game_file 轮转分批（同一批内同 game 只出现一次），
             #   env_s.batch = G_local×TPS，末尾不足时用 sub[0] 补齐（补的槽位结果忽略）。
@@ -1232,6 +1316,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _s_components_local = np.zeros(5, dtype=np.float64)
             _s_reward_std_sum = 0.0
             _s_nonzero_adv_groups = 0.0
+            _s_loss_finite = [True]
             all_roll: List[EzSolverTrajectory] = []
             _tokens_local = 0
             _backward_t0 = time.time()
@@ -1249,7 +1334,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raw, model, [r.traj for r in grp], pad_id, device, adapter="solver",
                     clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
                     loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
-                    group_weight=_group_weight)
+                    group_weight=_group_weight, loss_finite=_s_loss_finite)
                 _s_loss_sum += _g_loss
                 _stats_local = {key: sum(float(row.get(key, 0.0)) for row in _g_stats)
                                 for key in ("pg_sequence_sum", "kl_sequence_sum",
@@ -1264,6 +1349,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _tokens_local += sum(int(r.traj.n_trainable_tokens) for r in grp)
             _cuda_sync()
             _backward_s = time.time() - _backward_t0
+            require_all_ranks_finite(_s_loss_finite[0], device, world, dist,
+                                     label="solver loss")
             # ★ S 相位也打一行同款诊断：判读脚本要靠「真实 backward grad_norm」把
             #   「有梯度却没位移」（真断链，FATAL）和「本来就没梯度」（奖励全同分，
             #   正确不动）分开。只有 P 相位有诊断行时，S 相位的 0/504 无法判定。
@@ -1280,8 +1367,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             _gnSB = float(sum(p.grad.detach().float().norm() for p in _actS
                               if ".lora_B." in _nofS.get(id(p), "")))
             _step_t0 = time.time()
-            torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
+            _clip_norm_s = torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
+            require_all_ranks_finite(bool(torch.isfinite(_clip_norm_s).all()), device,
+                                     world, dist, label="solver gradient clip norm")
             _update_rel_s = update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}")
+            require_adapter_finite(raw, "solver", world, dist)
             if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
                 _sync_max = check_adapter_sync(raw, "solver", world, dist)
                 log(f"[adapter-sync] phase=solver step={step} status=PASS max_abs={_sync_max:.3e}")
@@ -1318,7 +1408,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             log(f"[outer {outer}][S{step}] rank={rank} global_tasks={len(batch)} local_G={G_local} "
                 f"| reward mean={np.mean(rw):.3f} "
                 f"| final_match={sum(r.verify.final_match for r in all_roll)}/{len(all_roll)} "
-                f"| pool={len(outer_pool)} | {time.time()-st0:.0f}s")
+                f"| pool={len(task_pool)} | fresh_uid={fresh_task.meta['uid']} | {time.time()-st0:.0f}s")
             log(f"[outer {outer}][S{step}] 诊断 真实 backward grad_norm={_gnS:.4e} "
                 f"({len(_actS)} 个张量有 grad；A={_gnSA:.4e} B={_gnSB:.4e})"
                 f"{'  ← 奖励全同分 ⇒ 优势全 0 ⇒ 梯度精确为 0，参数不动是正确的' if _gnS == 0.0 else ''}")
