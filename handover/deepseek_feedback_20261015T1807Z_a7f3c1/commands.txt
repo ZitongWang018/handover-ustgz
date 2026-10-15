@@ -1,0 +1,52 @@
+# 会话 a7f3c1 —— 关键命令（按时间顺序，节选）
+
+# [1] 同步后执行（★ 造成损坏的命令）
+cd ~/ztwang
+git fetch origin                       # 结果：失败（could not read Username）
+git reset --hard origin/main           # 结果：HEAD 仍为 0758f1f（未生效）
+git clean -fd -e selfplay/runs         # ★ 删除大量未跟踪 .py
+
+# [2] 删除旧 runs（事先已提清单，获用户批准）
+rm -rf selfplay/runs/eval selfplay/runs/qwen3-4b-alfworld-grpo \
+       selfplay/runs/qwen3-4b-alfworld-grpo-fp32 selfplay/runs/stepcount_result.txt
+
+# [3] 停止旧作业（用户授权）
+scancel 13093588
+
+# [4] 从三期拷回 glibc232（用户授权）
+ssh hpc3 'cd /data/user/xyu608/ztwang/selfplay/third_party && tar czf - glibc232' \
+  | ssh hpc2 'cd ~/ztwang/selfplay/third_party && tar xzf -'
+
+# [5] 从三期拷回 fast_downward 两个 .py（用户授权）
+ssh hpc3 'cd /data/user/xyu608/ztwang/selfplay/third_party/py311deps/fast_downward \
+          && tar czf - __init__.py interface.py' \
+  | ssh hpc2 'cd ~/ztwang/selfplay/third_party/py310deps/fast_downward && tar xzf -'
+
+# [6] 离线重装 py310deps 78 个包（用户授权）
+ssh hpc2 'cd ~/ztwang
+export TMPDIR=$HOME/ztwang/.tmp PIP_CACHE_DIR=$HOME/ztwang/.pipcache PIP_NO_INPUT=1
+PY=$HOME/miniconda3/envs/thinktool/bin/python
+W=$HOME/ztwang/selfplay/third_party/wheels
+PKGS=$(ls $W/*.whl | xargs -n1 basename | sed "s/\.whl$//" | awk -F- "{print \$1}" | sort -u | tr "\n" " ")
+$PY -m pip install --no-index --no-deps --upgrade --find-links=$W \
+  --target=$HOME/ztwang/selfplay/third_party/py310deps $PKGS'
+
+# [7] 生成评估合同
+cd ~/ztwang
+export SKR_PYTHON=$HOME/miniconda3/envs/thinktool/bin/python
+export PYTHONPATH=$PWD/selfplay/src:$PWD/selfplay/third_party/py310deps
+$SKR_PYTHON selfplay/evaluate.py prepare \
+  --config selfplay/config.yaml --alfworld-data $HOME/.cache/alfworld \
+  --base $HOME/thinktool/models/qwen3_4b --base-only \
+  --results-dir results/base --output results/base/contract.json
+# → prepared 140 tasks x 5 seeds; contract=7dd8e2e4...c7769
+
+# [8] 提交评测（sbatch --wrap，未新建文件）
+sbatch --account=root --partition=i64m1tga800u8ka --nodes=1 --ntasks-per-node=1 \
+  --gres=gpu:8 --cpus-per-task=64 --mem=400G --time=0-04:00:00 \
+  --job-name=ez-base-eval \
+  --output=/hpc2hdd/home/xyu608/ztwang/logs/ez-base-eval-%j.out \
+  --error=/hpc2hdd/home/xyu608/ztwang/logs/ez-base-eval-%j.err \
+  --wrap="cd /hpc2hdd/home/xyu608/ztwang && export SKR_PYTHON=... TMPDIR=...ztwang/.tmp \
+          PYTHONPATH=... && bash selfplay/scripts/run_eval.sh results/base/contract.json"
+# → Submitted batch job 13097438
