@@ -1,0 +1,22 @@
+{"t": 1791829450.96584, "rank": 0, "msg": "[dist] rank=0/2 local_rank=0 device=cuda:0 | run_dir=runs/ez-qwen3-4b-alfworld-1013-0224"}
+{"t": 1791829450.9661276, "rank": 0, "msg": "[dry-run] 缩规模：G=2 G_P=2 TPS=2 turns=16"}
+{"t": 1791829509.575667, "rank": 0, "msg": "[data] 3553 train games"}
+{"t": 1791829527.6336675, "rank": 0, "msg": "[selfcheck] base dtype=torch.bfloat16 | lora参数样例=['base_model.model.model.layers.0.self_attn.q_proj.lora_A.proposer.weight'] | gc=True | stop_mode=tool_call | 基座冻结=True | LoRA 可训练 1008/1008 | lora dtype=torch.float32"}
+{"t": 1791829534.6672723, "rank": 0, "msg": "[selfcheck] facts 通道 OK（109 条事实）"}
+{"t": 1791829534.7610295, "rank": 0, "msg": "[selfcheck] env slots: env_p=2 env_s=2 env_sr=2(lazy) → 本 rank 当前 4，懒建后 6；2 rank 全局 12"}
+{"t": 1791829536.1424546, "rank": 0, "msg": "[selfcheck] 梯度链 proposer grad_norm=5.6663e+02 (504 个张量有 grad) | solver grad_norm=5.6441e+02 (504 个张量有 grad)"}
+{"t": 1791829536.2923818, "rank": 0, "msg": "[dist] DDP 已包装：world_size=2 find_unused_parameters=True；两个 adapter 合计 132.1M 参数，每步 all-reduce 的是 **fp32 梯度** ≈0.53 GB（LoRA 让 DDP 在这里非常划算，不需要 ZeRO/FSDP）"}
+{"t": 1791829536.2924716, "rank": 0, "msg": "[dist] 属性转发探针：hasattr(DDP,'set_adapter')=False hasattr(DDP,'generate')=False （False 表示必须用内层 raw 调这些方法；loss 的 forward 仍要用包装后的 model）"}
+{"t": 1791829536.300482, "rank": 0, "msg": "[selfcheck] loss_norm=seq adv_ddof=1 clip_eps=0.3 max_grad_norm=1.0"}
+{"t": 1791829634.2524385, "rank": 0, "msg": "[proposer] 1/2 accepted | mean_turns=15.5 | fmt_bad=0 | dropped_sub=0 | extra_after_call=0 | 90.8s"}
+{"t": 1791829725.6834905, "rank": 0, "msg": "[ez-solver] 2 rollouts | reward mean=1.000 | final_match=2/2 | subtask_rate=0.000 | 78.8s"}
+{"t": 1791829731.4697218, "rank": 0, "msg": "[outer 0 P0] update_rel=5.000e-01（=max ‖Δp‖/(‖p‖+‖Δp‖)；252/504 张量真的动了；max‖Δp‖=5.564e-02）"}
+{"t": 1791829731.4715629, "rank": 0, "msg": "[outer 0 P0] probe top3 -> .0.self_attn.q_proj.lora_B.proposer.weight rel=5.00e-01 |Δ|=3.59e-02 ‖p‖=3.59e-02 | .0.self_attn.k_proj.lora_B.proposer.weight rel=5.00e-01 |Δ|=1.81e-02 ‖p‖=1.81e-02 | .0.self_attn.v_proj.lora_B.proposer.weight rel=5.00e-01 |Δ|=1.81e-02 ‖p‖=1.81e-02"}
+{"t": 1791829731.4720857, "rank": 0, "msg": "[outer 0][P0] rank=0 本地 games=1/2 | pool=1 (+1) | accept=1/2 | rew=[0.0, 1.2] | rew_spread=1.200 | rej={'env_done_no_finish': 1, 'ok': 1} | 195s"}
+{"t": 1791829731.472159, "rank": 0, "msg": "[outer 0][P0] 诊断 adv_spread/n_active/len_ids/mask_sum=[(1.414, 1713, [2930, 2786], [906, 807])] | 真实 backward grad_norm=2.2454e+00 (504 个张量有 grad；A=0.0000e+00 B=2.2454e+00)  ← A=0 是正常的（B 初始全 0）"}
+{"t": 1791829814.6220644, "rank": 0, "msg": "[ez-solver] 2 rollouts | reward mean=1.000 | final_match=2/2 | subtask_rate=0.000 | 76.4s"}
+{"t": 1791829818.3267941, "rank": 0, "msg": "[outer 0 S0] update_rel=0.000e+00（=max ‖Δp‖/(‖p‖+‖Δp‖)；0/504 张量真的动了；max‖Δp‖=0.000e+00）"}
+{"t": 1791829818.3268833, "rank": 0, "msg": "[outer 0 S0] probe top3 -> rs.0.self_attn.q_proj.lora_A.solver.weight rel=0.00e+00 |Δ|=0.00e+00 ‖p‖=3.26e+00 | rs.0.self_attn.q_proj.lora_B.solver.weight rel=0.00e+00 |Δ|=0.00e+00 ‖p‖=0.00e+00 | rs.0.self_attn.k_proj.lora_A.solver.weight rel=0.00e+00 |Δ|=0.00e+00 ‖p‖=3.27e+00"}
+{"t": 1791829818.3270652, "rank": 0, "msg": "[outer 0][S0] rank=0 batch=1/2 | reward mean=1.000 | final_match=2/2 | pool=1 | 87s"}
+{"t": 1791829818.327118, "rank": 0, "msg": "[outer 0][S0] 诊断 真实 backward grad_norm=0.0000e+00 (504 个张量有 grad；A=0.0000e+00 B=0.0000e+00)  ← 奖励全同分 ⇒ 优势全 0 ⇒ 梯度精确为 0，参数不动是正确的"}
+{"t": 1791829819.377499, "rank": 0, "msg": "[done] rank=0 1 outer loops in 4.7 min -> runs/ez-qwen3-4b-alfworld-1013-0224"}

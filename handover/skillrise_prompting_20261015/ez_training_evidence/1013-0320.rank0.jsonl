@@ -1,0 +1,14 @@
+{"t": 1791832832.575753, "rank": 0, "msg": "[dist] rank=0/8 local_rank=0 device=cuda:0 | run_dir=runs/ez-qwen3-4b-alfworld-1013-0320"}
+{"t": 1791832832.5759265, "rank": 0, "msg": "[dist] ⚠️ tasks_per_step=2 不能被 world=8 整除（或小于 world）。每 rank 的 backward 次数必须一致，否则 DDP 直接死锁（红线 B）。已自动上调为 TPS=8（每 rank 1 个 game）。想固定请设 train.tasks_per_step 或 EZ_SMOKE_TPS 为 8 的倍数"}
+{"t": 1791832920.4989188, "rank": 0, "msg": "[data] 3553 train games"}
+{"t": 1791832969.1331594, "rank": 0, "msg": "[selfcheck] base dtype=torch.bfloat16 | lora参数样例=['base_model.model.model.layers.0.self_attn.q_proj.lora_A.proposer.weight'] | gc=True | stop_mode=tool_call | 基座冻结=True | LoRA 可训练 1008/1008 | lora dtype=torch.float32"}
+{"t": 1791832977.7033973, "rank": 0, "msg": "[selfcheck] facts 通道 OK（109 条事实）"}
+{"t": 1791832978.0962842, "rank": 0, "msg": "[selfcheck] env slots: env_p=16 env_s=16 env_sr=8(lazy) → 本 rank 当前 32，懒建后 40；8 rank 全局 320  ⚠️ 全局 slot 占用偏高"}
+{"t": 1791832981.6254523, "rank": 0, "msg": "[selfcheck] 梯度链 proposer grad_norm=1.6986e+02 (504 个张量有 grad) | solver grad_norm=1.7041e+02 (504 个张量有 grad)"}
+{"t": 1791832981.808987, "rank": 0, "msg": "[dist] DDP 已包装：world_size=8 find_unused_parameters=True；两个 adapter 合计 132.1M 参数，每步 all-reduce 的是 **fp32 梯度** ≈0.53 GB（LoRA 让 DDP 在这里非常划算，不需要 ZeRO/FSDP）"}
+{"t": 1791832981.8090968, "rank": 0, "msg": "[dist] 属性转发探针：hasattr(DDP,'set_adapter')=False hasattr(DDP,'generate')=False （False 表示必须用内层 raw 调这些方法；loss 的 forward 仍要用包装后的 model）"}
+{"t": 1791832981.8172646, "rank": 0, "msg": "[selfcheck] loss_norm=seq adv_ddof=1 clip_eps=0.3 max_grad_norm=1.0"}
+{"t": 1791833779.1365616, "rank": 0, "msg": "[proposer] 3/16 accepted | mean_turns=29.5 | fmt_bad=281 | dropped_sub=0 | extra_after_call=5 | 787.8s"}
+{"t": 1791834221.265187, "rank": 0, "msg": "[ez-solver] 8 rollouts | reward mean=0.000 | final_match=0/8 | subtask_rate=0.000 | 249.5s"}
+{"t": 1791834498.4199538, "rank": 0, "msg": "[ez-solver] 8 rollouts | reward mean=0.000 | final_match=0/8 | subtask_rate=0.000 | 270.3s"}
+{"t": 1791834761.7527432, "rank": 0, "msg": "[ez-solver] 8 rollouts | reward mean=0.000 | final_match=0/8 | subtask_rate=0.000 | 256.4s"}
