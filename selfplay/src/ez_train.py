@@ -906,14 +906,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     vllm_policy = None
     _vllm_ver: Dict[str, int] = {"proposer": 0, "solver": 0}
     if rollout_backend == "vllm":
-        from ez_vllm_policy import (VLLMPolicy, build_vllm_engine,
-                                    export_lora_adapter, lora_workdir)
+        from ez_vllm_policy import (VLLMPolicy, export_lora_adapter, lora_workdir)
+        from training_runtime import build_training_vllm_engine
 
         _base_path = os.path.expandvars(os.path.expanduser(str(cfg["model"]["path"])))
         engine_kwargs = vllm_engine_kwargs(cfg, rank)
         vllm_policy = VLLMPolicy(
-            build_vllm_engine(
-                _base_path, **engine_kwargs),
+            build_training_vllm_engine(
+                _base_path, rank=rank, diagnostics_dir=run_dir / "runtime", **engine_kwargs),
             tokenizer, log_fn=log)
         policy = vllm_policy
         log(f"[selfcheck] rollout backend=vllm（引擎已就绪，engine_seed={engine_kwargs['seed']}，adapter 按需热刷）")
@@ -1462,6 +1462,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "next_step": next_step}, task_pool, rank, world,
                         uid_counter=uid_counter, dry_run=args.protocol_smoke,
                         protocol_manifest=protocol_manifest)
+            if s_done and not args.protocol_smoke:
+                from training_snapshots import publish_outer_snapshot_distributed
+                publish_outer_snapshot_distributed(
+                    run_dir, outer + 1, protocol_manifest, rank, world)
             if args.protocol_smoke:
                 break
 

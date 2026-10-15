@@ -39,6 +39,10 @@ SOURCE_PATHS = (
     "selfplay/scripts/run_train.sh",
     "selfplay/src/checkpoint.py",
     "selfplay/src/training_contract.py",
+    "selfplay/src/training_runtime.py",
+    "selfplay/src/training_snapshots.py",
+    "selfplay/evaluate_run.py",
+    "selfplay/scripts/run_experiment.sh",
     "selfplay/src/ez_train.py",
     "selfplay/src/grpo.py",
     "selfplay/src/grpo_norm.py",
@@ -512,6 +516,8 @@ def _dist_preflight(manifest: dict[str, Any], run_dir: Path, run_id: str,
                     raise ContractError("resume run_id differs from sealed checkpoint state")
                 if contract_signature(ckpt_manifest) != manifest["contract_sha256"]:
                     raise ContractError("resume checkpoint contract differs from current config")
+                from training_snapshots import ensure_resume_snapshots
+                ensure_resume_snapshots(selected.parent, selected, ckpt_manifest, checkpoint_info=info)
                 shared[0] = {"ok": True, "run_dir": str(selected.parent),
                              "manifest": ckpt_manifest, "selected_checkpoint": str(selected)}
             else:

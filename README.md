@@ -8,7 +8,7 @@
 
 明确的协议差异是 proposer/solver 上下文容量：论文为 40,960 tokens；共享 ReAct solver 固定 32,768，训练入口将 proposer 上下文和训练 vLLM engine 上限设为 40,960。solver 提示使用原始纯文本、`add_special_tokens=True`、最近 15 组历史、可用动作菜单和 `<action>...</action>` 投影；论文 Appendix G 的 ALFWorld prompt 使用 `<think>`/`<tool_call>` JSON。Proposer 延续论文的 `sub_finish` 快照、`finish` 终止任务和祈使句描述约束；`declare_task` 是可选意图记录，不能代替环境探索或 `finish`。由于论文正文 Algorithm 1 与 Appendix G 对 `declare` 的描述不完全一致，不能将本地 proposer prompt 称为逐字复用论文模板。
 
-论文表格报告 8×H100；当前目标训练服务器是 8×A800，因此硬件与论文不同。生成上限1024、ReAct温度0.7与top_p0.95属于共享评测工程设置，不是 Table 3 的论文超参数。
+生成上限 1024、ReAct 温度 0.7 与 top_p 0.95 属于共享评测工程设置，不是 Table 3 的论文超参数。
 
 ## 固定共享 solver 协议
 
@@ -63,24 +63,22 @@ bash selfplay/scripts/run_train.sh \
 
 Checkpoint封存双 adapter、AdamW状态、proposer task pool、训练游标和每个rank的RNG状态；续训必须沿用同一run、合同和world size。vLLM内部采样状态未封存，进程重启不保证轨迹逐位复现。CPU微型PEFT恢复测试只验证恢复后下一步参数一致，不证明真实vLLM采样可以逐位复现。
 
-训练完成后仍使用原始 `selfplay/config.yaml` 和同一 base/data 准备 checkpoint 评测合同；再比较两份合并结果：
+训练入口 `run_train.sh` 只负责训练，不会自动评测。要在所有训练 rank 退出、GPU 释放后串行评测四个 outer 快照，使用组合工作流脚本；它先校验 run 路径和已有 baseline 合同/结果，再训练，训练正常退出后才启动评测：
 
 ```bash
-python selfplay/evaluate.py prepare \
-  --config selfplay/config.yaml \
-  --alfworld-data /path/to/alfworld/data \
+bash selfplay/scripts/run_experiment.sh \
+  --run-id experiment-001 \
+  --run-dir /path/to/repo/selfplay/runs/explorer-zero-experiment-001 \
   --base /path/to/local/model \
-  --checkpoint /path/to/checkpoint \
-  --results-dir results/trained \
-  --output results/trained/contract.json
-bash selfplay/scripts/run_eval.sh results/trained/contract.json
-python selfplay/evaluate.py compare \
-  --baseline results/base/contract.merged.json \
-  --trained results/trained/contract.merged.json \
-  --output results/comparison.json
+  --alfworld-data /path/to/alfworld/data \
+  --baseline-contract results/base/contract.json \
+  --baseline-results results/base/contract.merged.json \
+  --backend vllm
 ```
 
-评测比较要求相同的 base 文件身份、协议签名和任务×种子网格。模型文件、tokenizer、评测配置、评测合同固定的评测相关源码、软件或数据池身份变化时，必须重做匹配基线；不能沿用不匹配的旧合同。本次改动只涉及训练代码，已有 baseline 合同通过校验后可继续使用，无需重跑基线。
+评测阶段逐个调用原有 `evaluate.py prepare`、`run_eval.sh` 和 `evaluate.py compare`，每个 outer 完成后才进入下一个。已有 baseline 不会重跑或写入。单独评测已完成的训练目录可运行 `python selfplay/evaluate_run.py --run-dir <run-dir> --baseline-results <base-merged.json> [--results-dir <run-dir>/evaluation]`；评测结果必须放在 run 目录内独立子目录。若目标目录已有完整且验证通过的四轮结果，会校验后跳过；若结果不完整，脚本保留现场并要求指定新的 `--results-dir`，不会删除或覆盖已有文件。
+
+每个 outer 的合同、合并结果、对照结果和命令日志保存在其子目录；顶层 `summary.json`/`summary.csv` 汇总四轮与 baseline 的对照。快照索引、封存和合同身份会在任何 GPU 评测启动前完成校验。评测仍使用原始 `selfplay/config.yaml`、同一基座与数据路径，确保协议签名与既有 baseline 相同。模型文件、tokenizer、评测配置、评测合同固定的评测相关源码、软件或数据池身份变化时，必须重做匹配基线；不能沿用不匹配的旧合同。本次改动只涉及训练代码，已有 baseline 合同通过校验后可继续使用，无需重跑基线。
 
 ## 结果状态与代码入口
 
