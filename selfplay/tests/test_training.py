@@ -19,7 +19,8 @@ sys.path.insert(0, str(SELFPLAY))
 
 torch = pytest.importorskip("torch")
 
-from ez_train import backward_microbatches
+from ez_train import (activate_rollout_adapter, backward_microbatches,
+                      sample_fresh_task_distributed)
 from grpo import per_token_logps
 from reward import TrajectoryStats
 from rollout import Trajectory
@@ -210,6 +211,160 @@ def test_shared_solver_sampling_settings_are_enforced():
     config["solver"]["temperature"] = 1.0
     with pytest.raises(train.ContractError, match="sampling"):
         train._validate_solver_sampling(config["solver"])
+
+
+def _fresh_task():
+    from ez_state import StateDelta, StateSnapshot
+    from ez_verify import ProposedTask
+    initial = StateSnapshot(facts=("atlocation(agent, kitchen)",), mode="facts")
+    return ProposedTask("put apple in fridge", initial, initial,
+                        StateDelta(added=("heated(apple)",)), game_file="game")
+
+
+def test_fresh_solver_task_retries_then_broadcast_payload_is_restorable():
+    from ez_train import sample_fresh_task_distributed
+    calls = []
+    def candidate(game, attempt):
+        calls.append((game, attempt))
+        return _fresh_task() if attempt == 2 else None
+
+    task = sample_fresh_task_distributed(
+        rank=0, world=1, dist_obj=None, game_files=["game-a"], outer=1,
+        step=4, max_attempts=4, sample_candidate=candidate)
+    assert len(calls) == 3
+    assert task.meta["uid"] == "solverfresh-o1-s4-a2"
+    assert task.meta["source_phase"] == "solver_fresh_proposer"
+    assert task.meta["source_outer"] == 1 and task.meta["source_step"] == 4
+
+
+def test_fresh_solver_task_rejection_is_bounded_and_nonroot_only_receives():
+    from ez_train import sample_fresh_task_distributed
+    calls = []
+    with pytest.raises(RuntimeError, match="rejected 3 consecutive"):
+        sample_fresh_task_distributed(
+            rank=0, world=1, dist_obj=None, game_files=["game-a"], outer=0,
+            step=0, max_attempts=3,
+            sample_candidate=lambda game, attempt: calls.append(attempt))
+    assert calls == [0, 1, 2]
+
+    class Receiver:
+        def broadcast_object_list(self, holder, src):
+            assert src == 0
+            holder[0] = {"ok": True, "task": _fresh_task().to_json()}
+    def must_not_sample(*_):
+        raise AssertionError("non-root must receive the broadcast task")
+    received = sample_fresh_task_distributed(
+        rank=1, world=2, dist_obj=Receiver(), game_files=[], outer=0,
+        step=1, max_attempts=3, sample_candidate=must_not_sample)
+    assert received.task_desc == "put apple in fridge"
+
+    class FailedReceiver:
+        def broadcast_object_list(self, holder, src):
+            holder[0] = {"ok": False, "error": "ValueError: sampler export failed"}
+    with pytest.raises(RuntimeError, match="sampler export failed"):
+        sample_fresh_task_distributed(
+            rank=1, world=2, dist_obj=FailedReceiver(), game_files=[], outer=0,
+            step=2, max_attempts=3, sample_candidate=must_not_sample)
+
+
+def test_adapter_sampler_routing_finishes_on_solver_after_fresh_proposer():
+    class Model:
+        active = None
+        def set_adapter(self, name):
+            self.active = name
+        def named_parameters(self):
+            return iter(())
+    model = Model()
+    sampler_routes = []
+    def sync(name):
+        sampler_routes.append((name, model.active))
+    activate_rollout_adapter(model, "proposer", sync)
+    activate_rollout_adapter(model, "solver", sync)
+    assert sampler_routes == [("proposer", "proposer"), ("solver", "solver")]
+    assert model.active == "solver"
+
+
+def test_nonfinite_microbatch_loss_is_flagged_before_backward(monkeypatch):
+    import grpo
+    from ez_dist import require_all_ranks_finite
+    model = TinyLM()
+    trajectory = _traj(input_ids=[1, 2, 3], loss_mask=[0, 1, 1], advantage=1.0)
+    monkeypatch.setattr(grpo, "grpo_loss", lambda *args, **kwargs: (
+        torch.tensor(float("nan"), requires_grad=True), {}))
+    finite = [True]
+    loss, _stats, valid = backward_microbatches(
+        model, model, [trajectory], pad_id=0, device=torch.device("cpu"),
+        adapter="solver", clip_eps=0.3, micro_batch_size=1, world=1,
+        loss_norm="seq", beta=0.0, loss_finite=finite)
+    assert valid == 1 and np.isnan(loss) and finite == [False]
+    assert all(parameter.grad is None for parameter in model.parameters())
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        require_all_ranks_finite(False, torch.device("cpu"), 1)
+
+
+def test_training_manifest_binds_baseline_and_training_only_context_override(tmp_path, monkeypatch):
+    import copy
+    import json
+    import train
+    import test_training_contract as baseline_tests
+    import eval_runner
+    import evaluation
+    from checkpoint import base_file_inventory
+
+    for variable in ("ALFWORLD_DATA", "WORLD_SIZE", "RANK", "LOCAL_RANK", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(variable, raising=False)
+    baseline_fixture = baseline_tests._fixture(tmp_path, monkeypatch)
+    contract_path, config_path, _old_inventory, data_root, _old_solver, contract = baseline_fixture
+    config = train._load_config(train.SELFPLAY_ROOT / "config.yaml")
+    config["env"]["config_path"] = str((train.SELFPLAY_ROOT / "alfworld.yaml").resolve())
+    original_bytes = (train.SELFPLAY_ROOT / "config.yaml").read_bytes()
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    # Build the baseline contract from the same frozen config and a tiny local model.
+    signature = contract["protocol_signature"]
+    signature["config"] = config
+    signature["config_sha256"] = evaluation.sha256_file(config_path)
+    signature["solver_settings"] = eval_runner._config_settings(config)
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(json.dumps({"model_type": "llama",
+        "eos_token_id": 2, "max_position_embeddings": 40960}), encoding="utf-8")
+    (base / "pytorch_model.bin").write_bytes(b"tiny-weight")
+    (base / "tokenizer.json").write_text("{}", encoding="utf-8")
+    inventory = base_file_inventory(base)
+    inventory_hash = evaluation.canonical_hash(inventory)
+    contract["base_path"] = str(base.resolve())
+    contract["base_inventory"] = {"files": [
+        {"path": name, **record} for name, record in sorted(inventory.items())]}
+    contract["arm_identity"]["base_inventory_sha256"] = inventory_hash
+    signature["base_inventory_sha256"] = inventory_hash
+    token_files = {name: {"path": name, **record} for name, record in inventory.items()
+                   if name.startswith("tokenizer") or name in
+                   ("vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json")}
+    signature["tokenizer_files_sha256"] = evaluation.canonical_hash(token_files)
+    baseline_tests._resign(contract)
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    monkeypatch.setattr(train, "_resolve_compat", lambda: {"mode": "native", "path": None})
+    monkeypatch.setattr(train, "_pool_manifest", lambda *args: {
+        "split": "train", "count": 1, "pool_order_sha256": "0" * 64, "entries": []})
+    resolved, manifest = train.resolve_training_manifest(
+        config_path, base, data_root, "hf", 8, baseline_contract_path=contract_path)
+    assert resolved["proposer"]["max_context_tokens"] == 40960
+    assert resolved["solver"]["max_context_tokens"] == 32768
+    assert resolved["runtime"]["vllm"]["max_model_len"] == 40960
+    assert manifest["baseline_binding"]["contract_sha256"] == contract["contract_sha256"]
+    assert manifest["baseline_binding"]["contract"] == contract
+    assert manifest["contract_sha256"] == train.contract_signature(manifest)
+    assert (train.SELFPLAY_ROOT / "config.yaml").read_bytes() == original_bytes
+
+    bad = copy.deepcopy(config)
+    bad["train"]["lr"] = 2e-4
+    bad_path = tmp_path / "bad-config.yaml"
+    bad_path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(train.ContractError, match="train.lr"):
+        train.resolve_training_manifest(bad_path, base, data_root, "hf", 8,
+                                        baseline_contract_path=contract_path)
 
 
 def test_real_peft_checkpoint_resumes_with_identical_adapter_weights(tmp_path):

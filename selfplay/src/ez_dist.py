@@ -202,3 +202,27 @@ def check_adapter_sync(model, adapter: str, world_size: int, dist_module=None,
     if bool(nonfinite.item()) or not torch.isfinite(maximum) or value > atol:
         raise RuntimeError(f"adapter {adapter} parameters diverged across ranks: max_abs={value}")
     return value
+
+
+def require_all_ranks_finite(local_finite: bool, device, world_size: int,
+                             dist_module=None, label: str = "training value") -> None:
+    """Raise synchronously on every rank if any rank observed a non-finite value."""
+    import torch
+    finite = torch.tensor([1 if local_finite else 0], dtype=torch.int32, device=device)
+    if world_size > 1:
+        dist = dist_module
+        if dist is None:
+            import torch.distributed as dist
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not bool(finite.item()):
+        raise FloatingPointError(f"non-finite {label} on at least one rank")
+
+
+def require_adapter_finite(model, adapter: str, world_size: int,
+                           dist_module=None, label: str = "updated adapter") -> None:
+    """Check active adapter weights locally, then fail collectively."""
+    import torch
+    params = active_lora_parameters(model, adapter)
+    finite = bool(params) and all(bool(torch.isfinite(p.detach()).all()) for _, p in params)
+    require_all_ranks_finite(finite, next(model.parameters()).device, world_size,
+                             dist_module, label=f"{label} ({adapter})")

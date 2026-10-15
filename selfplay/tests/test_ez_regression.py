@@ -156,15 +156,15 @@ def test_validity_filter_handles_quantifiers_adjectives_and_unsupported_objects(
 
 
 def test_declare_is_metadata_not_subtask_and_aliases_parse():
-    declared = parse_tool_call('<tool_call>{"arguments":{"action_type":"declare_task",'
+    declared = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"declare_task",'
                                '"task_description":"heat apple"}}</tool_call>')
     assert declared.kind == "declare"
-    sub = parse_tool_call('<tool_call>{"arguments":{"action_type":"subtask",'
+    sub = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"subtask",'
                           '"task_description":"heat apple"}}</tool_call>')
     assert sub.kind == "sub_finish"
-    put_alias = parse_tool_call('<tool_call>{"arguments":{"action_type":"put",'
+    put_alias = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"put",'
                                 '"object_name":"apple 1","receptacle_name":"fridge 1"}}</tool_call>')
-    move_alias = parse_tool_call('<tool_call>{"arguments":{"action_type":"move",'
+    move_alias = parse_tool_call('<tool_call>{"name":"alfworld_tool","arguments":{"action_type":"move",'
                                  '"object_name":"apple 1","receptacle_name":"fridge 1"}}</tool_call>')
     assert put_alias.kind == move_alias.kind == "action"
     assert put_alias.action == move_alias.action == "put apple 1 in/on fridge 1"

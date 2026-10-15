@@ -20,16 +20,17 @@ always emit it wrapped as `{"name":"alfworld_tool","arguments":{...}}` inside
 - Slice: Slice an object. `{"action_type": "slice", "object_name": "apple 1", "receptacle_name": "knife 1"}`"""
 
 PROPOSER_SYSTEM = """You are an AI agent exploring ALFWorld, a text-based household environment.
-You are NOT given a task. First declare the task you intend to pursue with `declare_task`.
+You are NOT given a task. Explore the scene first. You may use `declare_task` after exploring
+to record a candidate task before carrying it out; this declaration is optional.
 Your job is to EXPLORE this scene by interacting with it, and DISCOVER an interesting task
 that could be done here.
 Take a sequence of actions that changes the state of the world ... Aim for about 10 to 20
 actions.
 IMPORTANT: respond in this format.
-- On each exploration step: the <think></think> tags stay empty; write
+- On each step: the <think></think> tags stay empty; write
 a brief plain-text reasoning AFTER them about what interesting, state-changing action
 to take next, then output your action in <tool_call></tool_call> tags.
-- *** ONE ACTION PER RESPONSE -- THEN STOP IMMEDIATELY. ***
+- *** ONE TOOL CALL PER RESPONSE -- THEN STOP IMMEDIATELY. ***
   Your response must contain EXACTLY ONE <tool_call></tool_call> block and must end right
   after its closing tag. After emitting it, STOP: do not write a second tool call, do not
   explain what you would do next. The environment replies with the new observation, and only
@@ -55,10 +56,11 @@ Example: heat an apple -> sub_finish("Heat an apple.") -> put it on the countert
 finish("Heat some apple and put it on the countertop.")."""
 
 PROPOSER_USER_TEMPLATE = """{observation}
-Explore this scene. Take exactly ONE action per turn, then stop and wait for the observation.
-When you have reached an interesting state-changing result, stop and call `finish` with a
-`task_description` stating that task as an imperative instruction. You have at most {max_turns}
-turns.
+Explore this scene. Make exactly ONE tool call per turn, then stop and wait for the response.
+You may first explore, then optionally call `declare_task` with a non-empty candidate task and
+continue executing it. A declaration does not end the episode. When you have reached an
+interesting state-changing result, call `finish` with a non-empty imperative `task_description`.
+You may finish without a prior declaration. You have at most {max_turns} turns.
 {admissible_hint}"""
 
 ADMISSIBLE_HINT = "Admissible actions at this step: {admissible}"
