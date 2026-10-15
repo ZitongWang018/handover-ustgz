@@ -62,6 +62,17 @@ def _runtime_imports():
 
 def _upstream_imports():
     sys.path.insert(0, str(UPSTREAM))
+
+    # ★ 依赖装配按"已被三次成功运行验证过"的那套（用户：环境依赖用我们的、算法逻辑用上游的）：
+    #   `alfworld` / `textworld` / `tatsu` 一律取 selfplay/third_party/py310deps 里的版本，
+    #   而不是 upstream/ 快照里的副本。实测差异是致命的——
+    #   用 upstream 快照的 alfworld 时，textworld 解析 alfred.twl2 会在
+    #   tatsu/contexts.py:879 `self.cst = closure(self.cst)` 抛
+    #   TypeError: 'NoneType' object is not iterable（解析器全局状态被破坏），
+    #   随后连带 IndexError: pop from empty list（job 13050708/13050709）。
+    #   注：`upstream/` 仍然保留给**算法逻辑**（env_manager / prompt / projection 等按路径加载），
+    #   只是不让它提供 `alfworld` 这个运行时后端包。
+    sys.path.insert(0, str(SELFPLAY / "third_party" / "py310deps"))
     from agent_system.environments.alfworld.prompt import ALFWORLD_PLAY_PROMPT, get_alfworld_prompt
     from agent_system.environments.alfworld.memory import SimpleMemory
     from agent_system.environments.alfworld.projection import alfworld_projection
