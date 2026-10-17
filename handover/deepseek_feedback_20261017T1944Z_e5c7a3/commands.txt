@@ -1,0 +1,56 @@
+# 会话 e5c7a3 —— 关键命令（按时间顺序）
+
+# [1] 同步 9c3ea6b 到集群工作树（git archive + tar，未做 git reset/clean）
+cd ztwang && git archive origin/main -o /tmp/s3.tar
+scp /tmp/s3.tar hpc2:/tmp/s3.tar
+ssh hpc2 'cd ~/ztwang && tar xf /tmp/s3.tar -C ~/ztwang && rm -f /tmp/s3.tar'
+
+# [2] 全量测试
+ssh hpc2 'cd ~/ztwang && export ALFWORLD_DATA=$HOME/.cache/alfworld \
+  PYTHONPATH=$PWD/selfplay/src:$PWD/selfplay/third_party/py310deps && \
+  ~/miniconda3/envs/thinktool/bin/python -m pytest selfplay/tests/ -q'
+# → 101 passed, 1 skipped
+
+# [3] CPU AdamW 数值等价验证（对比 torch.optim.AdamW，20 步）
+ssh hpc2 'cd ~/ztwang && PYTHONPATH=$PWD/selfplay/src \
+  ~/miniconda3/envs/thinktool/bin/python - <<PYEOF
+import torch, sys
+sys.path.insert(0, "selfplay/src")
+from cpu_adamw import CPUStateAdamW
+torch.manual_seed(0)
+shape = (64, 32); w0 = torch.randn(shape)
+w_ref = w0.clone().requires_grad_(True); w_cpu = w0.clone().requires_grad_(True)
+ref = torch.optim.AdamW([w_ref], lr=1e-3, betas=(0.9,0.999), eps=1e-8, weight_decay=1e-2)
+cpu = CPUStateAdamW([w_cpu], lr=1e-3, betas=(0.9,0.999), eps=1e-8, weight_decay=1e-2)
+maxdiff = 0.0
+for i in range(20):
+    torch.manual_seed(100+i); g = torch.randn(shape)
+    w_ref.grad = g.clone(); w_cpu.grad = g.clone()
+    ref.step(); cpu.step()
+    maxdiff = max(maxdiff, (w_ref.detach()-w_cpu.detach()).abs().max().item())
+print("maxdiff = %.3e" % maxdiff)
+PYEOF'
+# → 20 步后最大逐元素差 = 0.000e+00（bit-exact）；state 全在 cpu
+
+# [4] 30B baseline 评测（a074f5c 修复后重做合同 + 重跑）
+ssh hpc2 'cd ~/ztwang && <env> python selfplay/evaluate.py prepare \
+  --config selfplay/config.yaml --alfworld-data $HOME/.cache/alfworld \
+  --base $HOME/thinktool/models/qwen3-30b-a3b-inst-2507 \
+  --base-only --results-dir results/base30b-v2 --output results/base30b-v2/contract.json'
+# → prepared 140 tasks x 5 seeds; contract=8e58ce3098b1a53e501b5d3a256fb3d572725388553160ef588ed9e68db9cf40
+
+ssh hpc2 'sbatch --account=root --partition=i64m1tga800u8ka --gres=gpu:8 \
+  --job-name=ez-base30b-v2 --wrap="... bash selfplay/scripts/run_eval.sh results/base30b-v2/contract.json"'
+# → 13159927 COMPLETED 22:43 exit=0；merged 700 episodes; SR=0.0843
+
+# [5] 从 rows 重算统计（只读）
+ssh hpc2 'cd ~/ztwang && python - <<PYEOF
+import json, collections
+d = json.load(open("results/base30b-v2/contract.merged.json"))
+# 逐类型 / 逐 seed / action_tag_valid 率 / truncated 率 / trace raw_output
+PYEOF'
+
+# [6] 本反馈分支（用 worktree 隔离，避免动到未提交的本地改动）
+git worktree add .worktrees/e5c7a3 -b deepseek-feedback/e5c7a3 origin/main
+git -C .worktrees/e5c7a3 add handover/deepseek_feedback_20261017T1944Z_e5c7a3/REPORT.md
+git -C .worktrees/e5c7a3 commit -m "..." && git -C .worktrees/e5c7a3 push -u origin deepseek-feedback/e5c7a3

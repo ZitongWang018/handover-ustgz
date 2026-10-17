@@ -1,0 +1,79 @@
+{
+  "session_id": "e5c7a3",
+  "utc": "2026-10-17T19:44Z",
+  "base_commit": "9c3ea6b",
+  "implementation_modified": false,
+  "user_decision": "使用 Qwen3-30B-A3B-Instruct-2507（指令版），不用 base 版",
+  "baseline_run": {
+    "job_id": "13159927",
+    "name": "ez-base30b-v2",
+    "state": "COMPLETED",
+    "elapsed": "00:22:43",
+    "exit_code": "0:0",
+    "node": "gpu1-23",
+    "contract_sha256_prefix": "8e58ce30",
+    "tasks_x_seeds": "140 x 5",
+    "episodes": 700,
+    "episode_weighted_sr": 0.0843,
+    "macro_6type_sr": 0.083,
+    "per_seed_episode_sr": [0.0643, 0.0571, 0.0857, 0.1143, 0.1000],
+    "per_type_sr": {
+      "look_at_obj_in_light": 0.200,
+      "pick_and_place_simple": 0.177,
+      "pick_two_obj_and_place": 0.042,
+      "pick_clean_then_place_in_recep": 0.037,
+      "pick_cool_then_place_in_recep": 0.032,
+      "pick_heat_then_place_in_recep": 0.012
+    },
+    "artifacts": "~/ztwang/results/base30b-v2/{contract.json, contract.merged.json, rank0..7.json}"
+  },
+  "invalidity_diagnosis": {
+    "verdict": "该 baseline 数值无效，不反映 30B-A3B 能力",
+    "evidence": [
+      "rows[*].trace[*].raw_output 中模型逐字复读提示词示例，例如 ' For example, if you want to go to the sinkbasin 1, you should write: <action>go to sinkbasin 1</action>'",
+      "action_tag_valid 率 = 0.994（格式齐备、语义错误）",
+      "truncated 率 = 0.004（非长度截断）",
+      "总步数 20046，700/700 行均含 trace"
+    ],
+    "root_cause": "协议向模型喂原始纯文本、不套 chat template（base 模型用法）；而 qwen3-30b-a3b-inst-2507 是指令版模型。对照：4B 用的 qwen3_4b 是 base 模型，故同协议下 SR=0.3200 正常。",
+    "not_verified": "未做 '同模型加 chat template 后重测' 的对照实验，因此上述根因为基于 trace 的推断"
+  },
+  "baseline_4b_reference": {
+    "episode_weighted_sr": 0.32,
+    "macro_6type_sr": 0.291,
+    "per_seed_episode_sr": [0.393, 0.343, 0.293, 0.307, 0.264],
+    "source": "~/ztwang/results/base/contract.merged.json"
+  },
+  "training_code_review": {
+    "commit": "9c3ea6b",
+    "tests": "101 passed, 1 skipped",
+    "cpu_adamw_equivalence": {
+      "compared_against": "torch.optim.AdamW",
+      "steps": 20,
+      "max_abs_elementwise_diff": 0.0,
+      "verdict": "bit-exact"
+    },
+    "optimizer_state_device": "cpu",
+    "profile_mutations": [
+      "train.generation_max_batch_size: 2 -> 1",
+      "runtime.memory_profile = qwen3_moe_cpu",
+      "runtime.optimizer_state_device = cpu",
+      "runtime.activation_offload = true",
+      "backend -> hf"
+    ],
+    "hyperparameters_unchanged": ["G=16", "GP=8", "TPS=1", "4 loops x (25+25)", "lr=1e-4", "clip=0.3", "KL=0.001", "LoRA r32 alpha32", "w_sub=0.3", "w_div=0.3"],
+    "precondition_checks": ["backend=hf", "model_type=qwen3_moe", "dtype=bfloat16", "lora=True", "lora_targets=all-linear", "gradient_checkpointing=True", "world_size=8"]
+  },
+  "broken_links": [
+    {"id": 1, "what": "训练用 HF 后端，30B baseline 用 vLLM 后端", "impact": "训练后无法与现有 baseline 配对比较（维护方 REPORT 亦如此说明）", "fix_owner": "维护方"},
+    {"id": 2, "what": "run_experiment.sh / evaluate_run.py 不适用于 qwen3_moe_cpu profile", "impact": "四快照自动评测不可用（vLLM 0.8.5 无法加载 MoE LoRA checkpoint）", "fix_owner": "维护方"},
+    {"id": 3, "what": "速度/整机 RAM/磁盘峰值未实测", "impact": "无法给出训练时长承诺", "fix_owner": "需授权后实测"}
+  ],
+  "boundary_check": {
+    "authorized_root": "/hpc2hdd/home/xyu608/ztwang",
+    "other_user_dirs_touched": false,
+    "readonly_models": "/hpc2hdd/home/xyu608/thinktool/models/",
+    "results_base_4b_untouched": true
+  },
+  "not_done": ["未修改任何源码/配置/提示模板/解析器/启动脚本", "未重试失败运行", "未启动训练", "未删除任何既有文件", "未推 main"]
+}
