@@ -256,5 +256,3 @@ def test_multi_device_mask_is_rejected_with_diagnostic_and_environment_restored(
     assert record["status"] == "failed"
     assert record["device_mask"] == "2,3"
     assert "run_train.sh" in record["exception_traceback"]
-
-\n

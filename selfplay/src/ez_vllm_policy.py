@@ -82,26 +82,21 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
                       max_num_seqs: int = 64, max_num_batched_tokens: int = 16384,
                       enable_prefix_caching: bool = True,
                       enforce_eager: bool = False, seed: int = 1234,
-                      trust_remote_code: bool = True):
+                      trust_remote_code: bool = True,
+                      enable_lora: bool = True):
     """构造单进程（= 单卡 TP=1）vLLM 引擎。
 
-    显存口径：训练侧的 HF 模型**同时**驻留同一张卡，所以 `gpu_memory_utilization`
-    是**总显存**的一个比例，必须给训练侧留足。A800 80G 下训练侧实测 ~20G，
-    给 vLLM 0.40 即 ~32G（权重 8G + KV ~24G），双方都宽裕。
+    `gpu_memory_utilization` 控制 vLLM 在可见 GPU 上的显存预算；共享 GPU 时需
+    按该设备上其他进程的占用共同规划。
     """
     from vllm import LLM
-    return LLM(
+    kwargs = dict(
         model=base_path,
         tokenizer=base_path,
         dtype="bfloat16",
         trust_remote_code=bool(trust_remote_code),
         gpu_memory_utilization=float(gpu_memory_utilization),
         max_model_len=int(max_model_len),
-        enable_lora=True,
-        max_lora_rank=int(max_lora_rank),
-        # 只需要 proposer / solver 两个 adapter 轮换驻留。
-        max_loras=2,
-        max_cpu_loras=4,
         max_num_seqs=int(max_num_seqs),
         max_num_batched_tokens=int(max_num_batched_tokens),
         enable_prefix_caching=bool(enable_prefix_caching),
@@ -109,6 +104,12 @@ def build_vllm_engine(base_path: str, *, gpu_memory_utilization: float = 0.40,
         disable_log_stats=True,
         seed=int(seed),
     )
+    if enable_lora:
+        kwargs.update(enable_lora=True, max_lora_rank=int(max_lora_rank),
+                      max_loras=2, max_cpu_loras=4)
+    else:
+        kwargs["enable_lora"] = False
+    return LLM(**kwargs)
 
 
 def normalize_sampling(cfg: RolloutConfig) -> Dict[str, Any]:

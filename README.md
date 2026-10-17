@@ -38,6 +38,8 @@ bash selfplay/scripts/run_eval.sh results/base/contract.json
 
 准备合同会固定当前数据根路径、ALFWorld YAML、实际发现的完整 `valid_seen` 池、五种子、评测源码/软件版本、配置和基座/tokenizer文件身份。合同校验拒绝 checksum 或嵌套身份不一致、错误 split、不同模型/solver/source/config/data，或当前发现的任务池与合同不同。合同必须来自 `--base-only` 基线臂。
 
+30B baseline 单独使用 `--base-only` 评测：factory 对 base-only 关闭 LoRA（`enable_lora=False`），checkpoint 评测才启用 LoRA；8 卡仍是一张卡一个 rank。评测固定沿用 full `valid_seen`、5 seeds、30 turns、32,768 context、temperature 0.7、top_p 0.95、1024 新 token、batch 32 和 GPU memory utilization 0.85，不降上下文/采样、不切 HF backend、不换权重。源码哈希变化后，旧 30B 合同不能复用；失败合同原样保留，必须用新的 `results/base30b-loraoff-<唯一ID>` 目录重新 prepare。完整命令、边界和未验证事项见 [30B baseline 交接报告](handover/gpt_feedback_20261017_30b_baseline/REPORT.md)。
+
 ```bash
 bash selfplay/scripts/run_train.sh \
   --base /path/to/local/model \

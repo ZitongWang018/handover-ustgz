@@ -245,5 +245,3 @@ def build_training_vllm_engine(base_path: str, *, rank: int,
             "Training vLLM startup failed. See the per-rank diagnostic JSON for the "
             "complete traceback; no alternate backend was selected.") from failure
     return engine
-
-\n

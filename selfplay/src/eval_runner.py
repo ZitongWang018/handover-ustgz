@@ -199,11 +199,14 @@ def prepare(args) -> int:
 
 def _load_policy(contract: dict, tokenizer):
     sig, arm = contract["protocol_signature"], contract["arm_identity"]
+    if arm.get("kind") not in {"base-only", "checkpoint"}:
+        raise ValueError(f"unsupported evaluation arm kind: {arm.get('kind')!r}")
     if sig["backend"] == "vllm":
         from ez_vllm_policy import VLLMPolicy, build_vllm_engine
         engine = build_vllm_engine(contract["base_path"], gpu_memory_utilization=sig["gpu_memory_utilization"],
             max_model_len=sig["max_context_tokens"], max_lora_rank=32,
-            max_num_seqs=sig["batch_size"], seed=SEEDS[0])
+            max_num_seqs=sig["batch_size"], seed=SEEDS[0],
+            enable_lora=arm["kind"] == "checkpoint")
         policy = VLLMPolicy(engine, tokenizer)
         if arm["kind"] == "checkpoint": policy.set_lora("solver", arm["solver_path"])
         return policy
