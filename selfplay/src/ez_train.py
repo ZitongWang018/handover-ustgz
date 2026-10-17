@@ -33,6 +33,7 @@ from ez_dist import (broadcast_pool_indices, check_adapter_sync, gather_group_va
                      sync_active_adapter_gradients, require_all_ranks_finite,
                      require_adapter_finite)  # noqa: E402
 from rollout import HFPolicy, RolloutConfig  # noqa: E402
+from training_memory import activation_offload_context, build_memory_footprint_report  # noqa: E402
 from grpo import (build_model_and_tokenizer, grpo_loss,  # noqa: E402
                         is_main, load_cfg, log0, make_batch, per_token_logps,
                         set_seed, setup_dist)
@@ -237,9 +238,21 @@ def tokenize_proposer_rollout(ro: ProposerRollout) -> ProposerRollout:
     return ro
 
 
-def update_probe(model, opt_params, optimizer, tag: str) -> float:
+def update_probe(model, opt_params, optimizer, tag: str, *, bounded_cpu: bool = False) -> float:
     """Report displacement across active trainable adapter parameters."""
     probes = [p for p in opt_params if p.grad is not None and p.requires_grad]
+    if bounded_cpu:
+        samples = probes[:3]
+        before = [p.detach().reshape(-1)[:4096].cpu().clone() for p in samples]
+        optimizer.step()
+        ratios = []
+        for p, old in zip(samples, before):
+            now = p.detach().reshape(-1)[:4096].cpu()
+            delta, norm = float((now - old).norm()), float(now.norm())
+            ratios.append(delta / (norm + delta) if norm + delta else 0.0)
+        result = max(ratios, default=0.0)
+        log(f"[{tag}] sampled_update_rel={result:.3e} (CPU probe: <=3 tensors, <=4096 values each; not global displacement)")
+        return result
     if not probes:
         log(f"[{tag}] update_rel=0（没有任何参数带 grad，优化器无事可做）")
         return 0.0
@@ -698,6 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log("[dist] ⚠️ 检测到 WORLD_SIZE>1 但进程组未生效 —— torchrun 参数可能没传进去")
 
     tcfg = cfg["train"]
+    offload_activations = bool(cfg["runtime"].get("activation_offload", False))
     # 用 is not None 而不是 or：--max-outer 0（只跑构建自检）不会被 falsy 吃掉
     N = tcfg.get("outer_loops", 4)
     M_P, M_S = tcfg.get("proposer_steps", 25), tcfg.get("solver_steps", 25)
@@ -825,6 +839,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"expected={expected_tokenizer_class!r}, actual={actual_tokenizer_class!r}")
     log(f"[identity] tokenizer_class={actual_tokenizer_class} matches baseline contract")
     raw = build_dual_lora(raw, cfg, resume_checkpoint=resume_ckpt)
+    if cfg["runtime"].get("memory_profile") == "qwen3_moe_cpu":
+        from uuid import uuid4
+        report = build_memory_footprint_report(raw, "qwen3_moe_cpu")
+        report_dir = run_dir / "runtime"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"memory_rank{rank}_{uuid4().hex}.json"
+        with report_path.open("x", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+        log(f"[memory] rank={rank} report={report_path} accounting only; real peaks require GPU measurement")
     broadcast_adapter_parameters(raw, world, dist)
 
     # ---- 启动自检：dtype / adapter / GC / facts（跑几小时前先炸掉所有致命项）----
@@ -872,7 +896,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- 梯度链自检：两个 adapter 是否各自都能接到梯度（不依赖环境/奖励）----
     #   在 phase 切换前跑：自检直接验证两个 adapter 的 forward/backward 梯度链
     #   会额外触发 reducer，日志更乱且没有诊断价值。device 见下一行。
-    _gc = grad_chain_selfcheck(raw, tokenizer, next(raw.parameters()).device)
+    with activation_offload_context(offload_activations):
+        _gc = grad_chain_selfcheck(raw, tokenizer, next(raw.parameters()).device)
     log(f"[selfcheck] 梯度链 proposer grad_norm={_gc['proposer_grad_norm']:.4e} "
         f"({int(_gc.get('proposer_params_with_grad', 0))} 个张量有 grad) | "
         f"solver grad_norm={_gc['solver_grad_norm']:.4e} "
@@ -969,8 +994,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     opt_params = [p for n, p in raw.named_parameters() if "lora_" in n]
     if not opt_params:
         raise SystemExit("没有找到任何 LoRA 参数，检查 peft 适配是否正常")
-    optimizer = torch.optim.AdamW(opt_params, lr=tcfg.get("lr", 1e-4),
-                                  weight_decay=tcfg.get("weight_decay", 0.0))
+    bounded_cpu_probe = cfg["runtime"].get("optimizer_state_device") == "cpu"
+    if bounded_cpu_probe:
+        from cpu_adamw import CPUStateAdamW
+        optimizer_class = CPUStateAdamW
+    else:
+        optimizer_class = torch.optim.AdamW
+    optimizer = optimizer_class(opt_params, lr=tcfg.get("lr", 1e-4),
+                                weight_decay=tcfg.get("weight_decay", 0.0))
     if resume_ckpt is not None:
         optimizer_path = resume_ckpt / "optimizer.pt"
         if not optimizer_path.is_file():
@@ -1155,11 +1186,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _diag.append((round(max(full_advs) - min(full_advs), 3),
                               [len(c.__dict__["input_ids"]) for c in groll],
                               [int(sum(c.__dict__["loss_mask"][1:])) for c in groll]))
-                _g_loss, _g_stats, _g_valid = backward_microbatches(
-                    raw, model, trajs_like, pad_id, device, adapter="proposer",
-                    clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
-                    loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
-                    group_weight=_group_weight, loss_finite=_p_loss_finite)
+                with activation_offload_context(offload_activations):
+                    _g_loss, _g_stats, _g_valid = backward_microbatches(
+                        raw, model, trajs_like, pad_id, device, adapter="proposer",
+                        clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
+                        loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
+                        group_weight=_group_weight, loss_finite=_p_loss_finite)
                 _p_loss_sum += _g_loss
                 _stats_local = {key: sum(float(row.get(key, 0.0)) for row in _g_stats)
                                 for key in ("pg_sequence_sum", "kl_sequence_sum",
@@ -1191,7 +1223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _clip_norm_p = torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
             require_all_ranks_finite(bool(torch.isfinite(_clip_norm_p).all()), device,
                                      world, dist, label="proposer gradient clip norm")
-            _update_rel_p = update_probe(raw, opt_params, optimizer, f"outer {outer} P{step}")
+            _update_rel_p = update_probe(raw, opt_params, optimizer, f"outer {outer} P{step}", bounded_cpu=bounded_cpu_probe)
             require_adapter_finite(raw, "proposer", world, dist)
             if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
                 _sync_max = check_adapter_sync(raw, "proposer", world, dist)
@@ -1330,11 +1362,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                                           if rank == 0 else 0.0)
                 for r, a in zip(grp, full_advs[rank::world]):
                     r.traj.advantage = a
-                _g_loss, _g_stats, _g_valid = backward_microbatches(
-                    raw, model, [r.traj for r in grp], pad_id, device, adapter="solver",
-                    clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
-                    loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
-                    group_weight=_group_weight, loss_finite=_s_loss_finite)
+                with activation_offload_context(offload_activations):
+                    _g_loss, _g_stats, _g_valid = backward_microbatches(
+                        raw, model, [r.traj for r in grp], pad_id, device, adapter="solver",
+                        clip_eps=clip_eps, micro_batch_size=micro_batch_size, world=world,
+                        loss_norm=loss_norm, beta=kl_beta, dist_obj=dist,
+                        group_weight=_group_weight, loss_finite=_s_loss_finite)
                 _s_loss_sum += _g_loss
                 _stats_local = {key: sum(float(row.get(key, 0.0)) for row in _g_stats)
                                 for key in ("pg_sequence_sum", "kl_sequence_sum",
@@ -1370,7 +1403,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _clip_norm_s = torch.nn.utils.clip_grad_norm_(opt_params, max_grad_norm)
             require_all_ranks_finite(bool(torch.isfinite(_clip_norm_s).all()), device,
                                      world, dist, label="solver gradient clip norm")
-            _update_rel_s = update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}")
+            _update_rel_s = update_probe(raw, opt_params, optimizer, f"outer {outer} S{step}", bounded_cpu=bounded_cpu_probe)
             require_adapter_finite(raw, "solver", world, dist)
             if step == 0 or (check_sync_every > 0 and (step + 1) % check_sync_every == 0):
                 _sync_max = check_adapter_sync(raw, "solver", world, dist)

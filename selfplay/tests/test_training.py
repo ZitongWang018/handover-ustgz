@@ -367,7 +367,8 @@ def test_training_manifest_binds_baseline_and_training_only_context_override(tmp
                                         baseline_contract_path=contract_path)
 
 
-def test_real_peft_checkpoint_resumes_with_identical_adapter_weights(tmp_path):
+@pytest.mark.parametrize("cpu_optimizer", [False, True])
+def test_real_peft_checkpoint_resumes_with_identical_adapter_weights(tmp_path, cpu_optimizer):
     transformers = pytest.importorskip("transformers")
     peft = pytest.importorskip("peft")
     from checkpoint import ContractError, contract_signature, validate_checkpoint_v3
@@ -384,7 +385,9 @@ def test_real_peft_checkpoint_resumes_with_identical_adapter_weights(tmp_path):
                   "lora_targets": ["q_proj", "v_proj"]},
     }
     model = build_dual_lora(base, config)
-    optimizer = torch.optim.AdamW(
+    from cpu_adamw import CPUStateAdamW
+    optimizer_class = CPUStateAdamW if cpu_optimizer else torch.optim.AdamW
+    optimizer = optimizer_class(
         [p for n, p in model.named_parameters() if "lora_" in n], lr=1e-3)
     ids = torch.tensor([[1, 4, 5, 6, 2]])
     for adapter in ("proposer", "solver"):
@@ -463,7 +466,7 @@ def test_real_peft_checkpoint_resumes_with_identical_adapter_weights(tmp_path):
         assert expected.keys() == actual.keys()
         for name in expected:
             torch.testing.assert_close(expected[name], actual[name], rtol=0, atol=0)
-    restored_optimizer = torch.optim.AdamW(
+    restored_optimizer = optimizer_class(
         [p for n, p in restored.named_parameters() if "lora_" in n], lr=1e-3)
     uid = restore_ez_optimizer_rng(
         restored_optimizer, checkpoint / "optimizer.pt", rng_path)

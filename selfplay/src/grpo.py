@@ -73,10 +73,13 @@ def build_model_and_tokenizer(cfg: dict, local_rank: int, world: int,
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path), local_files_only=True, trust_remote_code=False)
     tokenizer.padding_side = "right"
+    load_kwargs = {}
+    if cfg.get("runtime", {}).get("memory_profile") == "qwen3_moe_cpu" and torch.cuda.is_available():
+        load_kwargs.update(device_map={"": torch.device("cuda", local_rank)}, low_cpu_mem_usage=True)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path), local_files_only=True, trust_remote_code=False,
         torch_dtype=dtype_map[mcfg["dtype"]],
-        attn_implementation=mcfg["attn_implementation"])
+        attn_implementation=mcfg["attn_implementation"], **load_kwargs)
     model.config.use_cache = False
     if mcfg.get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

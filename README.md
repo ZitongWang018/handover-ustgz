@@ -84,6 +84,8 @@ bash selfplay/scripts/run_experiment.sh \
 
 ## 结果状态与代码入口
 
+30B 训练使用显式 `run_train.sh --memory-profile qwen3_moe_cpu --backend hf`：同一 HF 基座负责采样与更新，AdamW 状态及保存的反向激活卸载到 CPU，训练生成微批为 1；保留现有算法、all-linear 双 LoRA 与 solver 协议。原 baseline 评测源码和配置未变。此 profile 不用 `run_experiment.sh` 自动评测：现有 vLLM 仍不支持 MoE LoRA checkpoint，训练后需另行准备支持 adapter 的匹配评测。运行、续训、资源与验证边界见 [30B 训练交接](handover/gpt_feedback_20261018_30b_training/REPORT.md)；代码验证不等于真实八卡运行已通过。
+
 当前工作树尚未取得目标服务器上的完整基线合同，因此新增校验只证明训练时可验证绑定，不能据此声称基线已绑定、评测已完成或训练提升已确认。仓库当前也没有本协议的 GPU 训练和完整五种子评测结果；实际运行后再报告分数与差值。
 
 ```text

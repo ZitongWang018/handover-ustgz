@@ -30,6 +30,7 @@ from checkpoint import (  # noqa: E402
     sha256_file,
     validate_checkpoint_v3,
 )
+from training_memory import apply_training_memory_profile  # noqa: E402
 
 
 SOURCE_PATHS = (
@@ -38,6 +39,8 @@ SOURCE_PATHS = (
     "selfplay/alfworld.yaml",
     "selfplay/scripts/run_train.sh",
     "selfplay/src/checkpoint.py",
+    "selfplay/src/cpu_adamw.py",
+    "selfplay/src/training_memory.py",
     "selfplay/src/training_contract.py",
     "selfplay/src/training_runtime.py",
     "selfplay/src/training_snapshots.py",
@@ -261,7 +264,7 @@ def _validate_solver_sampling(solver_cfg: dict[str, Any]) -> None:
 
 def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Path,
                               backend: str, world_size: int, *, baseline_contract_path: Path,
-                              smoke: bool = False
+                              smoke: bool = False, memory_profile: str = "default"
                               ) -> tuple[dict[str, Any], dict[str, Any]]:
     cfg = _load_config(config_path)
     if cfg.get("protocol_version") != 3 or cfg.get("protocol_name") != "explorer_zero_skillrise":
@@ -272,6 +275,12 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
     data = Path(data_root).expanduser().resolve()
     if not base.is_dir() or not (base / "config.json").is_file():
         raise ContractError("--base must be an existing local model directory with config.json")
+    model_config = _json_load(base / "config.json")
+    if model_config.get("model_type") == "qwen3_moe":
+        if backend == "vllm":
+            raise ContractError("Qwen3-MoE training requires --memory-profile qwen3_moe_cpu --backend hf")
+        if memory_profile != "qwen3_moe_cpu":
+            raise ContractError("Qwen3-MoE requires explicit --memory-profile qwen3_moe_cpu")
     if not data.is_dir():
         raise ContractError("--alfworld-data must be an existing local data directory")
     if isinstance(world_size, bool) or world_size < 1:
@@ -306,6 +315,10 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
     cfg.setdefault("env", {})["data_root"] = str(data)
     cfg["runtime"]["backend"] = backend
     cfg["runtime"]["world_size"] = int(world_size)
+    try:
+        backend = apply_training_memory_profile(cfg, model_config, memory_profile, backend)
+    except ValueError as exc:
+        raise ContractError(str(exc)) from None
     # Paper Table 3 uses 40,960 context. Keep the shared ReAct solver context
     # at 32,768 and widen only the training proposer / generation engine.
     cfg["proposer"]["max_context_tokens"] = 40960
@@ -360,7 +373,6 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
                        or Path(name).name in {"config.json", "generation_config.json"}}
     if not any(Path(name).name in TOKENIZER_BASENAMES for name in tokenizer_files):
         raise ContractError("local base has no recognizable tokenizer files")
-    model_config = _json_load(base / "config.json")
     max_positions = model_config.get("max_position_embeddings")
     rope_scaling = model_config.get("rope_scaling")
     if (isinstance(max_positions, int) and not isinstance(max_positions, bool)
@@ -445,6 +457,19 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
             "device_environment": env_override.pop("device_environment", {}),
         },
     }
+    if memory_profile == "qwen3_moe_cpu":
+        resources = {
+            "runtime.backend": "hf",
+            "runtime.memory_profile": "qwen3_moe_cpu",
+            "runtime.optimizer_state_device": "cpu",
+            "runtime.activation_offload": True,
+            "train.generation_max_batch_size": 1,
+        }
+        manifest["effective_overrides"].update({
+            key: {"value": value, "source": "explicit --memory-profile qwen3_moe_cpu"}
+            for key, value in resources.items()})
+        manifest["backend"].update(memory_profile=memory_profile,
+            optimizer_state_device="cpu", activation_offload=True, generation_max_batch_size=1)
     manifest["contract_sha256"] = contract_signature(manifest)
     return cfg, manifest
 
@@ -619,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline-contract", type=Path, required=True,
                         help="existing base-only evaluation contract for the frozen shared protocol")
     parser.add_argument("--backend", choices=("hf", "vllm"), default=None)
+    parser.add_argument("--memory-profile", choices=("default", "qwen3_moe_cpu"),
+                        default="default", help="qwen3_moe_cpu uses shared HF sampling and CPU offload")
     parser.add_argument("--run-id", required=True, help="shared id passed identically to every torchrun rank")
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--resume", type=Path, default=None)
@@ -632,13 +659,14 @@ def main(argv: list[str] | None = None) -> int:
         local_error = None
         try:
             raw_cfg = _load_config(args.config)
-            backend = args.backend or str(raw_cfg["runtime"]["backend"])
+            backend = args.backend or ("hf" if args.memory_profile == "qwen3_moe_cpu"
+                                       else str(raw_cfg["runtime"]["backend"]))
             expected_world = (args.world_size if args.world_size is not None
                               else int(raw_cfg["runtime"]["world_size"]))
             cfg, manifest = resolve_training_manifest(
                 args.config.resolve(), args.base, args.alfworld_data, backend,
                 expected_world, baseline_contract_path=args.baseline_contract.resolve(),
-                smoke=args.smoke)
+                smoke=args.smoke, memory_profile=args.memory_profile)
             if args.smoke and args.resume is not None:
                 raise ContractError("--smoke cannot resume a checkpoint")
         except Exception as exc:  # join distributed preflight and broadcast a uniform failure
