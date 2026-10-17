@@ -1,0 +1,88 @@
+{
+  "base_commit": "9c3ea6b636f1616c0695e730721055eaaf7ba8a6",
+  "scope": "30B Instruct chat-template input and paired HF evaluation",
+  "server_accessed": false,
+  "jobs_started": false,
+  "weights_downloaded": false,
+  "test_summary": {
+    "passed": 112,
+    "skipped": 2,
+    "warnings": 2,
+    "seconds": 28.51,
+    "mode": "local CPU"
+  },
+  "python": "3.12.14",
+  "packages": {
+    "torch": "2.7.1+cpu",
+    "transformers": "4.57.6",
+    "peft": "0.17.1",
+    "pytest": "9.1.1",
+    "tokenizers": "0.22.2"
+  },
+  "files": {
+    "selfplay/config.yaml": {
+      "size": 1753,
+      "sha256": "79fce10750d2d12ad574f6307fb284fce8b833c82fe1ed38a0fb168f03f3ccc5"
+    },
+    "selfplay/src/protocol.py": {
+      "size": 6466,
+      "sha256": "bc22a41ca74bf60e6cb52a491370e65c90eb22178fe6fc0a10678f0247a4096a"
+    },
+    "selfplay/src/rollout.py": {
+      "size": 27059,
+      "sha256": "c02f52d2431543f870106edd2b9ad620e91751313dd55aa438ef86da65407995"
+    },
+    "selfplay/src/ez_solver.py": {
+      "size": 7021,
+      "sha256": "bc6c95c7c081ad38bb2ff9dda49e1b6203b5d122943cf61ec64dec82e8dabc7f"
+    },
+    "selfplay/src/eval_runner.py": {
+      "size": 28121,
+      "sha256": "e502375eb41bd2b13cb858842a3b63d3f9e621e2c29ac9d766e741ccbcb9a929"
+    },
+    "selfplay/src/evaluation.py": {
+      "size": 20159,
+      "sha256": "c3c7df35cbe91f55c75ca05189fe4f74ac0a0ecd02eb47345a579585f8fefe97"
+    },
+    "selfplay/src/training_contract.py": {
+      "size": 9778,
+      "sha256": "cf6f6fb60612f31b47945930f3dcd443134313fb3125f18070cfabdb7167a354"
+    },
+    "selfplay/src/grpo.py": {
+      "size": 14503,
+      "sha256": "4d2896df9f172cbcc53b79ca1bd832ff0c5405d1e7d3db4ed05f70c61746bfdc"
+    },
+    "selfplay/train.py": {
+      "size": 36609,
+      "sha256": "f82d2d7694ae5af4731902b3420763d513ca9703e1afc5654d178f9d860cba45"
+    },
+    "selfplay/evaluate_run.py": {
+      "size": 30029,
+      "sha256": "c53c001c267b69b81ec75afa2194477ab322b39ff44645e6e4083f4d6bc7274d"
+    },
+    "selfplay/scripts/run_experiment.sh": {
+      "size": 6134,
+      "sha256": "578128e02ba5da31386b14e1f0e5fa61aab7fbcd3cdb72aa010e21817d0d2c5b"
+    },
+    "selfplay/tests/test_chat_protocol.py": {
+      "size": 8819,
+      "sha256": "2585c59036a23096a19f1fadf4aecc2bdf7459065602fc103cdcf2634f7ff18c"
+    },
+    "selfplay/tests/test_experiment_shell.py": {
+      "size": 3163,
+      "sha256": "395fe36bfbfcf06afd9ff5bdeda712115e4946dc508ef62338e489094b428309"
+    }
+  },
+  "not_verified": [
+    "target 30B success rate",
+    "8xA800 GPU and host memory peak",
+    "training and evaluation throughput",
+    "complete four-outer production results"
+  ],
+  "hash_basis": "staged Git blob bytes (LF-normalized), not local checkout line endings",
+  "final_review": {
+    "job_id": "d63f1cf4-135e-47e4-9bf5-4573ca15d099",
+    "status": "completed",
+    "reviewer": "GPT accepted and tested concrete identity gaps; launcher already pinned GPUs, added explicit misuse guard"
+  }
+}

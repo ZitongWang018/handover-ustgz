@@ -30,6 +30,7 @@ class RolloutConfig:
     seed: Optional[int] = None
     log_every: int = 0
     max_batch_size: int = 0             # 0 processes the full request batch
+    prompt_format: str = "raw"          # explicit chat_template in the current shared config
 
 
 # --------------------------------------------------------------------------- 数据结构

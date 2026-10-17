@@ -19,6 +19,14 @@ from protocol import build_skillrise_prompt, encode_raw_prompt
 
 
 class TinyTokenizer:
+    chat_template = "test role-wrapping template v1"
+    def get_chat_template(self):
+        return self.chat_template
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        rendered = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n"
+        return [ord(c) for c in rendered] if tokenize else rendered
     def __call__(self, text, add_special_tokens=True):
         # Deterministic stand-in to prove the protocol receives the raw prompt.
         return {"input_ids": [ord(c) for c in text] + ([1] if add_special_tokens else [])}
@@ -148,7 +156,8 @@ def test_second_turn_prompt_uses_shared_action_observation_history():
     assert "Action 1" not in first
 
 
-def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkeypatch):
+@pytest.mark.parametrize("chat", [False, True])
+def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkeypatch, chat):
     import eval_runner
 
     types_by_id = ["pick_and_place_simple", "look_at_obj_in_light",
@@ -170,6 +179,10 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
         "menu_enabled": True}, "eval": {"split": "valid_seen", "seeds": list(SEEDS),
         "batch_size": 3, "shards": 2, "backend": "vllm", "gpu_memory_utilization": .85}}
     solver_cfg.write_text(json.dumps(config), encoding="utf-8")
+    if chat:
+        config["solver"]["prompt_format"] = "chat_template"
+        config["eval"]["backend"] = "hf"
+        solver_cfg.write_text(json.dumps(config), encoding="utf-8")
     cfg_hash = sha256_file(alf_cfg)
     env_sources = {"test": "fixed"}
     pool_hash = canonical_hash({"split": "valid_seen", "config_sha256": cfg_hash,
@@ -286,8 +299,25 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
             assert f"Action 1: go {task['task_id']}\nObservation 1: first-result {task['task_id']}" in row["trace"][1]["raw_prompt"]
             assert row["trace"][0]["request_seed"] == request_seed(seed, task["task_id"], 0)
             assert row["trace"][1]["request_seed"] == request_seed(seed, task["task_id"], 1)
+            if chat:
+                from protocol import encode_solver_prompt
+                first = row["trace"][0]
+                assert first["prompt_token_ids"] == encode_solver_prompt(tokenizer, first["raw_prompt"], "chat_template")
+                assert first["rendered_prompt"].endswith("<|im_start|>assistant\n")
+                assert first["action_is_admissible"] is True
     assert rows[("task0", 0)]["won"] is True
     assert rows[("task0", 1)]["won"] is False
+
+    mismatched = copy.deepcopy(contract)
+    mismatched["protocol_signature"]["backend"] = "vllm" if chat else "hf"
+    rejected_output = tmp_path / "wrong-backend-rank.json"
+    mismatched["expected_shards"][0]["path"] = str(rejected_output)
+    mismatched["contract_sha256"] = canonical_hash({k: v for k, v in mismatched.items() if k != "contract_sha256"})
+    mismatched_path = tmp_path / "wrong-backend-contract.json"
+    mismatched_path.write_text(json.dumps(mismatched), encoding="utf-8")
+    with pytest.raises(ValueError, match="protocol setting"):
+        eval_runner.run(types.SimpleNamespace(contract=str(mismatched_path), rank=0, output=str(rejected_output)))
+    assert not rejected_output.exists()
 
     drifted = tmp_path / "config_drift.yaml"
     changed = copy.deepcopy(config); changed["solver"]["temperature"] = .8

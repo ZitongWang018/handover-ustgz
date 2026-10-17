@@ -131,7 +131,7 @@ def _source_inventory() -> dict[str, dict[str, Any]]:
 
 
 def _package_versions() -> dict[str, str | None]:
-    names = ("torch", "transformers", "peft", "vllm", "alfworld", "textworld",
+    names = ("torch", "transformers", "tokenizers", "peft", "vllm", "alfworld", "textworld",
              "numpy", "PyYAML")
     versions = {}
     for name in names:
@@ -332,6 +332,11 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
     solver_cfg = cfg["solver"]
     if solver_cfg.get("style") != "react" or solver_cfg.get("menu_enabled") is not True:
         raise ContractError("solver must use the shared SkillRise React prompt and legal-action menu")
+    if solver_cfg.get("prompt_format", "raw") not in {"raw", "chat_template"}:
+        raise ContractError("solver.prompt_format must be raw or chat_template")
+    if memory_profile == "qwen3_moe_cpu" and (
+            solver_cfg.get("prompt_format") != "chat_template" or cfg["eval"].get("backend") != "hf"):
+        raise ContractError("30B training requires a matched chat_template/HF baseline config")
     if solver_cfg.get("stop_mode") != "action_tag" or solver_cfg.get("max_context_tokens") != 32768:
         raise ContractError("solver must use action_tag stopping and the shared 32768-token context")
     if solver_cfg.get("keep_recent_turns") != 15 or solver_cfg.get("max_turns") != 30:
@@ -368,6 +373,13 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
             solver_config=cfg["solver"])
     except (ValueError, OSError) as exc:
         raise ContractError(f"baseline contract validation failed: {exc}") from None
+    baseline_prompt = baseline_binding["contract"]["protocol_signature"]
+    cfg["runtime"]["expected_tokenizer_class"] = baseline_prompt["tokenizer_class"]
+    cfg["runtime"]["expected_solver_prompt_identity"] = {
+        "prompt_format": baseline_prompt.get("prompt_format", "raw"),
+        "raw_prompt_encoding": baseline_prompt.get("raw_prompt_encoding"),
+        "chat_template_sha256": baseline_prompt.get("chat_template_sha256"),
+    }
     tokenizer_files = {name: record for name, record in base_files.items()
                        if Path(name).name in TOKENIZER_BASENAMES
                        or Path(name).name in {"config.json", "generation_config.json"}}

@@ -598,6 +598,7 @@ def build_ez_rollout_configs(cfg: dict, local_group_size: int,
         max_context_tokens=s["max_context_tokens"],
         keep_recent_turns=s["keep_recent_turns"], seed=s["seed"],
         stop_mode=s["stop_mode"], max_batch_size=train["generation_max_batch_size"],
+        prompt_format=s.get("prompt_format", "raw"),
     )
     return p_cfg, s_cfg
 

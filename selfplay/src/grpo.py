@@ -73,6 +73,15 @@ def build_model_and_tokenizer(cfg: dict, local_rank: int, world: int,
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path), local_files_only=True, trust_remote_code=False)
     tokenizer.padding_side = "right"
+    expected_class = cfg.get("runtime", {}).get("expected_tokenizer_class")
+    if expected_class is not None and type(tokenizer).__qualname__ != expected_class:
+        raise ValueError("loaded tokenizer class differs from bound baseline; refusing model load")
+    expected_prompt = cfg.get("runtime", {}).get("expected_solver_prompt_identity")
+    if expected_prompt is not None:
+        from protocol import solver_prompt_identity
+        actual_prompt = solver_prompt_identity(tokenizer, cfg.get("solver", {}).get("prompt_format", "raw"))
+        if actual_prompt != expected_prompt:
+            raise ValueError("loaded tokenizer/chat template differs from the bound baseline; refusing model load")
     load_kwargs = {}
     if cfg.get("runtime", {}).get("memory_profile") == "qwen3_moe_cpu" and torch.cuda.is_available():
         load_kwargs.update(device_map={"": torch.device("cuda", local_rank)}, low_cpu_mem_usage=True)

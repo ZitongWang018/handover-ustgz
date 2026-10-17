@@ -77,8 +77,18 @@ def validate_baseline_contract(path: str | Path, *, config_path: str | Path,
                        ("vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json")}
     if signature.get("tokenizer_files_sha256") != evaluation.canonical_hash(tokenizer_files):
         raise ValueError("baseline tokenizer identity differs from training base")
-    if signature.get("raw_prompt_encoding") != "tokenizer.encode(add_special_tokens=True)":
+    from protocol import prompt_encoding
+    prompt_format = config.get("solver", {}).get("prompt_format", "raw")
+    if signature.get("prompt_format", "raw") != prompt_format:
+        raise ValueError("baseline prompt format differs from training config")
+    if signature.get("raw_prompt_encoding") != prompt_encoding(prompt_format):
         raise ValueError("baseline tokenizer prompt encoding is not the shared protocol")
+    chat_digest = signature.get("chat_template_sha256")
+    if prompt_format == "chat_template" and (not isinstance(chat_digest, str) or
+            len(chat_digest) != 64 or any(ch not in "0123456789abcdef" for ch in chat_digest)):
+        raise ValueError("baseline chat template digest is missing or malformed")
+    if prompt_format == "raw" and chat_digest is not None:
+        raise ValueError("raw baseline unexpectedly declares a chat template")
     if not isinstance(signature.get("tokenizer_class"), str) or not signature["tokenizer_class"]:
         raise ValueError("baseline tokenizer class identity is missing")
 

@@ -325,6 +325,11 @@ def test_training_manifest_binds_baseline_and_training_only_context_override(tmp
     signature["config"] = config
     signature["config_sha256"] = evaluation.sha256_file(config_path)
     signature["solver_settings"] = eval_runner._config_settings(config)
+    from protocol import solver_prompt_identity
+    from test_evaluation import TinyTokenizer
+    signature.update(solver_prompt_identity(TinyTokenizer(), config["solver"].get("prompt_format", "raw")))
+    for key in ("backend", "batch_size", "gpu_memory_utilization"):
+        signature[key] = config["eval"][key]
     base = tmp_path / "base"
     base.mkdir()
     (base / "config.json").write_text(json.dumps({"model_type": "llama",

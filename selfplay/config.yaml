@@ -34,6 +34,7 @@ proposer:
   finish_nudge: false
 solver:
   style: react
+  prompt_format: chat_template
   max_turns: 30
   max_new_tokens: 1024
   temperature: 0.7
@@ -71,7 +72,7 @@ train:
   checkpoint_keep: 0
 runtime:
   world_size: 8
-  backend: vllm
+  backend: hf
   vllm:
     gpu_memory_utilization: 0.35
     max_model_len: 32768
@@ -82,9 +83,9 @@ runtime:
     enforce_eager: false
     seed: 0
 eval:
-  backend: vllm
+  backend: hf
   gpu_memory_utilization: 0.85
   split: valid_seen
   seeds: [0, 1, 2, 3, 4]
-  batch_size: 32
+  batch_size: 1
   shards: 8

@@ -16,12 +16,18 @@ import evaluate_run
 from evaluation import canonical_hash, compare, merge
 
 
-def _baseline(tmp_path):
+def _baseline(tmp_path, chat=False):
     spec = importlib.util.spec_from_file_location("evaluation_fixture_local",
         Path(__file__).with_name("test_evaluation.py"))
     fixture_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture_module)
     contract, shards = fixture_module._fixture(tmp_path)
+    if chat:
+        from protocol import solver_prompt_identity
+        signature = contract["protocol_signature"]
+        signature.update(solver_prompt_identity(fixture_module.TinyTokenizer(), "chat_template"))
+        signature["backend"] = "hf"
+        signature["solver_settings"] = {"prompt_format": "chat_template"}
     contract["run_id"] = "base-run"
     config_path = tmp_path / "eval-config.yaml"
     config_path.write_text("{}\n", encoding="utf-8")
@@ -43,8 +49,8 @@ def _write(path, value):
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
-def _install_fake_pipeline(monkeypatch, tmp_path, *, fail_at=None, real_snapshots=False):
-    contract, shards, baseline = _baseline(tmp_path)
+def _install_fake_pipeline(monkeypatch, tmp_path, *, fail_at=None, real_snapshots=False, chat=False):
+    contract, shards, baseline = _baseline(tmp_path, chat=chat)
     baseline_path = tmp_path / "base" / "contract.merged.json"
     _write(baseline_path, baseline)
     run_dir = tmp_path / ("snaprun-train-run" if real_snapshots else "run")
@@ -188,11 +194,20 @@ def test_command_log_collision_rejected_before_child_start(tmp_path, monkeypatch
     assert (logdir / "prepare.stdout.log").read_text(encoding="utf-8") == "keep"
 
 
-def test_real_manifest_baseline_and_four_sealed_snapshots_reach_orchestration(tmp_path, monkeypatch):
-    run_dir, baseline_path, calls = _install_fake_pipeline(monkeypatch, tmp_path, real_snapshots=True)
+@pytest.mark.parametrize("chat", [False, True])
+def test_real_manifest_baseline_and_four_sealed_snapshots_reach_orchestration(tmp_path, monkeypatch, chat):
+    run_dir, baseline_path, calls = _install_fake_pipeline(monkeypatch, tmp_path, real_snapshots=True, chat=chat)
     result = evaluate_run.evaluate_run(run_dir, baseline_path)
     assert [row["outer"] for row in result["outers"]] == [1, 2, 3, 4]
     assert len(calls) == 12
+    if chat:
+        baseline = json.loads(baseline_path.read_text())
+        trained = json.loads((run_dir / "evaluation" / "outer_01" / "contract.merged.json").read_text())
+        assert baseline["protocol_signature"]["backend"] == "hf"
+        for arm in (baseline, trained):
+            arm["protocol_signature"].pop("chat_template_sha256")
+        with pytest.raises(ValueError, match="chat template identity"):
+            compare(baseline, trained)
 
 
 @pytest.mark.parametrize("damage", ["missing_fourth", "wrong_cursor", "bad_marker"])

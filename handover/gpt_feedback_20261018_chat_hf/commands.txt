@@ -1,0 +1,13 @@
+# Local CPU checks only; no server/job commands executed.
+# Existing environment; no dependencies installed.
+$env:PYTHONIOENCODING='utf-8'
+$env:OMP_NUM_THREADS='1'
+$env:TEMP='C:/Users/dasou/.codex/visualizations/2026/10/13/01a1340b-9220-7470-a33b-17bfd7cc2ea7'
+$env:TMP=$env:TEMP
+../testenv/Scripts/python.exe -m pytest selfplay/tests -q --tb=short -rs
+# Final: 112 passed, 2 skipped, 2 warnings in 28.51s
+../testenv/Scripts/python.exe selfplay/evaluate.py prepare --help
+../testenv/Scripts/python.exe selfplay/train.py --help
+# AST parse all selfplay/**/*.py: 41 files; SOURCE_PATHS all present.
+# Git Bash -n independently checked run_experiment.sh, run_train.sh, run_eval.sh.
+# No force push, merge of feedback branches, cleanup, model change or cluster operation.

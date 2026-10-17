@@ -6,7 +6,9 @@ not a claim that every SkillRise implementation detail is reproduced.
 """
 from __future__ import annotations
 
+import hashlib
 import re
+from numbers import Integral
 from typing import Any, Sequence
 
 ALFWORLD_PLAY_PROMPT = """
@@ -77,6 +79,43 @@ def encode_raw_prompt(tokenizer: Any, prompt: str) -> list[int]:
         if len(ids) != 1:
             raise ValueError("expected one prompt from tokenizer")
         ids = ids[0]
+    return [int(token) for token in ids]
+
+
+def prompt_encoding(prompt_format: str) -> str:
+    if prompt_format == "raw":
+        return "tokenizer.encode(add_special_tokens=True)"
+    if prompt_format == "chat_template":
+        return "tokenizer.apply_chat_template(user, tokenize=True, add_generation_prompt=True)"
+    raise ValueError(f"unsupported prompt_format={prompt_format!r}")
+
+
+def solver_prompt_identity(tokenizer: Any, prompt_format: str) -> dict[str, Any]:
+    """Pin the effective template, not just the name of the tokenizer class."""
+    encoding = prompt_encoding(prompt_format)
+    template = None
+    if prompt_format == "chat_template":
+        getter = getattr(tokenizer, "get_chat_template", None)
+        template = getter() if callable(getter) else getattr(tokenizer, "chat_template", None)
+        if not isinstance(template, str) or not template.strip():
+            raise ValueError("chat_template format requires a nonempty tokenizer chat template")
+    return {"prompt_format": prompt_format, "raw_prompt_encoding": encoding,
+        "chat_template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest()
+        if template is not None else None}
+
+
+def encode_solver_prompt(tokenizer: Any, prompt: str, prompt_format: str = "raw") -> list[int]:
+    """Apply the chat template once; its IDs already contain special tokens."""
+    if prompt_format == "raw":
+        return encode_raw_prompt(tokenizer, prompt)
+    solver_prompt_identity(tokenizer, prompt_format)
+    ids = tokenizer.apply_chat_template([{"role": "user", "content": prompt}],
+        tokenize=True, add_generation_prompt=True)
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if not isinstance(ids, list) or not ids or any(
+            isinstance(token, bool) or not isinstance(token, Integral) or token < 0 for token in ids):
+        raise ValueError("chat template must return a nonempty 1D list of integer token IDs")
     return [int(token) for token in ids]
 
 

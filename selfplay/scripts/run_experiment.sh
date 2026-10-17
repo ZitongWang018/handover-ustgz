@@ -6,11 +6,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 usage() {
-  echo "usage: run_experiment.sh --run-id ID --run-dir PATH --base PATH --alfworld-data PATH --baseline-contract PATH --baseline-results PATH [--backend vllm|hf] [--resume CKPT] [--results-dir PATH]" >&2
+  echo "usage: run_experiment.sh --run-id ID --run-dir PATH --base PATH --alfworld-data PATH --baseline-contract PATH --baseline-results PATH [--backend vllm|hf] [--memory-profile default|qwen3_moe_cpu] [--resume CKPT] [--results-dir PATH]" >&2
 }
 
 run_id=""; run_dir=""; base=""; alfworld_data=""; baseline_contract=""
-baseline_results=""; backend="vllm"; resume=""; results_dir=""
+baseline_results=""; backend="hf"; memory_profile="default"; resume=""; results_dir=""
 while (($#)); do
   case "$1" in
     --run-id) run_id="${2:?missing --run-id value}"; shift 2 ;;
@@ -20,6 +20,7 @@ while (($#)); do
     --baseline-contract) baseline_contract="${2:?missing --baseline-contract value}"; shift 2 ;;
     --baseline-results) baseline_results="${2:?missing --baseline-results value}"; shift 2 ;;
     --backend) backend="${2:?missing --backend value}"; shift 2 ;;
+    --memory-profile) memory_profile="${2:?missing --memory-profile value}"; shift 2 ;;
     --resume) resume="${2:?missing --resume value}"; shift 2 ;;
     --results-dir) results_dir="${2:?missing --results-dir value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -34,6 +35,14 @@ if [[ -z "$run_id" || -z "$run_dir" || -z "$base" || -z "$alfworld_data" ||
 fi
 if [[ "$backend" != "vllm" && "$backend" != "hf" ]]; then
   echo "--backend must be vllm or hf" >&2
+  exit 2
+fi
+if [[ "$memory_profile" != "default" && "$memory_profile" != "qwen3_moe_cpu" ]]; then
+  echo "unknown --memory-profile" >&2
+  exit 2
+fi
+if [[ "$memory_profile" == "qwen3_moe_cpu" && "$backend" != "hf" ]]; then
+  echo "qwen3_moe_cpu requires --backend hf" >&2
   exit 2
 fi
 if [[ "${WORLD_SIZE:-1}" != "1" || "${SKR_WORKER_MODE:-0}" == "1" ]]; then
@@ -95,16 +104,21 @@ if results.exists() and (not results.is_dir() or any(results.iterdir())):
 PY
 
 # Validate the existing baseline pair before starting the expensive training run.
-"$python_bin" - "$PROJECT_ROOT" "$baseline_contract" "$baseline_results" <<'PY'
+"$python_bin" - "$PROJECT_ROOT" "$baseline_contract" "$baseline_results" "$memory_profile" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / "selfplay"))
 from evaluate_run import validate_baseline_files
-validate_baseline_files(sys.argv[2], sys.argv[3])
+contract, _merged = validate_baseline_files(sys.argv[2], sys.argv[3])
+if sys.argv[4] == "qwen3_moe_cpu":
+    signature = contract.get("protocol_signature", {})
+    if signature.get("backend") != "hf" or signature.get("solver_settings", {}).get("prompt_format") != "chat_template":
+        raise SystemExit("30B requires a new matched HF/chat_template baseline from the current config")
 PY
 
 train_args=(--base "$base" --alfworld-data "$alfworld_data" \
-  --baseline-contract "$baseline_contract" --backend "$backend" --run-id "$run_id")
+  --baseline-contract "$baseline_contract" --backend "$backend" --run-id "$run_id" \
+  --memory-profile "$memory_profile")
 if [[ -n "$resume" ]]; then
   train_args+=(--resume "$resume")
 fi

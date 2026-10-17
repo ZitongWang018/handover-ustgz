@@ -103,6 +103,16 @@ def _verify_current_baseline_identity(contract: dict, binding: dict) -> None:
                        ("vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json")}
     if signature.get("tokenizer_files_sha256") != canonical_hash(tokenizer_files):
         raise RunEvaluationError("current tokenizer files differ from the bound baseline")
+    from transformers import AutoTokenizer
+    from protocol import solver_prompt_identity
+    tok = AutoTokenizer.from_pretrained(str(base_path), local_files_only=True, trust_remote_code=True)
+    if type(tok).__qualname__ != signature.get("tokenizer_class"):
+        raise RunEvaluationError("current tokenizer class differs from baseline")
+    identity_now = solver_prompt_identity(tok, settings.get("prompt_format", "raw"))
+    for key, value in identity_now.items():
+        legacy = "raw" if key == "prompt_format" and identity_now["prompt_format"] == "raw" else None
+        if signature.get(key, legacy) != value:
+            raise RunEvaluationError(f"current tokenizer/chat template differs from baseline: {key}")
     data_root = Path(contract.get("alfworld_data_root", "")).expanduser().resolve(strict=True)
     if not data_root.is_dir() or signature.get("alfworld_data_root") != str(data_root):
         raise RunEvaluationError("current ALFWorld data root differs from the bound baseline")

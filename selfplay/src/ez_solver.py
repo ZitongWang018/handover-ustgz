@@ -10,7 +10,7 @@ import numpy as np
 from ez_proposer import _slot_snapshot
 from ez_state import StateSnapshot, assert_facts_mode
 from ez_verify import ProposedTask, SolverRolloutResult, verify_solver_rollout
-from protocol import (MAX_PROMPT_CONTEXT, build_skillrise_prompt, encode_raw_prompt,
+from protocol import (MAX_PROMPT_CONTEXT, build_skillrise_prompt, encode_solver_prompt,
                       project_skillrise_action, replace_task_goal)
 from rollout import RolloutConfig, Trajectory, _align_slot_tasks
 from reward import TrajectoryStats
@@ -78,7 +78,8 @@ def run_ez_solver_rollouts(env, policy, tasks: Sequence[ProposedTask], cfg: Roll
         prompt_texts = [build_skillrise_prompt(
             init_observations[s], histories[s], admissible[s], step,
             history_length=solver_cfg.keep_recent_turns) for s in slots]
-        prompt_ids = [encode_raw_prompt(policy.tokenizer, prompt) for prompt in prompt_texts]
+        prompt_ids = [encode_solver_prompt(policy.tokenizer, prompt, solver_cfg.prompt_format)
+                      for prompt in prompt_texts]
         for s, ids in zip(slots, prompt_ids):
             if len(ids) + solver_cfg.max_new_tokens > MAX_PROMPT_CONTEXT:
                 raise ValueError(

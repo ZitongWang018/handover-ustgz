@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train
 
 
-def test_30b_manifest_binds_existing_vllm_baseline_without_changing_protocol(tmp_path, monkeypatch):
+def test_30b_manifest_binds_matched_hf_chat_baseline_without_changing_protocol(tmp_path, monkeypatch):
     import test_training_contract as fixtures
     import eval_runner
     import evaluation
@@ -36,6 +36,11 @@ def test_30b_manifest_binds_existing_vllm_baseline_without_changing_protocol(tmp
     signature.update(config=copy.deepcopy(config),
         config_sha256=evaluation.sha256_file(config_path),
         solver_settings=eval_runner._config_settings(config), base_inventory_sha256=digest)
+    from protocol import solver_prompt_identity
+    from test_evaluation import TinyTokenizer
+    signature.update(solver_prompt_identity(TinyTokenizer(), config["solver"]["prompt_format"]))
+    for key in ("backend", "batch_size", "gpu_memory_utilization"):
+        signature[key] = config["eval"][key]
     tokens = {name: {"path": name, **record} for name, record in inventory.items()
               if name.startswith("tokenizer")}
     signature["tokenizer_files_sha256"] = evaluation.canonical_hash(tokens)

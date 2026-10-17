@@ -120,10 +120,17 @@ def test_accepts_valid_baseline_and_returns_full_binding(tmp_path, monkeypatch):
     assert result["common_identity"]["seeds"] == [0, 1, 2, 3, 4]
 
 
-def test_eval_prepare_contract_round_trips_into_training_validation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("chat", [False, True])
+def test_eval_prepare_contract_round_trips_into_training_validation(tmp_path, monkeypatch, chat):
     transformers = pytest.importorskip("transformers")
     fixture = _fixture(tmp_path, monkeypatch)
     path, config_path, inventory, data_root, solver, expected = fixture
+    if chat:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        cfg["solver"]["prompt_format"] = "chat_template"
+        cfg["eval"]["backend"] = "hf"
+        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        solver = cfg["solver"]
     base = tmp_path / "base"
     base.mkdir()
     base_inventory = {"files": [{"path": name, **record} for name, record in sorted(inventory.items())]}
@@ -131,7 +138,7 @@ def test_eval_prepare_contract_round_trips_into_training_validation(tmp_path, mo
         evaluation.canonical_hash(inventory)))
     monkeypatch.setattr(eval_runner, "discover_suite", lambda *args: copy.deepcopy(expected["suite"]))
     class FakeTokenizer:
-        pass
+        chat_template = "fixed test template"
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
                         lambda *args, **kwargs: FakeTokenizer())
     contract_path = tmp_path / "prepared-by-evaluator.json"

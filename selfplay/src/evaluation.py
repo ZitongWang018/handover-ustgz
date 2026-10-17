@@ -276,6 +276,18 @@ def compare(base: dict, trained: dict) -> dict:
         "base_inventory_sha256", "alfworld_data_root", "software", "runtime_source_sha256")
     if any(key not in signature or signature[key] is None for key in required):
         raise ValueError("paired results lack required common protocol identity fields")
+    mode = signature.get("prompt_format", signature.get("solver_settings", {}).get("prompt_format", "raw"))
+    if mode == "chat_template":
+        from protocol import prompt_encoding
+        digest = signature.get("chat_template_sha256")
+        if (signature.get("prompt_format") != mode or
+                signature.get("solver_settings", {}).get("prompt_format") != mode or
+                signature.get("raw_prompt_encoding") != prompt_encoding(mode) or
+                not isinstance(digest, str) or len(digest) != 64 or
+                any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("paired chat results lack a consistent chat template identity")
+    elif mode != "raw":
+        raise ValueError("paired results have an unsupported prompt format")
     if base.get("arm_identity", {}).get("kind") != "base-only" or trained.get("arm_identity", {}).get("kind") != "checkpoint":
         raise ValueError("comparison requires a base-only run and a sealed checkpoint run")
     if (base["arm_identity"].get("base_inventory_sha256") != signature["base_inventory_sha256"] or

@@ -52,7 +52,7 @@ def _eval_config(config: dict) -> dict:
 
 def _versions() -> dict:
     result = {"python": sys.version.split()[0]}
-    for name in ("alfworld", "textworld", "torch", "transformers", "peft", "vllm", "numpy"):
+    for name in ("alfworld", "textworld", "torch", "transformers", "tokenizers", "peft", "vllm", "numpy"):
         try: result[name] = version(name)
         except PackageNotFoundError: result[name] = "not-installed"
     return result
@@ -76,7 +76,7 @@ def _base_identity(base: str) -> tuple[Path, dict, str]:
     return path, {"files": serial}, digest
 
 
-def _arm(args, base_digest: str, solver_config: dict) -> dict:
+def _arm(args, base_digest: str, solver_config: dict, *, prompt_identity=None, tokenizer_class=None) -> dict:
     if bool(args.base_only) == bool(args.checkpoint):
         raise ValueError("choose exactly one of --base-only or --checkpoint")
     if args.base_only:
@@ -92,6 +92,23 @@ def _arm(args, base_digest: str, solver_config: dict) -> dict:
     protocol_record = source_files.get("selfplay/src/protocol.py")
     if not isinstance(protocol_record, dict) or protocol_record.get("sha256") != sha256_file(SRC / "protocol.py"):
         raise ValueError("checkpoint was trained with different SkillRise prompt/action protocol source")
+    if solver_config.get("prompt_format") == "chat_template":
+        runtime = manifest["resolved_config"].get("runtime", {})
+        bound = manifest.get("baseline_binding", {}).get("contract", {}).get("protocol_signature", {})
+        fields = ("prompt_format", "raw_prompt_encoding", "chat_template_sha256")
+        if (bound.get("prompt_format") != "chat_template" or
+                runtime.get("expected_solver_prompt_identity") != {k: bound.get(k) for k in fields} or
+                prompt_identity != runtime.get("expected_solver_prompt_identity") or
+                not bound.get("tokenizer_class") or
+                tokenizer_class != bound.get("tokenizer_class") or
+                runtime.get("expected_tokenizer_class") != bound.get("tokenizer_class")):
+            raise ValueError("checkpoint lacks its bound training tokenizer/chat template identity")
+        current_versions = _versions()
+        if any(bound.get("software", {}).get(key) != current_versions[key] for key in ("transformers", "tokenizers")):
+            raise ValueError("checkpoint tokenizer software differs from evaluation runtime")
+        for name in ("rollout.py", "ez_solver.py"):
+            if source_files.get("selfplay/src/" + name, {}).get("sha256") != sha256_file(SRC / name):
+                raise ValueError(f"checkpoint used a different solver tokenization path: {name}")
     solver_path = Path(validated["solver_path"]).resolve(strict=True)
     if not (solver_path / "adapter_config.json").is_file():
         raise ValueError("validated checkpoint does not expose its solver adapter leaf")
@@ -110,6 +127,10 @@ def _config_settings(config: dict) -> dict:
         "top_p": 0.95, "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0,
         "stop_mode": "action_tag", "menu_enabled": True}
     settings = {}
+    if "prompt_format" in solver:
+        if solver["prompt_format"] not in {"raw", "chat_template"}:
+            raise ValueError("config.solver.prompt_format must be raw or chat_template")
+        settings["prompt_format"] = solver["prompt_format"]
     for key in expected:
         if key not in solver:
             raise ValueError(f"config.solver is missing required field: {key}")
@@ -157,9 +178,12 @@ def prepare(args) -> int:
     if suite["config_path"] != str(alfworld_config):
         raise ValueError("ALFWorld configuration path differs from config.env.config_path")
     base, base_inventory, base_digest = _base_identity(args.base)
-    arm = _arm(args, base_digest, _solver_config(config))
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(base), trust_remote_code=True, local_files_only=True)
+    from protocol import solver_prompt_identity
+    current_prompt = solver_prompt_identity(tok, settings.get("prompt_format", "raw"))
+    arm = _arm(args, base_digest, _solver_config(config), prompt_identity=current_prompt,
+               tokenizer_class=type(tok).__qualname__)
     token_files = {x["path"]: x for x in base_inventory["files"]
                    if x["path"].startswith("tokenizer") or x["path"] in
                    ("vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json")}
@@ -168,7 +192,7 @@ def prepare(args) -> int:
         "config_sha256": sha256_file(config_path), "config": config,
         "solver_settings": settings, "style": "react", "prompt_source_sha256": hashlib.sha256(prompt_source).hexdigest(),
         "tokenizer_files_sha256": canonical_hash(token_files),
-        "tokenizer_class": type(tok).__qualname__, "raw_prompt_encoding": "tokenizer.encode(add_special_tokens=True)",
+        "tokenizer_class": type(tok).__qualname__,
         "action_parser": "SkillRise play projection", "stop": "first decoded </action>, included",
         "seed_policy": "environment reset receives run seed; sha256(seed,task_id,turn) per generation request",
         "seeds": list(SEEDS), "max_turns": settings["max_turns"],
@@ -180,6 +204,7 @@ def prepare(args) -> int:
         "dtype": "bfloat16", "base_inventory_sha256": base_digest,
         "batch_size": settings["batch_size"], "gpu_memory_utilization": settings["gpu_memory_utilization"],
         "software": _versions(), "runtime_source_sha256": _source_identity()}
+    signature.update(current_prompt)
     contract = {"schema": SCHEMA, "run_id": args.run_id or uuid.uuid4().hex,
         "suite": suite, "config_path": str(config_path),
         "alfworld_data_root": str(data_root), "alfworld_config_path": str(alfworld_config), "base_path": str(base),
@@ -212,8 +237,13 @@ def _load_policy(contract: dict, tokenizer):
         return policy
     import torch
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(contract["base_path"], torch_dtype=torch.bfloat16,
-        trust_remote_code=True, local_files_only=True).to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True, "local_files_only": True}
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() != 1:
+            raise ValueError("HF evaluator requires one visible GPU per rank; launch with run_eval.sh")
+        load_kwargs.update(device_map={"": torch.device("cuda", 0)},
+                           low_cpu_mem_usage=True)
+    model = AutoModelForCausalLM.from_pretrained(contract["base_path"], **load_kwargs).eval()
     if arm["kind"] == "checkpoint":
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, arm["solver_path"], is_trainable=False,
@@ -223,8 +253,8 @@ def _load_policy(contract: dict, tokenizer):
 
 
 def run(args) -> int:
-    from protocol import (action_tag_stop_len, build_skillrise_prompt, encode_raw_prompt,
-                          project_skillrise_action)
+    from protocol import (action_tag_stop_len, build_skillrise_prompt, encode_solver_prompt,
+                          project_skillrise_action, solver_prompt_identity)
     from alfworld_compat import find_compat_dir, install
     compat = find_compat_dir()
     if compat: install(verbose=False)
@@ -255,16 +285,30 @@ def run(args) -> int:
     settings = _config_settings(config)
     if sha256_file(contract["config_path"]) != contract["protocol_signature"]["config_sha256"]:
         raise ValueError("solver config changed after prepare")
+    signature = contract["protocol_signature"]
+    if signature.get("config") != config or signature.get("solver_settings") != settings:
+        raise ValueError("prepared solver/evaluation settings differ from current config")
+    for key, value in settings.items():
+        if key in signature and signature[key] != value:
+            raise ValueError(f"prepared protocol setting differs from config: {key}")
     base, base_inventory, base_digest = _base_identity(contract["base_path"])
     if base_digest != contract["protocol_signature"]["base_inventory_sha256"] or base_inventory != contract["base_inventory"]:
         raise ValueError("base model files changed after prepare")
-    arm = _arm(argparse.Namespace(base_only=contract["arm_identity"]["kind"] == "base-only",
-                                  checkpoint=contract["arm_identity"].get("path")), base_digest,
-               _solver_config(config))
-    if arm != contract["arm_identity"]: raise ValueError("checkpoint identity differs from prepared contract")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(base), trust_remote_code=True, local_files_only=True)
     task_by_id = {t["task_id"]: t for t in contract["suite"]["tasks"]}
+    if type(tok).__qualname__ != contract["protocol_signature"].get("tokenizer_class"):
+        raise ValueError("loaded tokenizer class differs from prepared contract")
+    prompt_identity = solver_prompt_identity(tok, settings.get("prompt_format", "raw"))
+    for key, value in prompt_identity.items():
+        legacy_default = "raw" if key == "prompt_format" and prompt_identity["prompt_format"] == "raw" else None
+        if contract["protocol_signature"].get(key, legacy_default) != value:
+            raise ValueError(f"tokenizer/chat template differs from prepared contract: {key}")
+    arm = _arm(argparse.Namespace(base_only=contract["arm_identity"]["kind"] == "base-only",
+                                  checkpoint=contract["arm_identity"].get("path")), base_digest,
+               _solver_config(config), prompt_identity=prompt_identity, tokenizer_class=type(tok).__qualname__)
+    if arm != contract["arm_identity"]:
+        raise ValueError("checkpoint identity differs from prepared contract")
     tasks = [task_by_id[tid] for tid in spec["task_ids"]]
     policy = _load_policy(contract, tok)
     from alfworld_env import ALFWorldBatchEnv, load_alfworld_config
@@ -274,7 +318,8 @@ def run(args) -> int:
         max_new_tokens=settings["max_new_tokens"], temperature=settings["temperature"],
         top_p=settings["top_p"], top_k=settings["top_k"], min_p=settings["min_p"],
         repetition_penalty=settings["repetition_penalty"], max_context_tokens=settings["max_context_tokens"],
-        keep_recent_turns=settings["keep_recent_turns"], stop_mode="action_tag", max_batch_size=settings["batch_size"])
+        keep_recent_turns=settings["keep_recent_turns"], stop_mode="action_tag", max_batch_size=settings["batch_size"],
+        prompt_format=settings.get("prompt_format", "raw"))
     rows, start_time = [], time.time()
     for seed in SEEDS:
         for start in range(0, len(tasks), settings["batch_size"]):
@@ -297,7 +342,7 @@ def run(args) -> int:
                     prompts = [build_skillrise_prompt(init_obs[t["task_id"]], histories[t["task_id"]],
                         adm[t["task_id"]], turn,
                         history_length=settings["keep_recent_turns"]) for t in active_tasks]
-                    prompt_ids = [encode_raw_prompt(tok, prompt) for prompt in prompts]
+                    prompt_ids = [encode_solver_prompt(tok, prompt, settings.get("prompt_format", "raw")) for prompt in prompts]
                     if any(len(ids) + settings["max_new_tokens"] > settings["max_context_tokens"] for ids in prompt_ids):
                         raise ValueError("raw SkillRise prompt plus generation budget exceeds 32768-token context")
                     seeds = [request_seed(seed, t["task_id"], turn) for t in active_tasks]
@@ -319,6 +364,9 @@ def run(args) -> int:
                         command = action if action else "look"
                         env_actions[slot_index[t["task_id"]]] = command
                         traces[t["task_id"]].append({"turn": turn, "raw_prompt": prompt,
+                            "prompt_format": settings.get("prompt_format", "raw"),
+                            "rendered_prompt": tok.decode(pids, skip_special_tokens=False),
+                            "action_is_admissible": command in adm[t["task_id"]] and command != "help",
                             "prompt_token_ids": pids,
                             "output_token_ids": output_ids, "raw_output": raw,
                             "action_tag_valid": bool(tag_valid), "parser_projection": action,
