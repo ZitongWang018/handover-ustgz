@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "parent_commit": "a02acc98f61ca54a4b12c40a76bc3313441afd33",
+  "scope": "chat/vLLM fixed evaluation; HF training rollout retained",
+  "server_accessed": false,
+  "cluster_jobs_started": false,
+  "gpu_performance_verified": false,
+  "checks": {
+    "pytest": {
+      "passed": 145,
+      "skipped": 2,
+      "warnings": 2,
+      "seconds": 54.29
+    },
+    "shell_syntax": true,
+    "python_syntax": true,
+    "cli_help": true
+  },
+  "worker": {
+    "skill": "deepseek-worker",
+    "configured_model": "deepseek-flash",
+    "implementation_jobs": [
+      "138167c9-2b36-493e-836a-f78140954d60",
+      "1c7e7696-c258-4067-b80b-fde12f84983f",
+      "b52ed76d-736b-48f5-9502-e6ff59cfb805"
+    ],
+    "review_jobs": [
+      "9ae3aee1-2310-4a3a-8173-6b2439458586",
+      "779d8b0f-90fe-4265-9396-adbda200c040"
+    ],
+    "failed_incomplete_proposals_not_applied": [
+      "59b96dfd-ab19-42fb-a96a-89e311949ab3",
+      "09b91bce-e790-4660-bc05-52dfa3c96d15"
+    ],
+    "reviewer_applied_and_tested": true
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "size": 12972,
+      "sha256": "7067a4eba7350dd85e71dd7b196d80680491e2834e3fdcfb06e2ba6e90cdfba8"
+    },
+    {
+      "path": "selfplay/config.yaml",
+      "size": 1755,
+      "sha256": "f958ee068859c5c36ac495cb41264a36a47fd0dc4a3122d253ea53b2d8957190"
+    },
+    {
+      "path": "selfplay/train.py",
+      "size": 37096,
+      "sha256": "5016c3372203f249573b1780e66a22922189d63de234f73a368844d91d8e3222"
+    },
+    {
+      "path": "selfplay/merge_solver.py",
+      "size": 2295,
+      "sha256": "b3aaf12a751f488002a1d7c1b7c5b7d35ff567df651f09427d6d580fd791f753"
+    },
+    {
+      "path": "selfplay/evaluate_run.py",
+      "size": 36145,
+      "sha256": "c17aef5322e688b107b860722fe8f06af7592ca45fa9f3cc43903cbf9ff50640"
+    },
+    {
+      "path": "selfplay/src/eval_runner.py",
+      "size": 36478,
+      "sha256": "e7bd199b42e1e2c59d85925ee06b66037a5f0b5b7d7cb68b91bff6d44139f12b"
+    },
+    {
+      "path": "selfplay/src/merged_model.py",
+      "size": 12912,
+      "sha256": "c76d0bb1b518282cddc8e7255cfa4fb047e26bfa23cb72da2ac64955145eecfd"
+    },
+    {
+      "path": "selfplay/scripts/run_experiment.sh",
+      "size": 6129,
+      "sha256": "e73c8bcc9254fd35008909c550d78f18d1616bc33370795414a362ae97c82762"
+    },
+    {
+      "path": "selfplay/tests/test_baseline_lora.py",
+      "size": 6874,
+      "sha256": "db6baa918789396bea23aa80bff16889e50f4a43dd10f8c95615f9da981d0b61"
+    },
+    {
+      "path": "selfplay/tests/test_evaluate_run.py",
+      "size": 14322,
+      "sha256": "e3289ee686132b2b2747a41fbb1c5b2783fa35f9aac8786326ff4ef141ef764e"
+    },
+    {
+      "path": "selfplay/tests/test_evaluation.py",
+      "size": 18644,
+      "sha256": "ed89c11562ee08f43663c59318ac45c5d1bfe318fae19be014f9356993c79645"
+    },
+    {
+      "path": "selfplay/tests/test_experiment_shell.py",
+      "size": 3244,
+      "sha256": "03bdf2fa16f34f8cfe6b92b62150c7ea9f24b33af711103e84d740d9abc12016"
+    },
+    {
+      "path": "selfplay/tests/test_training_contract.py",
+      "size": 12364,
+      "sha256": "0b4e5b2ff3c6f344ebfe08903b213dfdd071a4af3f2a8b0eb3ee56da80bcc4c4"
+    },
+    {
+      "path": "selfplay/tests/test_eval_backend_independence.py",
+      "size": 1218,
+      "sha256": "74d05c009d080a9f4d3ab4d2767aabe6c2638ebb035de454519cffb0105afa94"
+    },
+    {
+      "path": "selfplay/tests/test_fast_eval.py",
+      "size": 11020,
+      "sha256": "81f8c8e382393a9182501e6b15cc9197bb4da1ef96efbfb05d02ca2d045825da"
+    },
+    {
+      "path": "selfplay/tests/test_merged_model.py",
+      "size": 11304,
+      "sha256": "f8901b890dd9048575f6588d184c7bd99f9ec6d0fcbf655e19047dbeb4ff582f"
+    }
+  ]
+}

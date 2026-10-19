@@ -156,8 +156,8 @@ def test_second_turn_prompt_uses_shared_action_observation_history():
     assert "Action 1" not in first
 
 
-@pytest.mark.parametrize("chat", [False, True])
-def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkeypatch, chat):
+@pytest.mark.parametrize("chat,backend", [(False, "vllm"), (True, "hf"), (True, "vllm")])
+def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkeypatch, chat, backend):
     import eval_runner
 
     types_by_id = ["pick_and_place_simple", "look_at_obj_in_light",
@@ -181,8 +181,8 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
     solver_cfg.write_text(json.dumps(config), encoding="utf-8")
     if chat:
         config["solver"]["prompt_format"] = "chat_template"
-        config["eval"]["backend"] = "hf"
-        solver_cfg.write_text(json.dumps(config), encoding="utf-8")
+    config["eval"]["backend"] = backend
+    solver_cfg.write_text(json.dumps(config), encoding="utf-8")
     cfg_hash = sha256_file(alf_cfg)
     env_sources = {"test": "fixed"}
     pool_hash = canonical_hash({"split": "valid_seen", "config_sha256": cfg_hash,
@@ -222,8 +222,11 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
     assert eval_runner.prepare(args) == 0
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
 
+    batch_sizes = []
     class FakePolicy:
         def generate_from_token_ids(self, prompt_ids, _cfg, request_seeds=None):
+            assert len(prompt_ids) == len(request_seeds)
+            batch_sizes.append(len(prompt_ids))
             ids_out = []
             self.last_finish_reasons = ["stop"] * len(prompt_ids)
             for ids, _seed in zip(prompt_ids, request_seeds):
@@ -285,6 +288,11 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
                     output=str(tmp_path / "unprepared-rank.json")))
         assert eval_runner.run(types.SimpleNamespace(contract=str(contract_path), rank=rank, output=str(output))) == 0
         outputs.append(json.loads(output.read_text(encoding="utf-8")))
+    assert set(batch_sizes) == ({1} if backend == "hf" else {3})
+    for shard in outputs:
+        assert shard["telemetry"]["request_count"] == 30
+        assert shard["telemetry"]["episode_count"] == 15
+        assert shard["telemetry"]["generated_token_count"] > 0
     merged = merge(contract, outputs)
     assert merged["summary"]["n_episodes"] == len(tasks) * len(SEEDS)
     assert merged["summary"]["six_type_macro_sr"] is not None
@@ -309,7 +317,7 @@ def test_prepare_run_merge_cpu_integration_with_reordered_slots(tmp_path, monkey
     assert rows[("task0", 1)]["won"] is False
 
     mismatched = copy.deepcopy(contract)
-    mismatched["protocol_signature"]["backend"] = "vllm" if chat else "hf"
+    mismatched["protocol_signature"]["backend"] = "hf" if backend == "vllm" else "vllm"
     rejected_output = tmp_path / "wrong-backend-rank.json"
     mismatched["expected_shards"][0]["path"] = str(rejected_output)
     mismatched["contract_sha256"] = canonical_hash({k: v for k, v in mismatched.items() if k != "contract_sha256"})

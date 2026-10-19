@@ -42,7 +42,7 @@ if [[ "$memory_profile" != "default" && "$memory_profile" != "qwen3_moe_cpu" ]];
   exit 2
 fi
 if [[ "$memory_profile" == "qwen3_moe_cpu" && "$backend" != "hf" ]]; then
-  echo "qwen3_moe_cpu requires --backend hf" >&2
+  echo "qwen3_moe_cpu requires HF rollout (--backend hf); vLLM is evaluation-only" >&2
   exit 2
 fi
 if [[ "${WORLD_SIZE:-1}" != "1" || "${SKR_WORKER_MODE:-0}" == "1" ]]; then
@@ -112,8 +112,8 @@ from evaluate_run import validate_baseline_files
 contract, _merged = validate_baseline_files(sys.argv[2], sys.argv[3])
 if sys.argv[4] == "qwen3_moe_cpu":
     signature = contract.get("protocol_signature", {})
-    if signature.get("backend") != "hf" or signature.get("solver_settings", {}).get("prompt_format") != "chat_template":
-        raise SystemExit("30B requires a new matched HF/chat_template baseline from the current config")
+    if signature.get("solver_settings", {}).get("prompt_format") != "chat_template":
+        raise SystemExit("30B requires a matched chat_template baseline from the current config")
 PY
 
 train_args=(--base "$base" --alfworld-data "$alfworld_data" \

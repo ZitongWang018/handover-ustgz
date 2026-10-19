@@ -24,7 +24,7 @@ def _config(alfworld_yaml):
             "keep_recent_turns": 15, "max_new_tokens": 1024, "temperature": 0.7,
             "top_p": 0.95, "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0,
             "stop_mode": "action_tag", "menu_enabled": True},
-        "eval": {"seeds": [0, 1, 2, 3, 4], "split": "valid_seen", "batch_size": 32,
+        "eval": {"seeds": [0, 1, 2, 3, 4], "split": "valid_seen", "batch_size": 4,
             "shards": 8, "backend": "vllm", "gpu_memory_utilization": 0.85},
     }
 
@@ -83,7 +83,7 @@ def _fixture(tmp_path, monkeypatch):
         "max_context_tokens": 32768, "max_new_tokens": 1024, "temperature": 0.7, "top_p": 0.95,
         "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0,
         "backend": "vllm", "dtype": "bfloat16", "base_inventory_sha256": base_hash,
-        "batch_size": 32, "gpu_memory_utilization": 0.85,
+        "batch_size": 4, "gpu_memory_utilization": 0.85,
         "software": eval_runner._versions(), "runtime_source_sha256": eval_runner._source_identity(),
     }
     contract = {"schema": evaluation.SCHEMA, "run_id": "fixture", "suite": suite,

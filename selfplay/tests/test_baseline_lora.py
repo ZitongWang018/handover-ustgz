@@ -134,11 +134,14 @@ def test_base_only_loads_non_lora_engine_and_generates_action_tag(fake_vllm):
     assert generate_kwargs["use_tqdm"] is False
 
 
-def test_checkpoint_loads_lora_engine_and_mounts_solver_adapter(fake_vllm, monkeypatch):
+def test_checkpoint_loads_lora_engine_and_mounts_solver_adapter(fake_vllm, monkeypatch, tmp_path):
     import eval_runner
 
     _install_lora_request(monkeypatch)
-    policy = eval_runner._load_policy(_contract("checkpoint"), _Tokenizer())
+    (tmp_path / "config.json").write_text('{"model_type": "qwen2"}', encoding="utf-8")
+    contract = _contract("checkpoint")
+    contract["base_path"] = str(tmp_path)
+    policy = eval_runner._load_policy(contract, _Tokenizer())
     assert policy.llm.engine_kwargs["enable_lora"] is True
     assert policy.llm.engine_kwargs["max_lora_rank"] == 32
     assert policy._lora_req.name == "solver"
@@ -146,7 +149,7 @@ def test_checkpoint_loads_lora_engine_and_mounts_solver_adapter(fake_vllm, monke
     assert policy._lora_req.path == "/checkpoints/solver/adapter"
 
 
-def test_base_succeeds_but_checkpoint_lora_failure_does_not_fallback(fake_vllm):
+def test_base_succeeds_but_checkpoint_lora_failure_does_not_fallback(fake_vllm, tmp_path):
     import eval_runner
 
     attempts = []
@@ -160,9 +163,23 @@ def test_base_succeeds_but_checkpoint_lora_failure_does_not_fallback(fake_vllm):
     fake_vllm.LLM = moe_lora_blocking_llm
     base_policy = eval_runner._load_policy(_contract("base-only"), _Tokenizer())
     assert base_policy.llm.engine_kwargs["enable_lora"] is False
+    (tmp_path / "config.json").write_text('{"model_type": "qwen2_moe"}', encoding="utf-8")
+    contract = _contract("checkpoint")
+    contract["base_path"] = str(tmp_path)
     with pytest.raises(ValueError, match="unsupported MoE.*LoRA engine setup"):
-        eval_runner._load_policy(_contract("checkpoint"), _Tokenizer())
+        eval_runner._load_policy(contract, _Tokenizer())
     assert attempts == [False, True]
+
+
+def test_unreadable_architecture_fails_before_engine(fake_vllm, tmp_path):
+    import eval_runner
+    attempts = []
+    fake_vllm.LLM = lambda **kwargs: attempts.append(kwargs)
+    contract = _contract("checkpoint")
+    contract["base_path"] = str(tmp_path)
+    with pytest.raises(ValueError, match="cannot inspect local model config"):
+        eval_runner._load_policy(contract, _Tokenizer())
+    assert attempts == []
 
 
 def test_unknown_arm_kind_fails_closed():

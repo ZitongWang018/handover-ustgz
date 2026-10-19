@@ -262,6 +262,18 @@ def _validate_solver_sampling(solver_cfg: dict[str, Any]) -> None:
         raise ContractError("solver sampling must match the shared SkillRise generation settings")
 
 
+def _validate_qwen3_moe_eval_protocol(solver_cfg: dict[str, Any],
+                                      eval_cfg: Any) -> None:
+    """Validate the shared 30B eval contract without selecting its backend."""
+    if (not isinstance(solver_cfg, dict)
+            or solver_cfg.get("prompt_format") != "chat_template"):
+        raise ContractError(
+            "30B training requires the shared chat_template solver protocol")
+    if not isinstance(eval_cfg, dict) or eval_cfg.get("backend") not in {"hf", "vllm"}:
+        raise ContractError(
+            "30B training requires eval.backend to be explicitly hf or vllm")
+
+
 def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Path,
                               backend: str, world_size: int, *, baseline_contract_path: Path,
                               smoke: bool = False, memory_profile: str = "default"
@@ -334,9 +346,8 @@ def resolve_training_manifest(config_path: Path, base_path: Path, data_root: Pat
         raise ContractError("solver must use the shared SkillRise React prompt and legal-action menu")
     if solver_cfg.get("prompt_format", "raw") not in {"raw", "chat_template"}:
         raise ContractError("solver.prompt_format must be raw or chat_template")
-    if memory_profile == "qwen3_moe_cpu" and (
-            solver_cfg.get("prompt_format") != "chat_template" or cfg["eval"].get("backend") != "hf"):
-        raise ContractError("30B training requires a matched chat_template/HF baseline config")
+    if memory_profile == "qwen3_moe_cpu":
+        _validate_qwen3_moe_eval_protocol(solver_cfg, cfg.get("eval"))
     if solver_cfg.get("stop_mode") != "action_tag" or solver_cfg.get("max_context_tokens") != 32768:
         raise ContractError("solver must use action_tag stopping and the shared 32768-token context")
     if solver_cfg.get("keep_recent_turns") != 15 or solver_cfg.get("max_turns") != 30:

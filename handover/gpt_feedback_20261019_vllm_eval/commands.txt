@@ -1,0 +1,23 @@
+# Local review only. No server, scheduler, model download, dependency installation or GPU jobs.
+# Existing test environment; this path is a local reviewer environment, not a cluster command.
+$env:PYTHONIOENCODING='utf-8'
+$env:OMP_NUM_THREADS='1'
+$env:TEMP='D:/dasou/deepseek-worker-jobs'
+$env:TMP=$env:TEMP
+../testenv/Scripts/python.exe -m pytest selfplay/tests -q --tb=short -rs
+# Final exit 0: 145 passed, 2 skipped, 2 warnings in 54.29s.
+# Skips: CUDA residency needs GPU; directory symlink test lacks Windows privilege.
+# Existing warnings: two PEFT checkpoint vocabulary/config warnings.
+
+../testenv/Scripts/python.exe selfplay/merge_solver.py --help
+../testenv/Scripts/python.exe selfplay/evaluate.py prepare --help
+# All selfplay Python sources compiled from text using compile(..., 'exec').
+# Git Bash -n: selfplay/scripts/run_eval.sh, run_experiment.sh, run_train.sh.
+git diff --check
+git fetch origin
+# origin/main before submission: a02acc98f61ca54a4b12c40a76bc3313441afd33
+
+# User-facing future evaluation commands are in README.md.
+# They have NOT been run. Server execution requires the user's separate job authorization,
+# actual ztwang-root boundary/resource checks, matched new baseline and sufficient CPU/disk.
+# Do not reuse old raw/vLLM or chat/HF baseline results.

@@ -60,7 +60,8 @@ def _versions() -> dict:
 
 def _source_identity() -> dict:
     names = ("eval_runner.py", "evaluation.py", "protocol.py", "alfworld_env.py",
-             "alfworld_compat.py", "checkpoint.py", "rollout.py", "ez_vllm_policy.py")
+             "alfworld_compat.py", "checkpoint.py", "rollout.py", "ez_vllm_policy.py",
+             "merged_model.py")
     missing = [name for name in names if not (SRC / name).is_file()]
     if missing:
         raise ValueError("required evaluator source is missing: " + ", ".join(missing))
@@ -74,6 +75,55 @@ def _base_identity(base: str) -> tuple[Path, dict, str]:
     digest = canonical_hash(inventory)
     serial = [{"path": rel, **record} for rel, record in sorted(inventory.items())]
     return path, {"files": serial}, digest
+
+
+def _validate_merged_export(path_value, base_digest: str, arm: dict) -> tuple[Path, dict]:
+    if not isinstance(path_value, (str, Path)) or not str(path_value):
+        raise ValueError("merged model path must be a non-empty directory path")
+    path = Path(path_value).expanduser().absolute()
+    if not path.is_dir():
+        raise ValueError("merged model path must be a directory")
+    from merged_model import validate_merged_model
+    manifest = validate_merged_model(str(path), base_digest=base_digest, arm=arm)
+    if not isinstance(manifest, dict):
+        raise ValueError("merged solver validator must return a manifest mapping")
+    digest = manifest.get("manifest_sha256")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError("merged solver manifest lacks manifest_sha256")
+    return path.resolve(strict=True), manifest
+
+
+def _validate_merged_model_record(record, base_digest: str, arm: dict) -> tuple[Path, dict]:
+    if not isinstance(record, dict):
+        raise ValueError("contract.merged_model must be a mapping")
+    stored = record.get("manifest_sha256")
+    if not isinstance(stored, str) or not stored:
+        raise ValueError("contract.merged_model lacks manifest_sha256")
+    path, manifest = _validate_merged_export(record.get("path"), base_digest, arm)
+    if manifest["manifest_sha256"] != stored:
+        raise ValueError("merged solver export manifest differs from the prepared contract")
+    return path, manifest
+
+
+def _is_qwen3_moe(base_path: str | Path) -> bool:
+    try:
+        config = json.loads((Path(base_path) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot inspect local model config for safe LoRA loading: {exc}") from None
+    if not isinstance(config, dict):
+        raise ValueError("local model config must be a mapping")
+    if str(config.get("model_type", "")).lower().startswith("qwen3_moe"):
+        return True
+    architectures = config.get("architectures") or []
+    if not isinstance(architectures, list) or any(not isinstance(name, str) for name in architectures):
+        raise ValueError("local model architectures must be a list of strings")
+    return any("qwen3moe" in name.lower() for name in architectures)
+
+
+def _unmerged_qwen_message() -> str:
+    return ("Qwen3Moe checkpoints cannot be evaluated through unmerged vLLM LoRA; "
+            "export a merged solver model with merged_model.export_solver_model "
+            "and pass --merged-model DIR to eval_runner.py prepare")
 
 
 def _arm(args, base_digest: str, solver_config: dict, *, prompt_identity=None, tokenizer_class=None) -> dict:
@@ -155,20 +205,32 @@ def _config_settings(config: dict) -> dict:
             settings["top_p"] != 0.95 or settings["top_k"] != -1 or
             settings["min_p"] != 0.0 or settings["repetition_penalty"] != 1.0):
         raise ValueError("config must declare the approved ReAct / valid_seen / five-seed protocol")
-    if settings["backend"] not in {"vllm", "hf"} or settings["batch_size"] < 1:
-        raise ValueError("config has unsupported backend or batch size")
+    if (settings["backend"] not in {"vllm", "hf"} or
+            isinstance(settings["batch_size"], bool) or
+            not isinstance(settings["batch_size"], int) or
+            not 1 <= settings["batch_size"] <= 8):
+        raise ValueError("config has unsupported backend or invalid batch size")
     if (isinstance(settings["shards"], bool) or not isinstance(settings["shards"], int) or
             not 1 <= settings["shards"] <= 8 or
             not isinstance(settings["gpu_memory_utilization"], (int, float)) or
             not 0 < settings["gpu_memory_utilization"] <= 1):
         raise ValueError("config has invalid evaluation shard or GPU memory settings")
+    if settings["batch_size"] * settings["shards"] > 64:
+        raise ValueError("config evaluation batch exceeds 64 episode slots across shards")
     return settings
 
 
 def prepare(args) -> int:
+    if Path(args.output).exists() or Path(args.output).is_symlink():
+        raise FileExistsError(f"refusing to overwrite contract: {args.output}")
     config_path = Path(args.config).expanduser().resolve(strict=True)
     config = _load_yaml(config_path)
     settings = _config_settings(config)
+    merged_requested = getattr(args, "merged_model", None)
+    if merged_requested and (args.base_only or not getattr(args, "checkpoint", None)):
+        raise ValueError("--merged-model requires a sealed --checkpoint arm")
+    if merged_requested and settings["backend"] != "vllm":
+        raise ValueError("--merged-model requires eval.backend=vllm")
     data_root = Path(args.alfworld_data).expanduser().resolve(strict=True)
     if not data_root.is_dir(): raise ValueError("--alfworld-data must point to an existing directory")
     os.environ["ALFWORLD_DATA"] = str(data_root)
@@ -184,6 +246,11 @@ def prepare(args) -> int:
     current_prompt = solver_prompt_identity(tok, settings.get("prompt_format", "raw"))
     arm = _arm(args, base_digest, _solver_config(config), prompt_identity=current_prompt,
                tokenizer_class=type(tok).__qualname__)
+    merged_model = None
+    if merged_requested:
+        merged_path, merged_manifest = _validate_merged_export(merged_requested, base_digest, arm)
+        merged_model = {"path": str(merged_path),
+                        "manifest_sha256": merged_manifest["manifest_sha256"]}
     token_files = {x["path"]: x for x in base_inventory["files"]
                    if x["path"].startswith("tokenizer") or x["path"] in
                    ("vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json")}
@@ -213,11 +280,14 @@ def prepare(args) -> int:
         "expected_shards": [{"rank": sh["rank"], "task_ids": sh["task_ids"],
             "path": str((Path(args.results_dir).resolve() / f"rank{sh['rank']}.json"))}
             for sh in suite["shards"]]}
+    if merged_model is not None:
+        contract["merged_model"] = merged_model
     contract["contract_sha256"] = canonical_hash(contract)
     out = Path(args.output)
     if out.exists(): raise FileExistsError(f"refusing to overwrite contract: {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with out.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(contract, ensure_ascii=False, indent=2) + "\n")
     print(f"prepared {len(suite['tasks'])} tasks x {len(SEEDS)} seeds; contract={contract['contract_sha256']}")
     return 0
 
@@ -226,15 +296,32 @@ def _load_policy(contract: dict, tokenizer):
     sig, arm = contract["protocol_signature"], contract["arm_identity"]
     if arm.get("kind") not in {"base-only", "checkpoint"}:
         raise ValueError(f"unsupported evaluation arm kind: {arm.get('kind')!r}")
+    merged_record = contract.get("merged_model")
     if sig["backend"] == "vllm":
         from ez_vllm_policy import VLLMPolicy, build_vllm_engine
-        engine = build_vllm_engine(contract["base_path"], gpu_memory_utilization=sig["gpu_memory_utilization"],
-            max_model_len=sig["max_context_tokens"], max_lora_rank=32,
-            max_num_seqs=sig["batch_size"], seed=SEEDS[0],
-            enable_lora=arm["kind"] == "checkpoint")
+        engine_kwargs = {
+            "gpu_memory_utilization": sig["gpu_memory_utilization"],
+            "max_model_len": sig["max_context_tokens"], "max_lora_rank": 32,
+            "max_num_seqs": sig["batch_size"], "seed": SEEDS[0],
+        }
+        if arm["kind"] == "base-only":
+            if merged_record is not None:
+                raise ValueError("base-only evaluation cannot use --merged-model")
+            engine = build_vllm_engine(contract["base_path"], **engine_kwargs, enable_lora=False)
+            return VLLMPolicy(engine, tokenizer)
+        if merged_record is not None:
+            merged_path, _manifest = _validate_merged_model_record(
+                merged_record, sig["base_inventory_sha256"], arm)
+            engine = build_vllm_engine(str(merged_path), **engine_kwargs, enable_lora=False)
+            return VLLMPolicy(engine, tokenizer)
+        if _is_qwen3_moe(contract["base_path"]):
+            raise ValueError(_unmerged_qwen_message())
+        engine = build_vllm_engine(contract["base_path"], **engine_kwargs, enable_lora=True)
         policy = VLLMPolicy(engine, tokenizer)
-        if arm["kind"] == "checkpoint": policy.set_lora("solver", arm["solver_path"])
+        policy.set_lora("solver", arm["solver_path"])
         return policy
+    if merged_record is not None:
+        raise ValueError("--merged-model requires eval.backend=vllm")
     import torch
     from transformers import AutoModelForCausalLM
     load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True, "local_files_only": True}
@@ -252,7 +339,32 @@ def _load_policy(contract: dict, tokenizer):
     return HFPolicy(model, tokenizer)
 
 
+def _telemetry_record(*, rank: int, setup_seconds: float, generation_seconds: float,
+                      environment_seconds: float, total_seconds: float,
+                      generated_token_count: int, request_count: int,
+                      episode_count: int) -> dict:
+    per_minute = (float(episode_count) * 60.0 / float(total_seconds)
+                  if total_seconds > 0 else 0.0)
+    return {"rank": rank,
+        "timings_seconds": {"setup": float(setup_seconds),
+                            "generation": float(generation_seconds),
+                            "environment": float(environment_seconds),
+                            "total": float(total_seconds)},
+        "generated_token_count": int(generated_token_count),
+        "request_count": int(request_count),
+        "episode_count": int(episode_count),
+        "effective_episodes_per_minute": per_minute}
+
+
+
+
 def run(args) -> int:
+    run_started = time.perf_counter()
+    setup_seconds = 0.0
+    generation_seconds = 0.0
+    environment_seconds = 0.0
+    generated_token_count = 0
+    request_count = 0
     from protocol import (action_tag_stop_len, build_skillrise_prompt, encode_solver_prompt,
                           project_skillrise_action, solver_prompt_identity)
     from alfworld_compat import find_compat_dir, install
@@ -276,6 +388,8 @@ def run(args) -> int:
     spec = contract["suite"]["shards"][rank]
     if Path(args.output).resolve() != Path(contract["expected_shards"][rank]["path"]).resolve():
         raise ValueError("output path differs from prepared contract")
+    if Path(args.output).exists() or Path(args.output).is_symlink():
+        raise FileExistsError(f"refusing to overwrite rank result: {args.output}")
     if _versions() != contract["protocol_signature"]["software"] or _source_identity() != contract["protocol_signature"]["runtime_source_sha256"]:
         raise ValueError("software or evaluator source differs from prepared contract")
     fresh = discover_suite(contract["alfworld_config_path"], contract["suite"]["split"],
@@ -309,6 +423,13 @@ def run(args) -> int:
                _solver_config(config), prompt_identity=prompt_identity, tokenizer_class=type(tok).__qualname__)
     if arm != contract["arm_identity"]:
         raise ValueError("checkpoint identity differs from prepared contract")
+    merged_record = contract.get("merged_model")
+    if merged_record is not None:
+        if signature["backend"] != "vllm" or arm["kind"] != "checkpoint":
+            raise ValueError("merged_model requires a vLLM checkpoint evaluation")
+        # _load_policy validates the full export immediately before engine load.
+    elif signature["backend"] == "vllm" and arm["kind"] == "checkpoint" and _is_qwen3_moe(base):
+        raise ValueError(_unmerged_qwen_message())
     tasks = [task_by_id[tid] for tid in spec["task_ids"]]
     policy = _load_policy(contract, tok)
     from alfworld_env import ALFWorldBatchEnv, load_alfworld_config
@@ -320,15 +441,18 @@ def run(args) -> int:
         repetition_penalty=settings["repetition_penalty"], max_context_tokens=settings["max_context_tokens"],
         keep_recent_turns=settings["keep_recent_turns"], stop_mode="action_tag", max_batch_size=settings["batch_size"],
         prompt_format=settings.get("prompt_format", "raw"))
+    setup_seconds = time.perf_counter() - run_started
     rows, start_time = [], time.time()
     for seed in SEEDS:
         for start in range(0, len(tasks), settings["batch_size"]):
             task_batch = tasks[start:start + settings["batch_size"]]
+            env_started = time.perf_counter()
             env = ALFWorldBatchEnv(env_config, split=contract["suite"]["alfworld_split"],
                 batch_size=len(task_batch), max_episode_steps=settings["max_turns"],
                 seed=seed, with_expert=False, with_facts=False, ignore_benchmark_done=False)
             try:
                 _obs, views, admissible, used, _ = env.reset([t["game_file"] for t in task_batch], seed=seed)
+                environment_seconds += time.perf_counter() - env_started
                 task_batch = align_task_slots(task_batch, used)
                 init_obs = {t["task_id"]: (views[i].raw or "").strip() for i, t in enumerate(task_batch)}
                 histories = {t["task_id"]: [] for t in task_batch}
@@ -348,14 +472,27 @@ def run(args) -> int:
                     seeds = [request_seed(seed, t["task_id"], turn) for t in active_tasks]
                     if settings["backend"] == "hf":
                         generated_ids = []
+                        finish_reasons = []
                         for ids, req_seed in zip(prompt_ids, seeds):
+                            call_started = time.perf_counter()
                             _, one_ids, _ = policy.generate_from_token_ids([ids], cfg, request_seeds=[req_seed])
+                            generation_seconds += time.perf_counter() - call_started
                             generated_ids.append(one_ids[0])
+                            call_reasons = list(getattr(policy, "last_finish_reasons", []) or [])
+                            finish_reasons.append(call_reasons[0] if call_reasons else None)
                     else:
+                        call_started = time.perf_counter()
                         _, generated_ids, _ = policy.generate_from_token_ids(prompt_ids, cfg, request_seeds=seeds)
+                        generation_seconds += time.perf_counter() - call_started
+                        call_reasons = list(getattr(policy, "last_finish_reasons", []) or [])
+                        finish_reasons = [call_reasons[i] if i < len(call_reasons) else None
+                                          for i in range(len(active_tasks))]
+                    if len(generated_ids) != len(active_tasks):
+                        raise ValueError("inference backend returned an incomplete generation batch")
+                    generated_token_count += sum(len(ids) for ids in generated_ids)
+                    request_count += len(active_tasks)
                     env_actions = ["look"] * len(task_batch)
                     slot_index = {t["task_id"]: i for i, t in enumerate(task_batch)}
-                    finish_reasons = getattr(policy, "last_finish_reasons", [])
                     for j, (t, prompt, pids, raw_ids, req_seed) in enumerate(zip(active_tasks, prompts, prompt_ids, generated_ids, seeds)):
                         stop_len = action_tag_stop_len(tok, raw_ids)
                         output_ids = list(raw_ids[:stop_len])
@@ -374,7 +511,9 @@ def run(args) -> int:
                             "admissible_actions": adm[t["task_id"]], "stop_len": stop_len,
                             "finish_reason": finish_reasons[j] if j < len(finish_reasons) else None,
                             "truncated": len(raw_ids) >= settings["max_new_tokens"]})
+                    step_started = time.perf_counter()
                     step = env.step(env_actions)
+                    environment_seconds += time.perf_counter() - step_started
                     for i, t in enumerate(task_batch):
                         if t["task_id"] not in active: continue
                         tid = t["task_id"]
@@ -394,18 +533,27 @@ def run(args) -> int:
                     row["record_sha256"] = canonical_hash(row)
                     rows.append(row)
             finally:
+                close_started = time.perf_counter()
                 env.close()
+                environment_seconds += time.perf_counter() - close_started
     summary = __import__("evaluation").summarize(rows, tasks, require_six_types=False)
+    total_seconds = time.perf_counter() - run_started
+    telemetry = _telemetry_record(rank=rank, setup_seconds=setup_seconds,
+        generation_seconds=generation_seconds, environment_seconds=environment_seconds,
+        total_seconds=total_seconds, generated_token_count=generated_token_count,
+        request_count=request_count, episode_count=len(rows))
     result = {"schema": SCHEMA, "run_id": contract["run_id"], "contract_sha256": digest,
         "rank": rank, "task_ids": list(spec["task_ids"]),
         "protocol_signature": contract["protocol_signature"], "arm_identity": contract["arm_identity"],
         "base_inventory": contract["base_inventory"],
         "software": contract["protocol_signature"]["software"],
         "runtime_source_sha256": contract["protocol_signature"]["runtime_source_sha256"],
-        "rows": rows, "summary": summary, "elapsed_seconds": time.time() - start_time}
+        "rows": rows, "summary": summary, "elapsed_seconds": time.time() - start_time,
+        "telemetry": telemetry}
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists(): raise FileExistsError(f"refusing to overwrite rank result: {out}")
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with out.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"rank {rank}: wrote {len(rows)} episodes to {out}")
     return 0
 
@@ -417,7 +565,8 @@ def merge_cmd(args) -> int:
     out = Path(args.output)
     if out.exists(): raise FileExistsError(f"refusing to overwrite merged result: {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with out.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"merged {result['summary']['n_episodes']} episodes; SR={result['summary']['episode_weighted_sr']:.4f}")
     return 0
 
@@ -427,7 +576,8 @@ def compare_cmd(args) -> int:
     result = compare(a, b)
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists(): raise FileExistsError(f"refusing to overwrite comparison: {out}")
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with out.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"paired episode SR delta={result['paired_episode_sr_delta_mean']:+.4f}")
     return 0
 
@@ -438,6 +588,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("prepare")
     p.add_argument("--config", default=str(SRC.parent / "config.yaml")); p.add_argument("--alfworld-data", required=True)
     p.add_argument("--base", required=True); p.add_argument("--checkpoint"); p.add_argument("--base-only", action="store_true")
+    p.add_argument("--merged-model")
     p.add_argument("--run-id"); p.add_argument("--results-dir", required=True); p.add_argument("--output", required=True); p.set_defaults(fn=prepare)
     p = sub.add_parser("run"); p.add_argument("--contract", required=True); p.add_argument("--rank", type=int, required=True); p.add_argument("--output", required=True); p.set_defaults(fn=run)
     p = sub.add_parser("merge"); p.add_argument("--contract", required=True); p.add_argument("--output", required=True); p.set_defaults(fn=merge_cmd)

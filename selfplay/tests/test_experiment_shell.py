@@ -15,7 +15,7 @@ BASH = str(_GIT_BASH) if _GIT_BASH.is_file() else shutil.which("bash")
 pytestmark = pytest.mark.skipif(not BASH, reason="bash is required for launcher wiring check")
 
 
-@pytest.mark.parametrize("scenario", ["success", "wrong_baseline", "train_failure"])
+@pytest.mark.parametrize("scenario", ["success", "vllm_baseline", "wrong_baseline", "train_failure"])
 def test_30b_experiment_forwards_profile_and_stops_on_failure(tmp_path, scenario):
     root = tmp_path / "repo"
     scripts = root / "selfplay" / "scripts"
@@ -39,8 +39,8 @@ if __name__ == "__main__":
 ''', encoding="utf-8")
     baseline = root / "contract.json"
     baseline.write_text(json.dumps({"protocol_signature": {
-        "backend": "vllm" if scenario == "wrong_baseline" else "hf",
-        "solver_settings": {"prompt_format": "chat_template"}}}), encoding="utf-8")
+        "backend": "vllm" if scenario == "vllm_baseline" else "hf",
+        "solver_settings": {"prompt_format": "raw" if scenario == "wrong_baseline" else "chat_template"}}}), encoding="utf-8")
     merged = root / "merged.json"
     merged.write_text("{}", encoding="utf-8")
     run = root / "selfplay" / "runs" / "explorer-zero-check"
@@ -53,11 +53,11 @@ if __name__ == "__main__":
         "--memory-profile", "qwen3_moe_cpu", "--backend", "hf"]
     result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=40)
     if scenario == "wrong_baseline":
-        assert result.returncode != 0 and "HF/chat_template" in result.stderr
+        assert result.returncode != 0 and "chat_template" in result.stderr
         assert not (root / "train-args.json").exists()
     else:
         forwarded = json.loads((root / "train-args.json").read_text())
         assert forwarded[forwarded.index("--memory-profile") + 1] == "qwen3_moe_cpu"
         assert forwarded[forwarded.index("--backend") + 1] == "hf"
-        assert (root / "eval-args.json").exists() == (scenario == "success")
-        assert result.returncode == (0 if scenario == "success" else 7), result.stderr
+        assert (root / "eval-args.json").exists() == (scenario in {"success", "vllm_baseline"})
+        assert result.returncode == (7 if scenario == "train_failure" else 0), result.stderr

@@ -22,6 +22,8 @@ def _baseline(tmp_path, chat=False):
     fixture_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture_module)
     contract, shards = fixture_module._fixture(tmp_path)
+    # This fixture tests orchestration independently of full model export.
+    contract["protocol_signature"]["backend"] = "hf"
     if chat:
         from protocol import solver_prompt_identity
         signature = contract["protocol_signature"]
@@ -115,6 +117,10 @@ def _install_fake_pipeline(monkeypatch, tmp_path, *, fail_at=None, real_snapshot
                 "path": str(snapshots[outer - 1]["path"]),
                 "manifest_sha256": snapshots[outer - 1]["checkpoint_manifest_sha256"],
                 "base_inventory_sha256": contract["arm_identity"]["base_inventory_sha256"]}
+            if "--merged-model" in argv:
+                eval_contract["merged_model"] = {
+                    "path": argv[argv.index("--merged-model") + 1],
+                    "manifest_sha256": "e" * 64}
             eval_contract["contract_sha256"] = canonical_hash({k: v for k, v in eval_contract.items()
                                                                  if k != "contract_sha256"})
             _write(output, eval_contract)
@@ -150,6 +156,45 @@ def test_runs_four_snapshots_serially_with_selected_python_and_skips_complete(tm
     calls.clear()
     second = evaluate_run.evaluate_run(run_dir, baseline_path, python="/python/selected")
     assert second["skipped"] is True
+    assert calls == []
+
+
+def test_vllm_four_snapshot_pipeline_binds_exports_and_rejects_missing_provenance(tmp_path, monkeypatch):
+    run_dir, baseline_path, calls = _install_fake_pipeline(monkeypatch, tmp_path)
+    _, _, contract = evaluate_run._manifest(run_dir)
+    contract["protocol_signature"]["backend"] = "vllm"
+    contract["contract_sha256"] = canonical_hash({k: v for k, v in contract.items() if k != "contract_sha256"})
+    baseline = json.loads(baseline_path.read_text())
+    baseline["protocol_signature"] = contract["protocol_signature"]
+    baseline["contract_sha256"] = contract["contract_sha256"]
+    _write(baseline_path, baseline)
+    exports = []
+    def export(outer_dir, snapshot, baseline_contract):
+        # In this orchestration test the actual CPU merge is tested separately.
+        assert baseline_contract is contract
+        exports.append(snapshot["outer"])
+        out = outer_dir / "merged_solver"
+        out.mkdir()
+        return out, {"manifest_sha256": "e" * 64}
+    monkeypatch.setattr(evaluate_run, "_export_merged_solver", export)
+    monkeypatch.setattr(evaluate_run.eval_runner, "_validate_merged_model_record", lambda *args: None)
+    result = evaluate_run.evaluate_run(run_dir, baseline_path, python="/python/selected")
+    assert exports == [1, 2, 3, 4]
+    prepare_calls = [argv for _, argv, _ in calls if "prepare" in argv]
+    assert len(prepare_calls) == 4
+    assert all("--merged-model" in argv and "--checkpoint" in argv for argv in prepare_calls)
+    assert all(row["comparison"]["trained_summary"]["n_episodes"] == 30 for row in result["outers"])
+    calls.clear()
+    assert evaluate_run.evaluate_run(run_dir, baseline_path)["skipped"] is True
+    assert calls == [] and exports == [1, 2, 3, 4]
+    # A completed result cannot be reused after its merged provenance is removed.
+    contract_path = run_dir / "evaluation" / "outer_01" / "contract.json"
+    damaged = json.loads(contract_path.read_text())
+    damaged.pop("merged_model")
+    damaged["contract_sha256"] = canonical_hash({k: v for k, v in damaged.items() if k != "contract_sha256"})
+    _write(contract_path, damaged)
+    with pytest.raises(evaluate_run.RunEvaluationError, match="lacks its merged"):
+        evaluate_run.evaluate_run(run_dir, baseline_path)
     assert calls == []
 
 

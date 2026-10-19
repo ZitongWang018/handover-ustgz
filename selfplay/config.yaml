@@ -83,9 +83,9 @@ runtime:
     enforce_eager: false
     seed: 0
 eval:
-  backend: hf
+  backend: vllm
   gpu_memory_utilization: 0.85
   split: valid_seen
   seeds: [0, 1, 2, 3, 4]
-  batch_size: 1
+  batch_size: 4
   shards: 8

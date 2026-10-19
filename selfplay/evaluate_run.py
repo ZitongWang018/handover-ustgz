@@ -11,6 +11,9 @@ import json
 import os
 import subprocess
 import sys
+import time
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +174,25 @@ def _validate_baseline_merged(path: Path, contract: dict) -> dict:
     return merged
 
 
+def _validate_existing_merged_export(contract: dict, outer: int) -> None:
+    record = contract.get("merged_model")
+    if record is None:
+        if (contract.get("protocol_signature", {}).get("backend") == "vllm" and
+                contract.get("arm_identity", {}).get("kind") == "checkpoint"):
+            raise RunEvaluationError(f"outer {outer} vLLM checkpoint result lacks its merged solver export")
+        return
+    signature = contract.get("protocol_signature", {})
+    arm = contract.get("arm_identity", {})
+    if signature.get("backend") != "vllm" or arm.get("kind") != "checkpoint":
+        raise RunEvaluationError("merged solver export requires a vLLM checkpoint evaluation")
+    try:
+        eval_runner._validate_merged_model_record(
+            record, signature["base_inventory_sha256"], arm)
+    except (OSError, ValueError, KeyError, ImportError) as exc:
+        raise RunEvaluationError(
+            f"outer {outer} merged solver export validation failed: {exc}") from None
+
+
 def validate_baseline_files(contract_path: str | Path, merged_path: str | Path) -> tuple[dict, dict]:
     """Validate existing immutable base contract/results before a new training run."""
     contract = _read_json(Path(contract_path).expanduser().resolve(strict=True))
@@ -263,6 +285,7 @@ def _validate_run_merged(merged_path: Path, eval_contract_path: Path, baseline: 
             Path(arm.get("path", "")).resolve() != snapshot["path"] or
             arm.get("manifest_sha256") != snapshot["checkpoint_manifest_sha256"]):
         raise RunEvaluationError(f"outer {snapshot['outer']} evaluation contract names the wrong checkpoint")
+    _validate_existing_merged_export(eval_contract, snapshot["outer"])
     merged = _read_json(merged_path)
     _validate_merged_against_contract(merged, eval_contract)
     comparison = compare(baseline, merged)
@@ -316,6 +339,78 @@ def _clean_eval_environment(python: str) -> dict[str, str]:
         clean["CUDA_VISIBLE_DEVICES"] = original_cuda
     clean["SKR_PYTHON"] = python
     return clean
+
+
+def _export_merged_solver(outer_dir: Path, snapshot: dict,
+                          baseline_contract: dict) -> tuple[Path, dict] | None:
+    if baseline_contract.get("protocol_signature", {}).get("backend") != "vllm":
+        return None
+    paths = [outer_dir / name for name in ("merge.stdout.log", "merge.stderr.log", "merge.json")]
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise RunEvaluationError("refusing to overwrite solver merge logs")
+    started = time.perf_counter()
+    record = {"checkpoint": str(snapshot["path"]), "outer": snapshot["outer"],
+              "base": baseline_contract["base_path"], "status": "failed"}
+    try:
+        with paths[0].open("x", encoding="utf-8") as stdout, paths[1].open("x", encoding="utf-8") as stderr:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    result = _export_merged_solver_impl(outer_dir, snapshot, baseline_contract)
+                except BaseException:
+                    traceback.print_exc()
+                    raise
+        record.update(status="completed", merged_model=str(result[0]),
+                      manifest_sha256=result[1]["manifest_sha256"])
+        return result
+    finally:
+        record["elapsed_seconds"] = time.perf_counter() - started
+        _write_json_new(paths[2], record)
+
+
+def _export_merged_solver_impl(outer_dir: Path, snapshot: dict,
+                               baseline_contract: dict) -> tuple[Path, dict] | None:
+    signature = baseline_contract.get("protocol_signature", {})
+    if signature.get("backend") != "vllm":
+        return None
+    try:
+        config = eval_runner._load_yaml(Path(baseline_contract["config_path"]).expanduser().resolve(strict=True))
+        settings = eval_runner._config_settings(config)
+    except (OSError, ValueError, KeyError) as exc:
+        raise RunEvaluationError(f"cannot resolve merged evaluation config: {exc}") from None
+    if settings.get("backend") != "vllm":
+        raise RunEvaluationError("prepared evaluation config is not vLLM-backed")
+    base_path = Path(baseline_contract["base_path"]).expanduser().resolve(strict=True)
+    # _manifest already validates this base. The exporter independently hashes
+    # its source before AND after merging; avoid a third full-model read here.
+    base_digest = signature["base_inventory_sha256"]
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(base_path), trust_remote_code=True, local_files_only=True)
+    from protocol import solver_prompt_identity
+    prompt_identity = solver_prompt_identity(tokenizer, settings.get("prompt_format", "raw"))
+    arm = eval_runner._arm(
+        argparse.Namespace(base_only=False, checkpoint=str(snapshot["path"])),
+        base_digest, eval_runner._solver_config(config),
+        prompt_identity=prompt_identity, tokenizer_class=type(tokenizer).__qualname__)
+    if arm.get("manifest_sha256") != snapshot.get("checkpoint_manifest_sha256"):
+        raise RunEvaluationError(
+            f"outer {snapshot['outer']} checkpoint identity differs from its seal")
+    if not Path(arm["solver_path"]).resolve().is_relative_to(Path(snapshot["path"]).resolve()):
+        raise RunEvaluationError(f"outer {snapshot['outer']} solver leaf escapes its checkpoint")
+    merged_dir = outer_dir / "merged_solver"
+    if merged_dir.exists():
+        raise RunEvaluationError(f"partial merged solver output exists: {merged_dir}")
+    from merged_model import export_solver_model, validate_merged_model
+    try:
+        export_solver_model(str(base_path), arm["solver_path"], str(merged_dir),
+                            checkpoint_identity=arm)
+        manifest = validate_merged_model(str(merged_dir), base_digest=base_digest, arm=arm)
+    except (OSError, ValueError, KeyError, ImportError, RuntimeError) as exc:
+        raise RunEvaluationError(
+            f"outer {snapshot['outer']} merged solver export failed: {exc}") from None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("manifest_sha256"), str):
+        raise RunEvaluationError(f"outer {snapshot['outer']} merged solver export lacks a manifest")
+    return merged_dir, manifest
 
 
 def _run_command(argv: list[str], cwd: Path, env: dict[str, str], log_dir: Path, label: str) -> None:
@@ -446,10 +541,13 @@ def evaluate_run(run_dir: str | Path, baseline_results: str | Path,
         if outer_dir.exists():
             raise RunEvaluationError(f"partial evaluation output exists; choose a new --results-dir: {outer_dir}")
         outer_dir.mkdir(parents=False)
+        merged_export = _export_merged_solver(outer_dir, snapshot, baseline_contract)
         prepared_contract = outer_dir / "contract.json"
         args = [selected_python, str(eval_script), "prepare", "--config", baseline_contract["config_path"],
             "--alfworld-data", baseline_contract["alfworld_data_root"], "--base", baseline_contract["base_path"],
             "--checkpoint", str(snapshot["path"]), "--results-dir", str(outer_dir), "--output", str(prepared_contract)]
+        if merged_export is not None:
+            args.extend(["--merged-model", str(merged_export[0])])
         _run_command(args, ROOT, env, outer_dir, "prepare")
         eval_contract = _read_json(prepared_contract)
         contract_payload = dict(eval_contract)
@@ -461,6 +559,14 @@ def evaluate_run(run_dir: str | Path, baseline_results: str | Path,
                 Path(eval_contract["arm_identity"].get("path", "")).resolve() != snapshot["path"] or
                 eval_contract["arm_identity"].get("manifest_sha256") != snapshot["checkpoint_manifest_sha256"]):
             raise RunEvaluationError(f"outer {snapshot['outer']} prepare emitted a mismatched evaluation contract")
+        if merged_export is not None:
+            record = eval_contract.get("merged_model")
+            record_path = record.get("path") if isinstance(record, dict) else None
+            if (not isinstance(record_path, str) or
+                    Path(record_path).resolve() != merged_export[0].resolve() or
+                    record.get("manifest_sha256") != merged_export[1].get("manifest_sha256")):
+                raise RunEvaluationError(
+                    f"outer {snapshot['outer']} prepare stored a mismatched merged solver export")
         _run_command(["bash", str(run_eval_script), str(prepared_contract)], ROOT, env, outer_dir, "run_eval")
         merged_path = outer_dir / "contract.merged.json"
         merged = _read_json(merged_path)
