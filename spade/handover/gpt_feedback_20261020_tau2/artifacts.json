@@ -1,0 +1,17 @@
+{
+  "scope": "tau2-only",
+  "real_api_or_gpu_run": false,
+  "local_tests_passed": 22,
+  "official_tests_passed": 35,
+  "files": {
+    "spade/run_tau2.py": "375104349b461e7873e9b488896ced9363e8da8dc4e40c11b34fe25e7506c861",
+    "spade/runtime.py": "82f0544c97b100e85ae5eacf466c2914dce261f23dac0cad3b91ffb2b912d487",
+    "spade/tau2_config.yaml": "e7cd13111bf860ceb826fc699e4157626ced3e197408b338c32a41579a49610f",
+    "spade/tau2_eval.py": "c123d0f011d0952dc54d5f66790fc763ed3d392342fe4d7fbfa21ca2b4a7adbb",
+    "spade/tau2_provider.py": "1cdacf2715bc542fdf41756324c647009f2393d3069138d17cc3a2b73a7a6431",
+    "spade/tests/conftest.py": "4e74c3a46ba078f1bb792bfb04fcc42f3a820966908faf3378a7f2a306c3bf82",
+    "spade/tests/test_runtime.py": "d207e4328405303d83bacdab290acaee80c60237d7740ff854d95ea1950acfa3",
+    "spade/tests/test_tau2_eval.py": "4ebc7303c89f9be68cd8514de08185301a5f71c67249c2e58711c8d65c1bfbe5"
+  },
+  "hash_basis": "Git staged blob bytes (LF normalized)"
+}

@@ -1,0 +1,6 @@
+[submodule "spade-official"]
+	path = spade/upstream
+	url = https://github.com/spade-rl/spade.git
+[submodule "tau2-official"]
+	path = spade/tau2-bench
+	url = https://github.com/sierra-research/tau2-bench.git
