@@ -4,6 +4,8 @@
 
 **交付状态：准备代码和启动配置，不是 SAO 论文结果的复现。** 当前入口不实现 SAO；单 rollout PPO 不等于 SAO。没有在本地 Windows 上运行 CUDA、Docker sandbox 或真实 SWE 训练。CPU 检查结果见 [VALIDATION.md](VALIDATION.md)。
 
+交给另一位 AI 去集群申请八卡 A 系列并运行 GRPO / GRPO＋DIS，请优先阅读 [集群执行交接文档](CLUSTER_HANDOFF.md)，其中列出了默认步数/超参数、SAO 差异、站点待确认项、提交顺序和验收证据。
+
 ## 一次准备，之后只改配置和启动参数
 
 服务器前提：Linux、已分配的 NVIDIA GPU、Docker GPU runtime、Docker Compose、Git、Python 3.12、uv。Harbor 在宿主机独立虚拟环境运行，训练在 Miles 官方容器中运行。无需把 Docker socket 挂进训练容器。模型权重由你提供，不自动下载。
