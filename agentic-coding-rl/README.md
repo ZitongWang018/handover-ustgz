@@ -4,7 +4,7 @@
 
 **交付状态：准备代码和启动配置，不是 SAO 论文结果的复现。** 当前入口不实现 SAO；单 rollout PPO 不等于 SAO。没有在本地 Windows 上运行 CUDA、Docker sandbox 或真实 SWE 训练。CPU 检查结果见 [VALIDATION.md](VALIDATION.md)。
 
-交给另一位 AI 去集群申请八卡 A 系列并运行 GRPO / GRPO＋DIS，请优先阅读 [集群执行交接文档](CLUSTER_HANDOFF.md)，其中列出了默认步数/超参数、SAO 差异、站点待确认项、提交顺序和验收证据。
+交给另一位 AI 去集群申请八卡 A 系列并运行 GRPO / GRPO＋DIS / Score Centering，请优先阅读 [集群执行交接文档](CLUSTER_HANDOFF.md)，其中列出了默认步数/超参数、SAO 差异、站点待确认项、三臂提交顺序，以及 Score Centering 的数值/真实概率协议验证和验收证据。
 
 ## 一次准备，之后只改配置和启动参数
 
