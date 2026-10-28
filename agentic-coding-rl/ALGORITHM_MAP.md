@@ -7,7 +7,7 @@
 | SWE agent、沙箱、reward | `examples/swe-agent-harbor-docker/`，Harbor 独立服务 | 保持 agent/任务/测试不变，terminal reward 来自 verifier |
 | 流式异步采样 | `train_async.py`、`miles/rollout/fully_async_rollout.py` | G=1 后完成一条即可进入组完成队列；仍然按指定全局 batch 更新，不是逐条 optimizer step |
 | 真实行为概率 | `miles/rollout/agentic/`、session、`miles/ray/rollout/train_data_conversion.py` | 保存每个 action token 实际生成时的 logprob，多版本轨迹不能用最新权重重算替代 |
-| DIS loss | `miles/backends/training_utils/loss/hub/losses.py`、`custom_loss_function_path` | 直接 learner/rollout ratio，区间外双侧 mask；不能用普通 PPO clipping 或三策略 TIS 直接冒充 |
+| DIS loss | **已在本目录 `algorithms/dis_core.py`、`algorithms/grpo_dis.py` 实现**，通过 `custom_loss_function_path` 接入 | GRPO＋DIS 入口 `--algo grpo_dis`；未来 SAO 可复用 tensor core，当前 hook 只接 GRPO |
 | GAE | `miles/backends/training_utils/loss/hub/advantages.py`、`math_utils.py` | 已跳过 observation；增加论文的长度自适应 λ，并分别核对 actor advantage 与 critic target |
 | critic | `miles/backends/megatron_utils/actor.py`、`train_async.py` | 独立模型已有；冻结 attention、critic:actor 更新频率、更新后 value 的时序仍需实现和验证 |
 | 指标 | loss metrics、rollout version、`dump-details` | lag/ratio、有效 action token、双侧 mask、EV、训练和 rollout 时间 |

@@ -10,9 +10,11 @@ import shlex
 import subprocess
 import sys
 
+from algorithms.dis_config import dis_settings
+
 PROJECT = Path(__file__).resolve().parent
 LOCK = json.loads((PROJECT / "UPSTREAM.lock.json").read_text(encoding="utf-8"))
-ALGORITHMS = ("grpo", "gspo", "grpo_tis", "grpo_mis", "score_centering", "ppo_single")
+ALGORITHMS = ("grpo", "grpo_dis", "gspo", "grpo_tis", "grpo_mis", "score_centering", "ppo_single")
 
 
 def read_config(path: str | Path) -> dict:
@@ -105,8 +107,8 @@ def build_train(config: dict, algo: str, mode: str, run_dir: Path, *, smoke=Fals
         raise ValueError("Invalid training sampling settings")
     if "REPLACE_" in r["session_external_host"] or not r["session_external_host"]:
         raise ValueError("Set runtime.session_external_host to the trainer host reachable from task containers")
-    if algo == "score_centering" and (t["top_p"] != 1 or t["top_k"] != -1):
-        raise ValueError("This score-centering recipe uses unfiltered sampling: top_p=1, top_k=-1")
+    if algo in ("grpo_dis", "score_centering") and (t["top_p"] != 1 or t["top_k"] != -1):
+        raise ValueError(f"This {algo} recipe uses unfiltered sampling: top_p=1, top_k=-1")
 
     args = model_args(m["megatron_type"])
 
@@ -181,6 +183,12 @@ def build_train(config: dict, algo: str, mode: str, run_dir: Path, *, smoke=Fals
     # Neither choice is the SAO DIS objective.
     if algo not in ("grpo_tis", "grpo_mis"):
         add("use-rollout-logprobs")
+    if algo == "grpo_dis":
+        lower, upper = dis_settings(config)
+        add("loss-type", "custom_loss")
+        add("custom-loss-function-path", "algorithms.grpo_dis.loss_function")
+        add("dis-ratio-low", lower)
+        add("dis-ratio-high", upper)
     if algo in ("grpo_tis", "grpo_mis"):
         # The upstream correction hook compares a detached current trainer score to
         # actual rollout probabilities, so it needs the trainer's forward pass.
@@ -222,7 +230,7 @@ def runtime_env(config: dict) -> dict[str, str]:
     cache = p["cache_root"]
     env = {
         "PYTHONUNBUFFERED": "1", "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "PYTHONPATH": os.pathsep.join([str(checkout("miles")), config["model"]["megatron_path"],
+        "PYTHONPATH": os.pathsep.join([str(PROJECT), str(checkout("miles")), config["model"]["megatron_path"],
                                      str(checkout("miles") / "examples/swe-agent-harbor-docker")]),
         "HF_HOME": str(cache / "huggingface"), "XDG_CACHE_HOME": str(cache),
         "TORCH_HOME": str(cache / "torch"), "TRITON_CACHE_DIR": str(cache / "triton"),

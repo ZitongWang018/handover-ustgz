@@ -1,0 +1,6 @@
+# CPU-only test environment; do not install this into the GPU training image.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+numpy>=1.26
+pydantic>=2.11,<3
+typing-extensions>=4.12

@@ -1,0 +1,35 @@
+{
+  "created_at_utc": "2026-10-28T19:08:21.787026+00:00",
+  "python": "3.12.14",
+  "platform": "Windows",
+  "torch": "2.6.0+cpu",
+  "numpy": "2.3.5",
+  "pydantic": "2.14.1",
+  "tests_run": 31,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "successful": true,
+  "randomized_gradient_cases": 100,
+  "random_seed": 20261029,
+  "test_elapsed_seconds": 13.273,
+  "upstreams": {
+    "miles": {
+      "url": "https://github.com/radixark/miles.git",
+      "ref": "main",
+      "commit": "ee3f3d4650bc7d901c736f81297b3ec524159fb0"
+    },
+    "harbor": {
+      "url": "https://github.com/harbor-framework/harbor.git",
+      "ref": "harbor-miles-v0.20.0",
+      "commit": "ac63e51a8fe8167347b2c91be7d1804faf89df10"
+    }
+  },
+  "native_cpu_contracts": "actual pinned pure reducer/layout/dispatcher bodies; no CUDA imports or compile decorators",
+  "limits": [
+    "No real GPU/Megatron/SGLang training",
+    "No real NCCL/TP/CP run",
+    "No Docker SWE verifier run",
+    "No SWE-bench Verified learning score"
+  ]
+}

@@ -1,6 +1,6 @@
 # SWE 长程 RL 算法实验底座
 
-用同一个 **Miles + SGLang + Megatron + Harbor** 管线做真实仓库修复任务。先跑 GRPO，再比较 GSPO、TIS/MIS、Score Centering、单 rollout PPO；后续在 PPO 分支接 SAO。新目录独立于本仓库的 `selfplay/`、`spade/`，不调用它们的代码。
+用同一个 **Miles + SGLang + Megatron + Harbor** 管线做真实仓库修复任务。支持 GRPO、GRPO＋DIS、GSPO、TIS/MIS、Score Centering、单 rollout PPO；后续在 PPO 分支接 SAO。新目录独立于本仓库的 `selfplay/`、`spade/`，不调用它们的代码。
 
 **交付状态：准备代码和启动配置，不是 SAO 论文结果的复现。** 当前入口不实现 SAO；单 rollout PPO 不等于 SAO。没有在本地 Windows 上运行 CUDA、Docker sandbox 或真实 SWE 训练。CPU 检查结果见 [VALIDATION.md](VALIDATION.md)。
 
@@ -98,6 +98,7 @@ python3 run.py train --algo grpo --mode async --run-id preview --dry-run
 
 ```bash
 bash scripts/in_container.sh train --algo grpo --mode async --run-id grpo-s42 --eval
+bash scripts/in_container.sh train --algo grpo_dis --mode async --run-id grpo-dis-s42 --eval
 bash scripts/in_container.sh train --algo gspo --mode async --run-id gspo-s42 --eval
 bash scripts/in_container.sh train --algo grpo_tis --mode async --run-id grpo-tis-s42 --eval
 bash scripts/in_container.sh train --algo grpo_mis --mode async --run-id grpo-mis-s42 --eval
@@ -118,6 +119,7 @@ bash scripts/in_container.sh train --algo ppo_single --mode async --run-id ppo-s
 | `--algo` | 实际算法定义 |
 |---|---|
 | `grpo` | 上游 GRPO advantage，ratio 分母用真实 rollout logprob（bypass 版本），不是 SAO DIS |
+| `grpo_dis` | 同一 GRPO advantage＋独立 DIS loss；直接 learner/rollout ratio，严格区间外 PG 归零，默认 `(0.2, 4.0)` |
 | `gspo` | 上游 GSPO 序列比率；clip 单独用 `gspo_clip_*` |
 | `grpo_tis` | 上游三策略 decoupled PPO/GRPO ＋ token TIS；重算 proximal logprob，与 bypass 基线有明确区别 |
 | `grpo_mis` | 同上，importance weights 超出配置区间时 mask；不是 SAO DIS |
@@ -126,10 +128,20 @@ bash scripts/in_container.sh train --algo ppo_single --mode async --run-id ppo-s
 
 统一训练采样默认 temperature=1、top_p=1、top_k=-1。Score Centering 额外存储候选概率，需匹配固定 Miles 的 SGLang/router 协议；CPU 测试无法证明容器中的实际响应满足协议，首次 smoke 应检查候选字段。论文实现的数值测试不是其 SWE 学习效果的复现。
 
+**GRPO＋DIS 直接入口：**在完成上述数据、checkpoint 和 Harbor 服务准备后：
+
+```bash
+# 先做两步 smoke；正式运行用新 run ID，并改 --smoke 为 --eval。
+bash scripts/run_grpo_dis.sh --run-id grpo-dis-smoke --smoke
+bash scripts/run_grpo_dis.sh --run-id grpo-dis-s42 --eval
+```
+
+`--mode sync` 可切换同步模式，默认仍为异步。旧 `local.json` 不必重建；可添加 `training.dis_ratio_low` / `dis_ratio_high` 覆盖默认值。它们与普通 PPO 的 `clip_low` / `clip_high` 独立，后者不会用于 DIS loss。算法、梯度、KL/entropy 的边界及完整检查说明见 [GRPO_DIS.md](GRPO_DIS.md)。
+
 比较固定 trajectory/token 预算与固定墙钟时间两条曲线，同时记录解决率、生成 token 数、工具轮数、policy lag、ratio/mask 比例及 critic EV。只在相同模型、数据、agent、上下文、采样和评测协议下比较；不同算法的 clip、normalization、额外 critic/候选概率成本要写明。训练 reward 上升不等于 Verified 提升。
 
 ## 后续实现 SAO 从哪里改
 
-见 [ALGORITHM_MAP.md](ALGORITHM_MAP.md)。不需要更换 SWE 环境或训练框架。为了固定版本，本包装器拒绝已修改的上游 tracked 文件；**开始算法开发时，在新的实验分支中明确更新版本/补丁和检查逻辑**，不能静默绕过来源记录。
+见 [ALGORITHM_MAP.md](ALGORITHM_MAP.md)。不需要更换 SWE 环境或训练框架。当前 DIS 使用 Miles 的 custom-loss 插件，代码位于本目录 `algorithms/`，不改上游 tracked 文件；manifest 包含插件源文件哈希。如果未来需要修改上游本身，必须明确更新版本/补丁和来源检查，不能静默绕过记录。
 
 主要来源：[Miles Harbor recipe](https://github.com/radixark/miles/tree/ee3f3d4650bc7d901c736f81297b3ec524159fb0/examples/swe-agent-harbor-docker)、[PPO](https://github.com/radixark/miles/tree/ee3f3d4650bc7d901c736f81297b3ec524159fb0/examples/ppo)、[Score Centering](https://github.com/radixark/miles/tree/ee3f3d4650bc7d901c736f81297b3ec524159fb0/examples/infra_features/score_centering)、[SAO 原文](https://arxiv.org/abs/2607.07508)。

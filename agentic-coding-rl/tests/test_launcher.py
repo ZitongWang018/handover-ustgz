@@ -6,6 +6,9 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+import os
+import shlex
+import subprocess
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
@@ -120,6 +123,43 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--eval-prompt-data", c)
         self.assertEqual(self.value(c, "n-samples-per-eval-prompt"), "1")
         self.assertNotEqual(self.value(self.command("gspo"), "eps-clip"), self.value(self.command(), "eps-clip"))
+
+    def test_grpo_dis_entry_is_a_distinct_objective_with_legacy_config_defaults(self):
+        # Old local.json files need not be regenerated to select the new arm.
+        self.config["training"].pop("dis_ratio_low", None)
+        self.config["training"].pop("dis_ratio_high", None)
+        for mode in ("sync", "async"):
+            c = self.command("grpo_dis", mode)
+            self.assertEqual(self.value(c, "loss-type"), "custom_loss")
+            self.assertEqual(self.value(c, "custom-loss-function-path"), "algorithms.grpo_dis.loss_function")
+            self.assertEqual(self.value(c, "dis-ratio-low"), "0.2")
+            self.assertEqual(self.value(c, "dis-ratio-high"), "4.0")
+            self.assertEqual(self.value(c, "advantage-estimator"), "grpo")
+            self.assertIn("--use-rollout-logprobs", c)
+            self.assertNotIn("--use-tis", c)
+            self.assertNotIn("--critic-lr", c)
+        self.config["training"].update(dis_ratio_low=.3, dis_ratio_high=3.)
+        self.assertEqual(self.value(self.command("grpo_dis"), "dis-ratio-low"), "0.3")
+        self.config["training"]["dis_ratio_low"] = 0
+        with self.assertRaisesRegex(ValueError, "DIS requires"):
+            self.command("grpo_dis")
+
+    def test_grpo_dis_unfiltered_sampling_and_real_cli_dry_run(self):
+        self.config["training"]["top_p"] = .9
+        with self.assertRaisesRegex(ValueError, "unfiltered"):
+            self.command("grpo_dis")
+        self.config["training"]["top_p"] = 1.
+        self.assertEqual(launcher.runtime_env(self.config)["PYTHONPATH"].split(os.pathsep)[0], str(PROJECT))
+        with tempfile.TemporaryDirectory(dir=PROJECT) as td:
+            config_path = Path(td) / "test.json"
+            config_path.write_text(json.dumps(self.config), encoding="utf-8")
+            for mode in ("sync", "async"):
+                output = subprocess.check_output([sys.executable, str(PROJECT / "run.py"), "train",
+                    "--config", str(config_path), "--algo", "grpo_dis", "--mode", mode,
+                    "--run-id", "cli-preview-not-created", "--dry-run"], text=True, encoding="utf-8")
+                c = shlex.split(output)
+                self.assertEqual(self.value(c, "custom-loss-function-path"), "algorithms.grpo_dis.loss_function")
+        self.assertFalse((PROJECT / "runs/cli-preview-not-created").exists())
 
 
 if __name__ == "__main__":

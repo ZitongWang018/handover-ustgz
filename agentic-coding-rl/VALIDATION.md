@@ -28,3 +28,13 @@ for f in scripts/*.sh; do bash -n "$f"; done
 - 真实训练结果、SWE-bench Verified 分数、SAO 算法或论文结论。
 
 入口可供目标机器首跑；通过两步 GPU smoke、检查轨迹和 checkpoint 后，才能把其状态提升为“训练链路已验证”。学习效果和论文对齐需另外的预算、seed 和评测结果。
+
+## GRPO＋DIS 追加验证
+
+独立 CPU PyTorch 环境已实际运行 **31 项测试**，含额外 **100 组随机 categorical-policy 闭式梯度对照**，全部通过。覆盖有限差分 gradcheck、真实 softmax/optimizer-step 对照、正负 advantage、严格端点、极端比率、masked NaN、FP16/BF16/FP32/FP64、全拒绝批次、原始归一化分母、KL/entropy、原生 custom-loss schema/registry、microbatch/token scaling，以及同步/异步 CLI 预览。
+
+发现并修正的检查问题：CPU dispatcher 夹具补齐原生 `intra_dp_cp` 属性；Windows 命令预览的非 ASCII 路径改为 UTF-8 输出。没有以放宽 DIS 梯度或边界断言的方式绕过失败。
+
+四个 Bash 脚本逐个通过语法检查，九个 Python 文件通过编译检查。Miles/Harbor 固定上游仍无 tracked 修改。CP=2 检查使用两个逻辑 rank 的原生纯布局/归约函数体，非真实 GPU/NCCL 测试。参见 [GRPO_DIS.md](GRPO_DIS.md) 和 [机器可读检查记录](validation/grpo_dis_cpu.json)。
+
+重跑数学与接口检查前，按 `GRPO_DIS.md` 安装独立 CPU 测试依赖；旧的只验证 launcher 的 8 项检查不需要 torch。尚未执行真实 SWE GPU smoke，不声称获得 Verified 学习效果。

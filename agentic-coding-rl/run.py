@@ -20,6 +20,7 @@ import uuid
 from launcher import (ALGORITHMS, LOCK, PROJECT, build_train, check_workspace, checkout,
                       git_head, model_args, paths, read_config, runtime_env, shell_command,
                       verify_sources, workspace_path)
+from algorithms.dis_config import dis_settings
 
 
 def now():
@@ -271,10 +272,16 @@ def train(config, options):
                 "mode": options.mode, "smoke": options.smoke, "evaluation_enabled": options.eval,
                 "upstreams": LOCK, "config": config, "command": command,
                 "train_jsonl_sha256": sha256(p["train_jsonl"]),
-                "wrapper_source_sha256": {name: sha256(PROJECT / name) for name in ("launcher.py", "run.py")},
+                "wrapper_source_sha256": {name: sha256(PROJECT / name) for name in (
+                    "launcher.py", "run.py", *[str(f.relative_to(PROJECT)) for f in sorted((PROJECT / "algorithms").glob("*.py"))])},
                 "container_image_id": os.environ.get("SWE_RL_IMAGE_ID", "not recorded; direct launch"),
                 "parent_commit": git_head(PROJECT),
                 "evaluation_jsonl_sha256": sha256(p["eval_jsonl"]) if options.eval else None}
+    if options.algo == "grpo_dis":
+        lower, upper = dis_settings(config)
+        manifest["algorithm_details"] = {"objective": "direct_double_sided_is_v1", "ratio_low": lower,
+            "ratio_high": upper, "strict_bounds": True, "normalizer": "original_action_tokens",
+            "regularizers": "reference_KL_and_entropy_on_original_action_tokens"}
     write_json(run_dir / "manifest.json", manifest)
     env = {**os.environ, **runtime_env(config)}
     # Ray's UNIX socket names have a short length limit: keep the configured
@@ -370,6 +377,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        # Command previews may contain non-ASCII checkpoint/workspace paths.
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     try:
         main()
     except (ValueError, FileNotFoundError, subprocess.CalledProcessError) as error:

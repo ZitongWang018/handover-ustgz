@@ -69,6 +69,8 @@
     "max_response_len": 2048,
     "clip_low": 0.2,
     "clip_high": 0.28,
+    "dis_ratio_low": 0.2,
+    "dis_ratio_high": 4.0,
     "gspo_clip_low": 0.0003,
     "gspo_clip_high": 0.0004,
     "kl_loss_coef": 0.001,
