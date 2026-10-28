@@ -1,0 +1,10 @@
+.deps/
+.cache/
+.tmp/
+.venv/
+configs/local.json
+configs/*.local.json
+data/
+runs/
+__pycache__/
+*.pyc
